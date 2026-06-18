@@ -1,5 +1,13 @@
 # RADAR - Restricted Action Detector for Azure Roles
 
+![PowerShell](https://img.shields.io/badge/PowerShell-5391FE?style=flat-square&logo=powershell&logoColor=white)
+![Azure](https://img.shields.io/badge/Azure-0078D4?style=flat-square&logo=microsoftazure&logoColor=white)
+![Release](https://img.shields.io/github/v/release/danielfears/azure-radar?style=flat-square&logo=github)
+![License](https://img.shields.io/github/license/danielfears/azure-radar?style=flat-square)
+![Stars](https://img.shields.io/github/stars/danielfears/azure-radar?style=flat-square&logo=github)
+![Forks](https://img.shields.io/github/forks/danielfears/azure-radar?style=flat-square&logo=github)
+![Last commit](https://img.shields.io/github/last-commit/danielfears/azure-radar?style=flat-square)
+
 RADAR is a PowerShell tool that identifies which **Azure RBAC roles** grant access to a defined list of **restricted actions**, the actions the team does not want anyone to be able to perform.
 
 It takes a CSV of Azure RBAC actions to restrict and compares each one against the permissions of every built-in role (and optionally custom roles defined at a specific management group), honouring `Actions` and `NotActions`. The output is a CSV and a self-contained HTML report listing every role that grants any of the restricted actions, with the matched permission pattern shown alongside.
@@ -210,4 +218,4 @@ The **HTML report** is a self-contained dashboard (no external assets, so it can
 
 ## License
 
-TBD
+Released under the [MIT License](LICENSE).
