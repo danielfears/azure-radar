@@ -23,13 +23,29 @@
     (i.e. roles authored at that MG, not inherited from above). Built-in roles
     are always scanned.
 
+.PARAMETER DynamicRestrictedActions
+    When set, RADAR derives the restricted-action list at runtime from the
+    NotActions of "grant-all then claw-back" custom roles (those whose Actions
+    is '*') found at the -ManagementGroup scope, instead of (or together with)
+    -InputCsv. This always reflects the live role definitions. Requires
+    -ManagementGroup.
+
+.PARAMETER RestrictedFromRoleNames
+    Optional. One or more role-name patterns (wildcards supported) that narrow
+    which wildcard roles -DynamicRestrictedActions derives from. When omitted,
+    every wildcard custom role at the scope is used.
+
 .EXAMPLE
     # Default: scan only built-in roles.
     ./Invoke-Radar.ps1 -InputCsv ./restricted-actions.csv -OutputCsv ./output/radar-report.csv -OutputHtml ./output/radar-report.html
 
 .EXAMPLE
-    # Scan built-ins plus custom roles authored at a specific management group.
-    ./Invoke-Radar.ps1 -InputCsv ./restricted-actions.csv -OutputCsv ./output/radar-report.csv -OutputHtml ./output/radar-report.html -ManagementGroup my-management-group
+    # Scan built-ins plus custom roles authored at a management group.
+    ./Invoke-Radar.ps1 -InputCsv ./restricted-actions.csv -OutputCsv ./output/radar-report.csv -OutputHtml ./output/radar-report.html -ManagementGroup <your-management-group>
+
+.EXAMPLE
+    # Derive the restricted actions live from the wildcard claw-back roles at a management group.
+    ./Invoke-Radar.ps1 -DynamicRestrictedActions -ManagementGroup <your-management-group> -OutputCsv ./output/radar-report.csv -OutputHtml ./output/radar-report.html -DeniedRolesCsv ./denied-roles.csv
 #>
 
 [CmdletBinding()]
@@ -44,7 +60,11 @@ param(
 
     [string]$ManagementGroup,
 
-    [switch]$NoMenu
+    [switch]$NoMenu,
+
+    [switch]$DynamicRestrictedActions,
+
+    [string[]]$RestrictedFromRoleNames
 )
 
 Set-StrictMode -Version Latest
@@ -54,7 +74,7 @@ $ErrorActionPreference = 'Stop'
 $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
 
 # Interactive menu when launched with no scoping parameters.
-$invokedWithArgs = $InputCsv -or $OutputCsv -or $OutputHtml -or $ManagementGroup
+$invokedWithArgs = $InputCsv -or $OutputCsv -or $OutputHtml -or $ManagementGroup -or $DynamicRestrictedActions
 if (-not $invokedWithArgs -and -not $NoMenu) {
     $scriptDir = Split-Path -Parent $PSCommandPath
     $defaultIn     = Join-Path $scriptDir 'restricted-actions.csv'
@@ -89,14 +109,26 @@ if (-not $invokedWithArgs -and -not $NoMenu) {
         default { throw "Unknown selection: $choice" }
     }
 
-    if (-not $InputCsv)       { $InputCsv       = $defaultIn }
+    if ($ManagementGroup) {
+        $dynAns = Read-Host 'Pull restricted actions dynamically from that MG''s wildcard-role NotActions instead of the CSV? [Y/n]'
+        if ([string]::IsNullOrWhiteSpace($dynAns) -or $dynAns.Trim().ToUpperInvariant() -eq 'Y') {
+            $DynamicRestrictedActions = $true
+        }
+    }
+
+    if (-not $InputCsv -and -not $DynamicRestrictedActions) { $InputCsv = $defaultIn }
     if (-not $OutputCsv)      { $OutputCsv      = $defaultCsv }
     if (-not $OutputHtml)     { $OutputHtml     = $defaultHtml }
     if (-not $DeniedRolesCsv -and (Test-Path -LiteralPath $defaultDenied)) { $DeniedRolesCsv = $defaultDenied }
 
     Write-Host ''
     Write-Host 'Running with:'
-    Write-Host "  InputCsv:        $InputCsv"
+    if ($DynamicRestrictedActions) {
+        Write-Host '  Restricted from: dynamic (NotActions of wildcard roles at the MG)'
+        if ($InputCsv) { Write-Host "  + InputCsv:      $InputCsv" }
+    } else {
+        Write-Host "  InputCsv:        $InputCsv"
+    }
     Write-Host "  OutputCsv:       $OutputCsv"
     Write-Host "  OutputHtml:      $OutputHtml"
     if ($DeniedRolesCsv) {
@@ -110,8 +142,13 @@ if (-not $invokedWithArgs -and -not $NoMenu) {
     Write-Host ''
 }
 
-if (-not $InputCsv)  { throw 'InputCsv is required.' }
 if (-not $OutputCsv) { throw 'OutputCsv is required.' }
+if (-not $InputCsv -and -not $DynamicRestrictedActions) {
+    throw 'Provide -InputCsv, -DynamicRestrictedActions, or both as the source of restricted actions.'
+}
+if ($DynamicRestrictedActions -and -not $ManagementGroup) {
+    throw '-DynamicRestrictedActions requires -ManagementGroup (the scope where the wildcard claw-back roles are authored).'
+}
 
 $IncludeCustomRoles = [bool]$ManagementGroup
 
@@ -149,7 +186,7 @@ function Connect-RadarAzAccount {
 function Test-PermissionMatch {
     <#
     Returns $true if the role's permission pattern and the restricted action
-    overlap — that is, there exists at least one concrete action that satisfies
+    overlap, that is, there exists at least one concrete action that satisfies
     both. Wildcards ('*') are honored on either side.
 
     Examples that return $true:
@@ -206,7 +243,9 @@ function ConvertTo-RadarHtmlReport {
 
         [string]$CustomScope,
 
-        [bool]$DeniedListProvided = $false
+        [bool]$DeniedListProvided = $false,
+
+        [string[]]$SourceRoleNames = @()
     )
 
     $generated = (Get-Date).ToString('u')
@@ -246,7 +285,7 @@ function ConvertTo-RadarHtmlReport {
   }
   header {
     padding: 28px 36px; border-bottom: 1px solid var(--border);
-    display: flex; align-items: center; gap: 16px;
+    display: flex; align-items: center; justify-content: center; gap: 16px; text-align: center;
     background: rgba(255,255,255,0.02);
   }
   header .logo {
@@ -279,6 +318,13 @@ function ConvertTo-RadarHtmlReport {
     padding: 10px 12px; font-size: 14px;
   }
   .toolbar input[type="search"]:focus { outline: none; border-color: var(--accent); }
+  .toolbar button {
+    flex: 0 0 auto; cursor: pointer;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 16px; font-size: 13px; white-space: nowrap;
+  }
+  .toolbar button:hover { border-color: var(--accent); color: var(--accent); }
 
   .role {
     background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
@@ -317,7 +363,7 @@ function ConvertTo-RadarHtmlReport {
     background: rgba(255,184,107,0.12); color: var(--warn);
     border-color: rgba(255,184,107,0.45);
   }
-  .role.is-custom { border-left: 3px solid var(--warn); }
+  .role.is-denied { border-left: 3px solid var(--ok); }
   .role.is-undenied { border-left: 3px solid var(--danger); }
   .role.is-custom.is-undenied { border-left: 3px solid var(--danger); }
   .role .badge.denied {
@@ -348,18 +394,41 @@ function ConvertTo-RadarHtmlReport {
   details.actions-list summary { cursor: pointer; color: var(--muted); }
   details.actions-list ul { columns: 2; column-gap: 32px; margin: 12px 0 0; padding-left: 20px; }
   details.actions-list li { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; padding: 2px 0; }
+  details.actions-list.exposed { border-color: rgba(255,92,122,0.45); }
+  details.actions-list.exposed summary { color: var(--danger); }
+  details.actions-list .note { color: var(--muted); font-size: 12px; margin: 10px 0 0; max-width: 760px; }
+  details.actions-list li .via { color: var(--muted); font-size: 11px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
 
   footer { color: var(--muted); font-size: 12px; text-align: center; padding: 20px; }
   .empty {
     background: var(--panel); border: 1px dashed var(--border); border-radius: 12px;
     padding: 40px; text-align: center; color: var(--muted);
   }
+
+  .compliance {
+    display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 12px; padding: 22px 26px; margin-bottom: 22px;
+  }
+  .donut { flex: 0 0 auto; }
+  .donut .track { stroke: rgba(255,92,122,0.22); }
+  .donut .arc { stroke: var(--ok); }
+  .donut .pct { font-size: 28px; font-weight: 700; fill: var(--text); }
+  .donut .pct-sub { font-size: 10px; fill: var(--muted); text-transform: uppercase; letter-spacing: 1.5px; }
+  .compliance-info { flex: 1 1 240px; }
+  .compliance-info h2 { margin: 0 0 4px; font-size: 16px; }
+  .compliance-info p { margin: 0; color: var(--muted); font-size: 13px; max-width: 540px; }
+  .compliance-info .nums { margin-top: 14px; display: flex; gap: 26px; flex-wrap: wrap; }
+  .compliance-info .num { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .compliance-info .num b { font-size: 22px; display: block; color: var(--text); letter-spacing: 0; }
+  .compliance-info .num.ok b { color: var(--ok); }
+  .compliance-info .num.gap b { color: var(--danger); }
 </style>
 '@)
     [void]$sb.AppendLine('</head><body>')
 
     [void]$sb.AppendLine('<header><div class="logo"></div><div>')
-    [void]$sb.AppendLine('<h1>RADAR &mdash; Restricted Action Detector for Azure Roles</h1>')
+    [void]$sb.AppendLine('<h1>RADAR - Restricted Action Detector for Azure Roles</h1>')
     $scope = if ($IncludeCustomRoles) { 'built-in &amp; custom roles' } else { 'built-in roles' }
     $scopeNote = if ($IncludeCustomRoles -and $CustomScope) {
         ' &middot; ' + (ConvertTo-HtmlSafe $CustomScope)
@@ -385,26 +454,43 @@ function ConvertTo-RadarHtmlReport {
         }
     }
 
+    # Deny-policy coverage donut (compliance %).
+    if ($DeniedListProvided -and $rolesAffected -gt 0) {
+        $coveragePct = [math]::Round((($rolesAlreadyDenied / $rolesAffected) * 100), 0)
+        $radius = 52
+        $circ   = 2 * [math]::PI * $radius
+        $arc    = [math]::Round((($coveragePct / 100) * $circ), 2)
+        $rest   = [math]::Round(($circ - $arc), 2)
+        [void]$sb.AppendLine('<section class="compliance">')
+        [void]$sb.AppendLine('<svg class="donut" viewBox="0 0 120 120" width="150" height="150" role="img" aria-label="Deny-policy coverage ' + $coveragePct + ' percent">')
+        [void]$sb.AppendLine('  <circle class="track" cx="60" cy="60" r="' + $radius + '" fill="none" stroke-width="14"/>')
+        [void]$sb.AppendLine('  <circle class="arc" cx="60" cy="60" r="' + $radius + '" fill="none" stroke-width="14" stroke-linecap="round" transform="rotate(-90 60 60)" stroke-dasharray="' + $arc + ' ' + $rest + '"/>')
+        [void]$sb.AppendLine('  <text class="pct" x="60" y="60" text-anchor="middle" dominant-baseline="central">' + $coveragePct + '%</text>')
+        [void]$sb.AppendLine('  <text class="pct-sub" x="60" y="80" text-anchor="middle">covered</text>')
+        [void]$sb.AppendLine('</svg>')
+        [void]$sb.AppendLine('<div class="compliance-info">')
+        [void]$sb.AppendLine('  <h2>Deny-policy coverage</h2>')
+        [void]$sb.AppendLine('  <p>Share of roles that grant a restricted action and are already blocked by the deny policy.<br />The remainder are the roles still to add.</p>')
+        [void]$sb.AppendLine('  <div class="nums">')
+        [void]$sb.AppendLine('    <div class="num"><b>' + $rolesAffected + '</b>roles affected</div>')
+        [void]$sb.AppendLine('    <div class="num ok"><b>' + $rolesAlreadyDenied + '</b>already denied</div>')
+        [void]$sb.AppendLine('    <div class="num gap"><b>' + $rolesNotYetDenied + '</b>still to deny</div>')
+        [void]$sb.AppendLine('  </div>')
+        [void]$sb.AppendLine('</div>')
+        [void]$sb.AppendLine('</section>')
+    }
+
     # Summary cards.
     [void]$sb.AppendLine('<section class="grid">')
     [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Built-in Scanned</div><div class=`"value accent`">$BuiltInScanned</div></div>")
     if ($IncludeCustomRoles) {
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Custom Scanned</div><div class=`"value accent`">$CustomScanned</div></div>")
     }
-    $rolesClass = if ($rolesAffected -gt 0) { 'danger' } else { 'ok' }
-    [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Roles Affected</div><div class=`"value $rolesClass`">$rolesAffected</div></div>")
-    [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Total Matches</div><div class=`"value warn`">$totalMatches</div></div>")
-    if ($IncludeCustomRoles) {
-        $customMatchClass = if ($customMatches -gt 0) { 'warn' } else { 'ok' }
-        [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Custom Matches</div><div class=`"value $customMatchClass`">$customMatches</div></div>")
-    }
-    if ($DeniedListProvided) {
-        $notDeniedClass = if ($rolesNotYetDenied -gt 0) { 'danger' } else { 'ok' }
-        [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Already Denied</div><div class=`"value ok`">$rolesAlreadyDenied</div></div>")
-        [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Not Yet Denied</div><div class=`"value $notDeniedClass`">$rolesNotYetDenied</div></div>")
-    }
     [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Restricted Actions</div><div class=`"value`">$($RestrictedActions.Count)</div></div>")
-    [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Actions Triggered</div><div class=`"value`">$actionsTriggered</div></div>")
+    if ($SourceRoleNames -and $SourceRoleNames.Count -gt 0) {
+        $srcTitle = ConvertTo-HtmlSafe ($SourceRoleNames -join ', ')
+        [void]$sb.AppendLine("<div class=`"card`" title=`"$srcTitle`"><div class=`"label`">Source Roles</div><div class=`"value accent`">$($SourceRoleNames.Count)</div></div>")
+    }
     [void]$sb.AppendLine('</section>')
 
     # Restricted actions input list.
@@ -414,8 +500,41 @@ function ConvertTo-RadarHtmlReport {
     }
     [void]$sb.AppendLine('</ul></details>')
 
+    # Currently obtainable restricted actions: still granted by at least one role
+    # not on the deny list, so a user who can assign roles could regain them.
+    if ($DeniedListProvided) {
+        $obtainable = [ordered]@{}
+        foreach ($item in $resultArray) {
+            $isDen = $item.PSObject.Properties['IsAlreadyDenied'] -and $item.IsAlreadyDenied
+            if (-not $isDen) {
+                $act = [string]$item.RestrictedAction
+                if (-not $obtainable.Contains($act)) { $obtainable[$act] = New-Object System.Collections.Generic.List[string] }
+                $rn = [string]$item.RoleName
+                if (-not $obtainable[$act].Contains($rn)) { [void]$obtainable[$act].Add($rn) }
+            }
+        }
+        $obtainableActions = @($obtainable.Keys | Sort-Object)
+        $obtainClass = if ($obtainableActions.Count -gt 0) { 'actions-list exposed' } else { 'actions-list' }
+        [void]$sb.AppendLine('<details class="' + $obtainClass + '"><summary>Currently obtainable restricted actions (' + $obtainableActions.Count + ' of ' + $RestrictedActions.Count + ')</summary>')
+        [void]$sb.AppendLine('<p class="note">Restricted actions still granted by at least one role that is not on the deny list. A user who can assign roles could regain these by self-assigning an un-denied role. Hover an action to see which roles grant it.</p>')
+        if ($obtainableActions.Count -eq 0) {
+            [void]$sb.AppendLine('<p class="note">None - every restricted action is granted only by roles already on the deny list.</p>')
+        }
+        else {
+            [void]$sb.AppendLine('<ul>')
+            foreach ($act in $obtainableActions) {
+                $roles = $obtainable[$act]
+                $titleSafe = ConvertTo-HtmlSafe ((@($roles) | Sort-Object) -join ', ')
+                $plural = if ($roles.Count -ne 1) { 's' } else { '' }
+                [void]$sb.AppendLine('<li title="' + $titleSafe + '">' + (ConvertTo-HtmlSafe $act) + ' <span class="via">(' + $roles.Count + ' role' + $plural + ')</span></li>')
+            }
+            [void]$sb.AppendLine('</ul>')
+        }
+        [void]$sb.AppendLine('</details>')
+    }
+
     # Toolbar / filter.
-    [void]$sb.AppendLine('<div class="toolbar"><input id="filter" type="search" placeholder="Filter by role name, action, or matched pattern..." /></div>')
+    [void]$sb.AppendLine('<div class="toolbar"><input id="filter" type="search" placeholder="Filter by role name, action, or matched pattern..." /><button id="toggle-all" type="button">Expand all</button></div>')
 
     if ($grouped.Count -eq 0) {
         [void]$sb.AppendLine('<div class="empty">No matches found. None of the scanned roles grant the restricted actions.</div>')
@@ -443,6 +562,7 @@ function ConvertTo-RadarHtmlReport {
             $roleClasses = @('role')
             if ($isCustom) { $roleClasses += 'is-custom' }
             if ($DeniedListProvided -and -not $isAlreadyDenied) { $roleClasses += 'is-undenied' }
+            if ($DeniedListProvided -and $isAlreadyDenied) { $roleClasses += 'is-denied' }
             $roleClass = $roleClasses -join ' '
 
             $matchWord = if ($items.Count -eq 1) { 'match' } else { 'matches' }
@@ -483,6 +603,16 @@ function ConvertTo-RadarHtmlReport {
         role.style.display = (any || summaryMatch || q === '') ? '' : 'none';
         if (q !== '' && (any || summaryMatch)) role.open = true;
       });
+    });
+  }
+
+  const toggleBtn = document.getElementById('toggle-all');
+  if (toggleBtn) {
+    toggleBtn.addEventListener('click', () => {
+      const roles = document.querySelectorAll('details.role');
+      const expand = Array.from(roles).some(r => !r.open);
+      roles.forEach(r => { r.open = expand; });
+      toggleBtn.textContent = expand ? 'Collapse all' : 'Expand all';
     });
   }
 </script>
@@ -539,21 +669,23 @@ function Get-ActionMatch {
 
 Connect-RadarAzAccount
 
-if (-not (Test-Path -LiteralPath $InputCsv)) {
-    throw "Input CSV not found: $InputCsv"
+$csvActions = @()
+if ($InputCsv) {
+    if (-not (Test-Path -LiteralPath $InputCsv)) {
+        throw "Input CSV not found: $InputCsv"
+    }
+
+    $restricted = Import-Csv -LiteralPath $InputCsv
+    if (-not ($restricted | Get-Member -Name 'Action' -MemberType NoteProperty)) {
+        throw "Input CSV must contain an 'Action' column."
+    }
+
+    $csvActions = @($restricted.Action |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { $_.Trim() })
+
+    Write-Host "Loaded $(@($csvActions | Sort-Object -Unique).Count) restricted action(s) from $InputCsv"
 }
-
-$restricted = Import-Csv -LiteralPath $InputCsv
-if (-not ($restricted | Get-Member -Name 'Action' -MemberType NoteProperty)) {
-    throw "Input CSV must contain an 'Action' column."
-}
-
-$restrictedActions = $restricted.Action |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-    ForEach-Object { $_.Trim() } |
-    Sort-Object -Unique
-
-Write-Host "Loaded $($restrictedActions.Count) restricted action(s) from $InputCsv"
 
 # Optional: load list of role names already denied (e.g. via Azure Policy / blocklist).
 $deniedRoleSet = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
@@ -580,6 +712,7 @@ $builtInRoles = @(Get-AzRoleDefinition -WarningAction SilentlyContinue | Where-O
 Write-Host "  Built-in roles found: $($builtInRoles.Count)"
 
 $customRoles = @()
+$rawCustom   = @()
 $scopeLabel  = $null
 
 if ($ManagementGroup) {
@@ -602,6 +735,48 @@ if ($ManagementGroup) {
     $scopeLabel = "MG '$ManagementGroup'"
     Write-Host "  Custom roles found:   $($customRoles.Count) (authored at $scopeLabel; $($rawCustom.Count - $customRoles.Count) inherited from above were excluded)"
 }
+
+# Derive restricted actions dynamically from the NotActions of wildcard
+# "grant-all then claw-back" roles (Actions = '*') found at the MG scope.
+$dynamicActions = @()
+$dynamicSourceRoleNames = @()
+if ($DynamicRestrictedActions) {
+    $sourceRoles = @($rawCustom | Where-Object { @(Get-RoleProperty -Role $_ -Name 'Actions') -contains '*' })
+    if ($RestrictedFromRoleNames) {
+        $sourceRoles = @($sourceRoles | Where-Object {
+            $rn = $_.Name
+            @($RestrictedFromRoleNames | Where-Object { $rn -like $_ }).Count -gt 0
+        })
+    }
+    $dynamicSourceRoleNames = @($sourceRoles | ForEach-Object { $_.Name })
+
+    $naSet = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($sr in $sourceRoles) {
+        foreach ($na in @(Get-RoleProperty -Role $sr -Name 'NotActions')) {
+            if (-not [string]::IsNullOrWhiteSpace($na)) { [void]$naSet.Add($na.Trim()) }
+        }
+    }
+    $dynamicActions = @($naSet)
+
+    if ($sourceRoles.Count -eq 0) {
+        Write-Warning "Dynamic mode: no wildcard (Actions = '*') roles found at $scopeLabel to derive NotActions from."
+    }
+    else {
+        Write-Host "  Derived $($dynamicActions.Count) restricted action(s) from $($sourceRoles.Count) wildcard role(s): $(@($sourceRoles | ForEach-Object { $_.Name }) -join ', ')"
+    }
+}
+
+# Final restricted-action set: CSV actions and/or dynamically derived NotActions.
+$restrictedActions = @(@($csvActions) + @($dynamicActions) |
+    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+    ForEach-Object { $_.Trim() } |
+    Sort-Object -Unique)
+
+if ($restrictedActions.Count -eq 0) {
+    throw "No restricted actions to evaluate. Provide -InputCsv with entries and/or -DynamicRestrictedActions with wildcard roles present at the scope."
+}
+
+Write-Host "Total restricted actions to evaluate: $($restrictedActions.Count)"
 
 $roles = @()
 $roles += $builtInRoles
@@ -657,7 +832,8 @@ if ($OutputHtml) {
         -CustomScanned $customRoles.Count `
         -IncludeCustomRoles ([bool]$IncludeCustomRoles) `
         -CustomScope $effectiveScope `
-        -DeniedListProvided ([bool]$DeniedRolesCsv)
+        -DeniedListProvided ([bool]$DeniedRolesCsv) `
+        -SourceRoleNames $dynamicSourceRoleNames
 
     Set-Content -LiteralPath $OutputHtml -Value $html -Encoding UTF8
 }
