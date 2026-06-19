@@ -30,11 +30,6 @@
     -InputCsv. This always reflects the live role definitions. Requires
     -ManagementGroup.
 
-.PARAMETER RestrictedFromRoleNames
-    Optional. One or more role-name patterns (wildcards supported) that narrow
-    which wildcard roles -DynamicRestrictedActions derives from. When omitted,
-    every wildcard custom role at the scope is used.
-
 .EXAMPLE
     # Default: scan only built-in roles.
     ./Invoke-Radar.ps1 -InputCsv ./restricted-actions.csv -OutputCsv ./output/radar-report.csv -OutputHtml ./output/radar-report.html
@@ -62,9 +57,7 @@ param(
 
     [switch]$NoMenu,
 
-    [switch]$DynamicRestrictedActions,
-
-    [string[]]$RestrictedFromRoleNames
+    [switch]$DynamicRestrictedActions
 )
 
 Set-StrictMode -Version Latest
@@ -72,6 +65,20 @@ $ErrorActionPreference = 'Stop'
 
 # Suppress noisy "Upcoming breaking changes" warnings emitted by Az.Resources cmdlets.
 $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
+
+# --- Configuration -------------------------------------------------------
+# Dynamic derivation (-DynamicRestrictedActions) builds the restricted-action
+# baseline from the NotActions of "grant-all then claw-back" wildcard roles
+# (Actions = '*') authored at the -ManagementGroup scope. Only the BROAD admin
+# roles (your Owner/Contributor-style roles) encode the canonical deny policy;
+# narrow, purpose-built wildcard roles (e.g. a networking or peering role) claw
+# back almost everything they do not need, so unioning their NotActions pollutes
+# the baseline with irrelevant actions and yields false-positive matches.
+#
+# Derivation is therefore always scoped to these role-name patterns (wildcards
+# allowed). Set these to your own broad claw-back roles; this is the single
+# place to adjust which roles define the baseline.
+$DefaultBaselineRolePatterns = @('Custom-Owner-*', 'Custom-Contributor-*')
 
 # Interactive menu when launched with no scoping parameters.
 $invokedWithArgs = $InputCsv -or $OutputCsv -or $OutputHtml -or $ManagementGroup -or $DynamicRestrictedActions
@@ -124,7 +131,7 @@ if (-not $invokedWithArgs -and -not $NoMenu) {
     Write-Host ''
     Write-Host 'Running with:'
     if ($DynamicRestrictedActions) {
-        Write-Host '  Restricted from: dynamic (NotActions of wildcard roles at the MG)'
+        Write-Host '  Restricted from: dynamic (NotActions of baseline claw-back roles at the MG)'
         if ($InputCsv) { Write-Host "  + InputCsv:      $InputCsv" }
     } else {
         Write-Host "  InputCsv:        $InputCsv"
@@ -151,6 +158,13 @@ if ($DynamicRestrictedActions -and -not $ManagementGroup) {
 }
 
 $IncludeCustomRoles = [bool]$ManagementGroup
+
+# Dynamic derivation is always scoped to the canonical baseline claw-back roles
+# ($DefaultBaselineRolePatterns) so that narrow, purpose-built wildcard roles
+# (e.g. peering) cannot pollute the restricted set with their role-scoping NotActions.
+if ($DynamicRestrictedActions) {
+    Write-Host "Dynamic derivation scoped to baseline role pattern(s): $($DefaultBaselineRolePatterns -join ', ')"
+}
 
 function Connect-RadarAzAccount {
     <#
@@ -742,12 +756,10 @@ $dynamicActions = @()
 $dynamicSourceRoleNames = @()
 if ($DynamicRestrictedActions) {
     $sourceRoles = @($rawCustom | Where-Object { @(Get-RoleProperty -Role $_ -Name 'Actions') -contains '*' })
-    if ($RestrictedFromRoleNames) {
-        $sourceRoles = @($sourceRoles | Where-Object {
-            $rn = $_.Name
-            @($RestrictedFromRoleNames | Where-Object { $rn -like $_ }).Count -gt 0
-        })
-    }
+    $sourceRoles = @($sourceRoles | Where-Object {
+        $rn = $_.Name
+        @($DefaultBaselineRolePatterns | Where-Object { $rn -like $_ }).Count -gt 0
+    })
     $dynamicSourceRoleNames = @($sourceRoles | ForEach-Object { $_.Name })
 
     $naSet = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
@@ -759,7 +771,7 @@ if ($DynamicRestrictedActions) {
     $dynamicActions = @($naSet)
 
     if ($sourceRoles.Count -eq 0) {
-        Write-Warning "Dynamic mode: no wildcard (Actions = '*') roles found at $scopeLabel to derive NotActions from."
+        Write-Warning "Dynamic mode: no wildcard (Actions = '*') roles at $scopeLabel matched the baseline pattern(s): $($DefaultBaselineRolePatterns -join ', '). Nothing was derived; check the role names against `$DefaultBaselineRolePatterns at the top of the script."
     }
     else {
         Write-Host "  Derived $($dynamicActions.Count) restricted action(s) from $($sourceRoles.Count) wildcard role(s): $(@($sourceRoles | ForEach-Object { $_.Name }) -join ', ')"
