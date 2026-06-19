@@ -112,7 +112,7 @@ Connect-AzAccount
 ./Invoke-Radar.ps1
 ```
 
-The menu offers built-in only, or built-in plus custom roles authored at a management group entered at the prompt. When a management group is selected it also offers to derive the restricted actions dynamically from that group's claw-back roles (see [Deriving restricted actions dynamically](#deriving-restricted-actions-dynamically)). Pass `-NoMenu` to skip it. To run non-interactively with explicit paths:
+The menu offers built-in only, or built-in plus custom roles authored at a management group entered at the prompt. When a management group is selected it also offers to derive the restricted actions dynamically from that group's baseline claw-back roles (see [Deriving restricted actions dynamically](#deriving-restricted-actions-dynamically)). Pass `-NoMenu` to skip it. To run non-interactively with explicit paths:
 
 ```powershell
 ./Invoke-Radar.ps1 -InputCsv ./restricted-actions.csv `
@@ -149,10 +149,11 @@ Custom roles are visually distinguished in both reports: the CSV `IsCustom` colu
 
 Instead of maintaining `restricted-actions.csv` by hand, RADAR can build the restricted-action list at runtime from the live role definitions themselves. The model here grants `*` and claws permissions back via `NotActions`, so those `NotActions` *are* the canonical restricted set. `-DynamicRestrictedActions` reads them straight from Azure, so the scan always reflects the current roles rather than a list that can drift.
 
+Only the **broad admin** claw-back roles (your Owner/Contributor-style roles) express the canonical deny policy. Narrow, purpose-built wildcard roles (for example a networking or peering role) grant `*` but claw back almost everything they do not need, so their `NotActions` are role-scoping noise rather than policy. Unioning them would pollute the restricted set with irrelevant actions and flag roles that legitimately grant them. To prevent that, derivation is **always scoped to the canonical baseline roles**, defined by `$DefaultBaselineRolePatterns` at the top of `Invoke-Radar.ps1` (default `Custom-Owner-*` and `Custom-Contributor-*`). Set that constant to your own broad claw-back roles; it is the single place to adjust which roles define the baseline.
+
 | Switch | Behaviour |
 | --- | --- |
-| `-DynamicRestrictedActions` | Derive the restricted actions from the `NotActions` of every "grant-all" custom role (those whose `Actions` is `*`) found at the `-ManagementGroup` scope. Requires `-ManagementGroup`. Can be combined with `-InputCsv`, in which case both sources are unioned. |
-| `-RestrictedFromRoleNames <patterns>` | Optional. Narrow the derivation to specific role names (wildcards supported), e.g. `'Custom-Owner-*'`. When omitted, every wildcard role at the scope is used. |
+| `-DynamicRestrictedActions` | Derive the restricted actions from the `NotActions` of the baseline "grant-all" claw-back roles (those whose `Actions` is `*` and whose name matches `$DefaultBaselineRolePatterns`) found at the `-ManagementGroup` scope. Requires `-ManagementGroup`. Can be combined with `-InputCsv`, in which case both sources are unioned. |
 
 ```powershell
 # Pull the restricted actions live from the wildcard claw-back roles at a management group
