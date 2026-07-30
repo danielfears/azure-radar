@@ -582,6 +582,27 @@ Describe 'Scoped baseline contexts' {
         $insideCustomer.State | Should -Be 'True'
         $aboveCustomer.State | Should -Be 'Unknown'
     }
+
+    It 'does not let an observed external role scope poison required hierarchy completeness' {
+        $requiredScopes = @(
+            (New-RadarScope `
+                -Id '/providers/Microsoft.Management/managementGroups/work'),
+            (New-RadarScope -Id '/subscriptions/sub-1')
+        )
+        $knownScopes = @(
+            @($requiredScopes) +
+            (New-RadarScope -Id '/subscriptions/external')
+        )
+
+        $hierarchy = Get-RadarScopeHierarchy `
+            -KnownScopes $knownScopes `
+            -RequiredScopes $requiredScopes
+
+        $hierarchy.IsComplete | Should -BeTrue
+        $hierarchy.AncestorsByScope.ContainsKey(
+            '/subscriptions/sub-1'
+        ) | Should -BeTrue
+    }
 }
 
 Describe 'Get-RadarScanScope' {
@@ -2140,5 +2161,7 @@ Describe 'Invoke-Radar scoped baseline gap model' {
         $uat[0].BaselineScope | Should -Be '/subscriptions/sub-2'
         $uat[0].DenyCoverage | Should -Be 'None'
         $uat[0].UnblockedScopes | Should -Be '/subscriptions/sub-2'
+        Test-Path -LiteralPath "$outputCsv.partial" |
+            Should -BeFalse
     }
 }

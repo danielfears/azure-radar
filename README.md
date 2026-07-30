@@ -125,6 +125,10 @@ and HTML before an ephemeral session ends.
 
 Large estates can take time: policy assignments and exemptions are queried at
 each relevant exact scope to prevent a parent result hiding a descendant gap.
+The evaluation phase prints percentage, elapsed time, and estimated remaining
+time every 5%. After each completed baseline context RADAR writes
+`<OutputCsv>.partial`; an interrupted run therefore retains completed contexts,
+and a successful run replaces it with the final CSV.
 
 ## Repository layout
 

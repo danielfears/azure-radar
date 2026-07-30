@@ -517,7 +517,10 @@ function Get-RadarScopeHierarchy {
     Builds management-group and subscription ancestry once. Resource-group and
     resource scopes inherit their subscription's management-group ancestors.
     #>
-    param([object[]]$KnownScopes = @())
+    param(
+        [object[]]$KnownScopes = @(),
+        [object[]]$RequiredScopes = @()
+    )
 
     $ancestorsByScope = @{}
     $scopeById = @{}
@@ -626,8 +629,16 @@ function Get-RadarScopeHierarchy {
             }
         }
 
+        $requiredHierarchyScopes = if (
+            @($RequiredScopes).Count -gt 0
+        ) {
+            @($RequiredScopes)
+        }
+        else {
+            @($KnownScopes)
+        }
         $unresolvedHierarchyScopes = @(
-            $KnownScopes |
+            $requiredHierarchyScopes |
                 Where-Object {
                     $scopeId = $_.Id.TrimEnd('/').ToLowerInvariant()
                     (
@@ -4738,6 +4749,53 @@ function Get-RadarRoleDenyCoverage {
     }
 }
 
+function Update-RadarAnalysisProgress {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$State,
+        [string]$CurrentContext
+    )
+
+    $State.Processed++
+    if ($State.Total -le 0) { return }
+    $percent = [math]::Min(
+        100,
+        [math]::Floor(($State.Processed / $State.Total) * 100)
+    )
+    Write-Progress `
+        -Activity 'RADAR role/action gap evaluation' `
+        -Status "$percent% - $CurrentContext" `
+        -PercentComplete $percent
+
+    if ($percent -lt $State.NextConsolePercent) { return }
+    $elapsed = $State.Stopwatch.Elapsed
+    $remaining = if (
+        $State.Processed -gt 0 -and
+        $State.Processed -lt $State.Total
+    ) {
+        [timespan]::FromTicks(
+            [long](
+                ($elapsed.Ticks / $State.Processed) *
+                ($State.Total - $State.Processed)
+            )
+        )
+    }
+    else {
+        [timespan]::Zero
+    }
+    Write-Host (
+        '  Evaluation progress: {0}% ({1}/{2} role-context pairs, elapsed {3:hh\:mm\:ss}, estimated remaining {4:hh\:mm\:ss})' -f
+        $percent,
+        $State.Processed,
+        $State.Total,
+        $elapsed,
+        $remaining
+    )
+    while ($State.NextConsolePercent -le $percent) {
+        $State.NextConsolePercent += 5
+    }
+}
+
 # --- Main ---------------------------------------------------------------
 
 Connect-RadarAzAccount
@@ -4851,12 +4909,99 @@ foreach ($boundaryScope in $policyBoundaryInventory.Scopes) {
 }
 
 $scopeHierarchy = Get-RadarScopeHierarchy `
-    -KnownScopes @($knownScopeById.Values)
+    -KnownScopes @($knownScopeById.Values) `
+    -RequiredScopes $scanScopes
 foreach ($hierarchyScope in $scopeHierarchy.Scopes) {
     $knownScopeById[
         $hierarchyScope.Id.TrimEnd('/').ToLowerInvariant()
     ] = $hierarchyScope
 }
+$accessibleSubscriptionIds =
+    New-Object System.Collections.Generic.HashSet[string] (
+        [StringComparer]::OrdinalIgnoreCase
+    )
+$hasRequestedManagementGroup = @(
+    $scanScopes |
+        Where-Object { $_.Type -eq 'ManagementGroup' }
+).Count -gt 0
+foreach ($requestedScope in $scanScopes) {
+    $subscriptionMatch = [regex]::Match(
+        $requestedScope.Id,
+        '(?i)^/subscriptions/([^/]+)'
+    )
+    if ($subscriptionMatch.Success) {
+        [void]$accessibleSubscriptionIds.Add(
+            $subscriptionMatch.Groups[1].Value
+        )
+    }
+}
+if ($hasRequestedManagementGroup) {
+    $requestedManagementGroupIds = @(
+        $scanScopes |
+            Where-Object { $_.Type -eq 'ManagementGroup' } |
+            ForEach-Object { $_.Id.TrimEnd('/') }
+    )
+    foreach (
+        $hierarchySubscription in @(
+            $scopeHierarchy.Scopes |
+                Where-Object { $_.Type -eq 'Subscription' }
+        )
+    ) {
+        $subscriptionKey =
+            $hierarchySubscription.Id.TrimEnd('/').ToLowerInvariant()
+        if (
+            -not $scopeHierarchy.AncestorsByScope.ContainsKey(
+                $subscriptionKey
+            )
+        ) {
+            continue
+        }
+        $isRequestedDescendant = @(
+            $scopeHierarchy.AncestorsByScope[$subscriptionKey] |
+                Where-Object {
+                    $ancestor = [string]$_
+                    @(
+                        $requestedManagementGroupIds |
+                            Where-Object {
+                                [string]::Equals(
+                                    $_,
+                                    $ancestor,
+                                    [System.StringComparison]::OrdinalIgnoreCase
+                                )
+                            }
+                    ).Count -gt 0
+                }
+        ).Count -gt 0
+        if ($isRequestedDescendant) {
+            [void]$accessibleSubscriptionIds.Add(
+                ($hierarchySubscription.Id -split '/')[2]
+            )
+        }
+    }
+}
+$externalScopeKeys = @(
+    foreach ($knownScopeKey in @($knownScopeById.Keys)) {
+        $subscriptionMatch = [regex]::Match(
+            $knownScopeById[$knownScopeKey].Id,
+            '(?i)^/subscriptions/([^/]+)'
+        )
+        if (
+            $subscriptionMatch.Success -and
+            -not $accessibleSubscriptionIds.Contains(
+                $subscriptionMatch.Groups[1].Value
+            )
+        ) {
+            $knownScopeKey
+        }
+    }
+)
+foreach ($externalScopeKey in $externalScopeKeys) {
+    $knownScopeById.Remove($externalScopeKey)
+}
+if ($externalScopeKeys.Count -gt 0) {
+    Write-Host "  Excluded scopes outside the active tenant subscription set: $($externalScopeKeys.Count)"
+}
+
 $scopeLimitWarnings = New-Object System.Collections.Generic.List[string]
 if ($scopeDiscovery.DiscoveryMode -ne 'Estate') {
     $limitedScopeById = @{}
@@ -5043,6 +5188,27 @@ $coverageCache = @{}
 $availabilityCache = @{}
 $results = New-Object System.Collections.Generic.List[object]
 $runtimeWarnings = New-Object System.Collections.Generic.List[string]
+$analysisContextCount =
+    $baselineContextInventory.Contexts.Count +
+    $(if ($csvActions.Count -gt 0) { 1 } else { 0 })
+$progressState = [pscustomobject]@{
+    Processed = 0
+    Total = $roles.Count * $analysisContextCount
+    NextConsolePercent = 5
+    Stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+}
+$earlyOutputDir = Split-Path -Parent $OutputCsv
+if (
+    $earlyOutputDir -and
+    -not (Test-Path -LiteralPath $earlyOutputDir)
+) {
+    New-Item `
+        -ItemType Directory `
+        -Path $earlyOutputDir `
+        -Force |
+        Out-Null
+}
+$partialOutputCsv = "$OutputCsv.partial"
 
 $getMatch = {
     param(
@@ -5090,7 +5256,7 @@ $getCoverage = {
         $AssignmentPaths |
             ForEach-Object { $_.ResourceType }
     ) -join ','
-    $key = "$ContextKey$([char]31)$roleKey$([char]31)$pathKey"
+    $key = "$ContextKey$([char]31)$roleKey$([char]31)$pathKey$([char]31)$ContextComplete"
     if (-not $coverageCache.ContainsKey($key)) {
         $coverageCache[$key] = Get-RadarRoleDenyCoverage `
             -Role $Role `
@@ -5171,8 +5337,26 @@ $addResult = {
 # any summary is calculated.
 foreach ($baselineContext in $baselineContextInventory.Contexts) {
     $contextKey =
-        "baseline:$($baselineContext.BaselineRoleId):$($baselineContext.BaselineScope)"
+        "subtree:$($baselineContext.BaselineScope.ToLowerInvariant())"
     foreach ($role in $roles) {
+        $matchedActions =
+            New-Object System.Collections.Generic.List[object]
+        foreach ($action in $baselineContext.RestrictedActions) {
+            $match = & $getMatch $role $action
+            if ($null -ne $match) {
+                [void]$matchedActions.Add([pscustomobject]@{
+                    Action = $action
+                    Match = $match
+                })
+            }
+        }
+        if ($matchedActions.Count -eq 0) {
+            Update-RadarAnalysisProgress `
+                -State $progressState `
+                -CurrentContext $baselineContext.BaselineRoleName
+            continue
+        }
+
         $availability = & $getAvailability `
             $role `
             $baselineContext.EvaluationScopes `
@@ -5182,7 +5366,12 @@ foreach ($baselineContext in $baselineContextInventory.Contexts) {
                 "$($baselineContext.BaselineRoleName) at $($baselineContext.BaselineScope): $warning"
             )
         }
-        if (@($availability.Scopes).Count -eq 0) { continue }
+        if (@($availability.Scopes).Count -eq 0) {
+            Update-RadarAnalysisProgress `
+                -State $progressState `
+                -CurrentContext $baselineContext.BaselineRoleName
+            continue
+        }
 
         $coverage = & $getCoverage `
             $role `
@@ -5190,9 +5379,7 @@ foreach ($baselineContext in $baselineContextInventory.Contexts) {
             $contextKey `
             $baselineContext.IsComplete `
             $baselineContext.AssignmentPaths
-        foreach ($action in $baselineContext.RestrictedActions) {
-            $match = & $getMatch $role $action
-            if ($null -eq $match) { continue }
+        foreach ($matchedAction in $matchedActions) {
             & $addResult `
                 'BaselineNotActions' `
                 $baselineContext.BaselineRoleName `
@@ -5201,11 +5388,28 @@ foreach ($baselineContext in $baselineContextInventory.Contexts) {
                 'Baseline role NotActions' `
                 $baselineContext.AssignmentPath `
                 $role `
-                $action `
-                $match `
+                $matchedAction.Action `
+                $matchedAction.Match `
                 $coverage `
                 $baselineContext.RestrictionWarnings
         }
+        Update-RadarAnalysisProgress `
+            -State $progressState `
+            -CurrentContext $baselineContext.BaselineRoleName
+    }
+
+    if ($results.Count -gt 0) {
+        $results.ToArray() |
+            Sort-Object `
+                AnalysisMode,
+                BaselineRoleName,
+                BaselineScope,
+                RoleName,
+                RestrictedAction |
+            Export-Csv `
+                -LiteralPath $partialOutputCsv `
+                -NoTypeInformation
+        Write-Host "  Partial checkpoint:   $partialOutputCsv"
     }
 }
 
@@ -5215,6 +5419,24 @@ foreach ($baselineContext in $baselineContextInventory.Contexts) {
 if ($csvActions.Count -gt 0) {
     $globalContextKey = 'csv:accessible-estate'
     foreach ($role in $roles) {
+        $matchedActions =
+            New-Object System.Collections.Generic.List[object]
+        foreach ($action in $csvActions) {
+            $match = & $getMatch $role $action
+            if ($null -ne $match) {
+                [void]$matchedActions.Add([pscustomobject]@{
+                    Action = $action
+                    Match = $match
+                })
+            }
+        }
+        if ($matchedActions.Count -eq 0) {
+            Update-RadarAnalysisProgress `
+                -State $progressState `
+                -CurrentContext 'CSV safety baseline'
+            continue
+        }
+
         $availability = & $getAvailability `
             $role `
             $knownScopes `
@@ -5224,16 +5446,19 @@ if ($csvActions.Count -gt 0) {
                 "CSV safety baseline: $warning"
             )
         }
-        if (@($availability.Scopes).Count -eq 0) { continue }
+        if (@($availability.Scopes).Count -eq 0) {
+            Update-RadarAnalysisProgress `
+                -State $progressState `
+                -CurrentContext 'CSV safety baseline'
+            continue
+        }
         $coverage = & $getCoverage `
             $role `
             $availability `
             $globalContextKey `
             $true `
             @()
-        foreach ($action in $csvActions) {
-            $match = & $getMatch $role $action
-            if ($null -eq $match) { continue }
+        foreach ($matchedAction in $matchedActions) {
             & $addResult `
                 'GlobalCsv' `
                 'CSV safety baseline' `
@@ -5242,13 +5467,35 @@ if ($csvActions.Count -gt 0) {
                 'Input CSV' `
                 'Depends on the applicable assignment path' `
                 $role `
-                $action `
-                $match `
+                $matchedAction.Action `
+                $matchedAction.Match `
                 $coverage `
                 @()
         }
+        Update-RadarAnalysisProgress `
+            -State $progressState `
+            -CurrentContext 'CSV safety baseline'
+    }
+
+    if ($results.Count -gt 0) {
+        $results.ToArray() |
+            Sort-Object `
+                AnalysisMode,
+                BaselineRoleName,
+                BaselineScope,
+                RoleName,
+                RestrictedAction |
+            Export-Csv `
+                -LiteralPath $partialOutputCsv `
+                -NoTypeInformation
+        Write-Host "  Partial checkpoint:   $partialOutputCsv"
     }
 }
+
+$progressState.Stopwatch.Stop()
+Write-Progress `
+    -Activity 'RADAR role/action gap evaluation' `
+    -Completed
 
 $sortedResults = @(
     $results.ToArray() |
@@ -5355,6 +5602,9 @@ else {
         -LiteralPath $OutputCsv `
         -Encoding UTF8 `
         -Value '"AnalysisMode","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictionSource","AssignmentPath","RoleName","RoleId","IsCustom","RestrictedAction","MatchedPattern","IsAlreadyDenied","DenyCoverage","DeniedScopeCount","EvaluatedScopeCount","BlockingPolicies","DeniedScopes","UnblockedScopes","UnblockedAssignmentPaths","CoverageWarnings"'
+}
+if (Test-Path -LiteralPath $partialOutputCsv) {
+    Remove-Item -LiteralPath $partialOutputCsv -Force
 }
 
 if ($OutputHtml) {
