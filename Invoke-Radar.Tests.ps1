@@ -220,7 +220,7 @@ Describe 'Get-RadarBaselineRole' {
         }
     }
 
-    It 'auto-selects the broadest Owner and Contributor wildcard roles' {
+    It 'auto-selects every substantial Owner, Contributor, and Baseline role' {
         $roles = @(
             (New-TestWildcardRole `
                 -Name 'Customer-Platform-Owner' `
@@ -257,7 +257,7 @@ Describe 'Get-RadarBaselineRole' {
         $selection.Roles.Name |
             Should -Contain 'Customer-Platform-Contributor'
         $selection.Roles.Name |
-            Should -Not -Contain 'Workload-Storage-Owner'
+            Should -Contain 'Workload-Storage-Owner'
         $selection.Roles.Name |
             Should -Not -Contain 'Peering Operator'
     }
@@ -291,6 +291,296 @@ Describe 'Get-RadarBaselineRole' {
         )
 
         $selection.Roles | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Scoped baseline contexts' {
+    BeforeEach {
+        Mock Get-AzContext {
+            [pscustomobject]@{
+                Tenant = [pscustomobject]@{ Id = 'tenant-root' }
+            }
+        }
+        Mock Get-AzManagementGroup {
+            [pscustomobject]@{
+                Id = '/providers/Microsoft.Management/managementGroups/tenant-root'
+                Name = 'tenant-root'
+                DisplayName = 'Tenant root'
+                Children = @(
+                    [pscustomobject]@{
+                        Id = '/providers/Microsoft.Management/managementGroups/work'
+                        Name = 'work'
+                        DisplayName = 'Work'
+                        Children = @(
+                            [pscustomobject]@{
+                                Id = '/subscriptions/sub-1'
+                                Name = 'sub-1'
+                                DisplayName = 'Subscription 1'
+                                Children = @()
+                            }
+                        )
+                    },
+                    [pscustomobject]@{
+                        Id = '/providers/Microsoft.Management/managementGroups/other'
+                        Name = 'other'
+                        DisplayName = 'Other'
+                        Children = @(
+                            [pscustomobject]@{
+                                Id = '/subscriptions/sub-2'
+                                Name = 'sub-2'
+                                DisplayName = 'Subscription 2'
+                                Children = @()
+                            }
+                        )
+                    }
+                )
+            }
+        }
+    }
+
+    It 'expands a management-group baseline only through its own subtree' {
+        $knownScopes = @(
+            (New-RadarScope `
+                -Id '/providers/Microsoft.Management/managementGroups/work'),
+            (New-RadarScope -Id '/subscriptions/sub-1'),
+            (New-RadarScope `
+                -Id '/subscriptions/sub-1/resourceGroups/workload'),
+            (New-RadarScope -Id '/subscriptions/sub-2')
+        )
+        $hierarchy = Get-RadarScopeHierarchy -KnownScopes $knownScopes
+
+        $subtree = Get-RadarSubtreeScope `
+            -RootScope '/providers/Microsoft.Management/managementGroups/work' `
+            -Scopes $hierarchy.Scopes `
+            -Hierarchy $hierarchy
+
+        $subtree.Scopes.Id | Should -Contain '/subscriptions/sub-1'
+        $subtree.Scopes.Id |
+            Should -Contain '/subscriptions/sub-1/resourceGroups/workload'
+        $subtree.Scopes.Id | Should -Not -Contain '/subscriptions/sub-2'
+    }
+
+    It 'keeps baseline roles at the same scope as separate contexts' {
+        $knownScopes = @(
+            (New-RadarScope -Id '/subscriptions/sub-1')
+        )
+        $hierarchy = Get-RadarScopeHierarchy -KnownScopes $knownScopes
+        $roles = @(
+            [pscustomobject]@{
+                Name = 'Customer-Platform-Owner'
+                Id = '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+                IsCustom = $true
+                AssignableScopes = @('/subscriptions/sub-1')
+                Permissions = @(
+                    [pscustomobject]@{
+                        Actions = @('*')
+                        NotActions = @(
+                            'restricted/owner-only',
+                            'restricted/shared',
+                            'restricted/third'
+                        )
+                    }
+                )
+            },
+            [pscustomobject]@{
+                Name = 'Customer-Platform-Contributor'
+                Id = '/providers/Microsoft.Authorization/roleDefinitions/22222222-2222-2222-2222-222222222222'
+                IsCustom = $true
+                AssignableScopes = @('/subscriptions/sub-1')
+                Permissions = @(
+                    [pscustomobject]@{
+                        Actions = @('*')
+                        NotActions = @(
+                            'restricted/contributor-only',
+                            'restricted/shared',
+                            'restricted/third'
+                        )
+                    }
+                )
+            }
+        )
+
+        $result = Get-RadarBaselineContext `
+            -BaselineRoles $roles `
+            -KnownScopes $knownScopes `
+            -Hierarchy $hierarchy
+
+        $result.Contexts.Count | Should -Be 2
+        (
+            $result.Contexts |
+                Where-Object {
+                    $_.BaselineRoleName -eq 'Customer-Platform-Owner'
+                }
+        ).RestrictedActions |
+            Should -Contain 'restricted/owner-only'
+        (
+            $result.Contexts |
+                Where-Object {
+                    $_.BaselineRoleName -eq 'Customer-Platform-Contributor'
+                }
+        ).RestrictedActions |
+            Should -Not -Contain 'restricted/owner-only'
+    }
+
+    It 'omits a baseline AssignableScope outside the requested universe' {
+        $knownScopes = @(
+            (New-RadarScope -Id '/subscriptions/sub-1')
+        )
+        $hierarchy = Get-RadarScopeHierarchy -KnownScopes $knownScopes
+        $role = [pscustomobject]@{
+            Name = 'Customer-Platform-Owner'
+            Id = '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+            IsCustom = $true
+            AssignableScopes = @(
+                '/subscriptions/sub-1',
+                '/subscriptions/sub-2'
+            )
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('*')
+                    NotActions = @(
+                        'restricted/a',
+                        'restricted/b',
+                        'restricted/c'
+                    )
+                }
+            )
+        }
+
+        $result = Get-RadarBaselineContext `
+            -BaselineRoles @($role) `
+            -KnownScopes $knownScopes `
+            -Hierarchy $hierarchy
+
+        $result.Contexts.Count | Should -Be 1
+        $result.Contexts[0].BaselineScope |
+            Should -Be '/subscriptions/sub-1'
+    }
+
+    It 'omits a concrete NotAction re-granted by another permission block' {
+        $knownScopes = @(
+            (New-RadarScope -Id '/subscriptions/sub-1')
+        )
+        $hierarchy = Get-RadarScopeHierarchy -KnownScopes $knownScopes
+        $role = [pscustomobject]@{
+            Name = 'Customer-Platform-Owner'
+            Id = '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+            IsCustom = $true
+            AssignableScopes = @('/subscriptions/sub-1')
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('*')
+                    NotActions = @(
+                        'Dangerous.Provider/write',
+                        'Dangerous.Provider/delete'
+                    )
+                },
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/write')
+                    NotActions = @()
+                }
+            )
+        }
+
+        $result = Get-RadarBaselineContext `
+            -BaselineRoles @($role) `
+            -KnownScopes $knownScopes `
+            -Hierarchy $hierarchy
+
+        $result.Contexts[0].RestrictedActions |
+            Should -Not -Contain 'Dangerous.Provider/write'
+        $result.Contexts[0].RestrictedActions |
+            Should -Contain 'Dangerous.Provider/delete'
+    }
+
+    It 'limits a subscription role to scopes below its AssignableScope' {
+        $knownScopes = @(
+            (New-RadarScope -Id '/subscriptions/sub-1'),
+            (New-RadarScope `
+                -Id '/subscriptions/sub-1/resourceGroups/workload'),
+            (New-RadarScope -Id '/subscriptions/sub-2')
+        )
+        $hierarchy = Get-RadarScopeHierarchy -KnownScopes $knownScopes
+        $role = [pscustomobject]@{
+            Name = 'Subscription Operator'
+            Id = '/providers/Microsoft.Authorization/roleDefinitions/33333333-3333-3333-3333-333333333333'
+            IsCustom = $true
+            AssignableScopes = @('/subscriptions/sub-1')
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Microsoft.Resources/*')
+                    NotActions = @()
+                }
+            )
+        }
+
+        $availability = Get-RadarRoleScopesInContext `
+            -Role $role `
+            -ContextScopes $knownScopes `
+            -Hierarchy $hierarchy
+
+        $availability.Scopes.Id | Should -Contain '/subscriptions/sub-1'
+        $availability.Scopes.Id |
+            Should -Contain '/subscriptions/sub-1/resourceGroups/workload'
+        $availability.Scopes.Id | Should -Not -Contain '/subscriptions/sub-2'
+    }
+
+    It 'keeps ancestry above an accessible fallback root unresolved' {
+        $hierarchy = [pscustomobject]@{
+            AncestorsByScope = @{
+                '/providers/microsoft.management/managementgroups/child' = @()
+            }
+            UnresolvedAncestorRoots = @(
+                '/providers/microsoft.management/managementgroups/child'
+            )
+        }
+
+        $relationship = Test-RadarScopeDescendsFrom `
+            -Scope '/providers/Microsoft.Management/managementGroups/child' `
+            -RootScope '/providers/Microsoft.Management/managementGroups/unreadable-parent' `
+            -Hierarchy $hierarchy
+
+        $relationship.State | Should -Be 'Unknown'
+    }
+
+    It 'builds descendants from an accessible customer root without tenant-root read' {
+        Mock Get-AzManagementGroup {
+            if ($GroupName -eq 'tenant-root') {
+                throw 'tenant root forbidden'
+            }
+            [pscustomobject]@{
+                Id = '/providers/Microsoft.Management/managementGroups/customer-root'
+                Name = 'customer-root'
+                DisplayName = 'Customer root'
+                ParentId = '/providers/Microsoft.Management/managementGroups/tenant-root'
+                Children = @(
+                    [pscustomobject]@{
+                        Id = '/subscriptions/sub-1'
+                        Name = 'sub-1'
+                        DisplayName = 'Subscription 1'
+                        Children = @()
+                    }
+                )
+            }
+        }
+        $knownScopes = @(
+            (New-RadarScope `
+                -Id '/providers/Microsoft.Management/managementGroups/customer-root'),
+            (New-RadarScope -Id '/subscriptions/sub-1')
+        )
+
+        $hierarchy = Get-RadarScopeHierarchy -KnownScopes $knownScopes
+        $insideCustomer = Test-RadarScopeDescendsFrom `
+            -Scope '/subscriptions/sub-1' `
+            -RootScope '/providers/Microsoft.Management/managementGroups/customer-root' `
+            -Hierarchy $hierarchy
+        $aboveCustomer = Test-RadarScopeDescendsFrom `
+            -Scope '/subscriptions/sub-1' `
+            -RootScope '/providers/Microsoft.Management/managementGroups/tenant-root' `
+            -Hierarchy $hierarchy
+
+        $insideCustomer.State | Should -Be 'True'
+        $aboveCustomer.State | Should -Be 'Unknown'
     }
 }
 
@@ -496,6 +786,142 @@ Describe 'Get-RadarRoleInventory' {
             $Subscription -contains 'sub-1' -and -not $UseTenantScope
         }
     }
+
+    It 'retains roles beneath both roots in a mixed MG and subscription query' {
+        Mock Get-AzRoleDefinition { @() }
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/22222222-2222-2222-2222-222222222222'
+                        RoleName = 'Customer-Platform-Owner'
+                        AssignableScopes = @('/subscriptions/sub-1')
+                        Permissions = @(
+                            [pscustomobject]@{
+                                actions = @('*')
+                                notActions = @('Dangerous.Provider/write')
+                            }
+                        )
+                    },
+                    [pscustomobject]@{
+                        Id = '/subscriptions/unrelated/providers/Microsoft.Authorization/roleDefinitions/33333333-3333-3333-3333-333333333333'
+                        RoleName = 'Standalone Workload Role'
+                        AssignableScopes = @(
+                            '/subscriptions/unrelated/resourceGroups/workload'
+                        )
+                        Permissions = @(
+                            [pscustomobject]@{
+                                actions = @('Microsoft.Resources/*')
+                                notActions = @()
+                            }
+                        )
+                    }
+                )
+                SkipToken = $null
+            }
+        }
+
+        $inventory = Get-RadarRoleInventory `
+            -Scopes @(
+                (New-RadarScope `
+                    -Id '/providers/Microsoft.Management/managementGroups/customer-root'),
+                (New-RadarScope -Id '/subscriptions/unrelated')
+            )
+
+        $inventory.Warnings | Should -BeNullOrEmpty
+        $inventory.CustomRoles.Name |
+            Should -Contain 'Customer-Platform-Owner'
+        $inventory.CustomRoles.Name |
+            Should -Contain 'Standalone Workload Role'
+        $mgRole = $inventory.CustomRoles |
+            Where-Object { $_.Name -eq 'Customer-Platform-Owner' }
+        $roleKey = Get-RadarRoleKey -Role $mgRole
+        $inventory.RoleScopes[$roleKey] |
+            Should -Contain '/subscriptions/sub-1'
+        Should -Invoke Search-AzGraph -ParameterFilter {
+            $UseTenantScope -and
+            -not $ManagementGroup -and
+            -not $Subscription
+        }
+    }
+}
+
+Describe 'New-RadarScope' {
+    It 'classifies only exact subscription IDs as subscriptions' {
+        (New-RadarScope -Id '/subscriptions/sub-1').Type |
+            Should -Be 'Subscription'
+        (
+            New-RadarScope `
+                -Id '/subscriptions/sub-1/resourceGroups/workload'
+        ).Type | Should -Be 'ResourceGroup'
+        (
+            New-RadarScope `
+                -Id '/subscriptions/sub-1/resourceGroups/workload/providers/Microsoft.Storage/storageAccounts/test'
+        ).Type | Should -Be 'Resource'
+    }
+}
+
+Describe 'Get-RadarPolicyBoundaryScope' {
+    BeforeEach {
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @()
+                SkipToken = $null
+            }
+        }
+        Mock Get-AzPolicyAssignment {
+            @(
+                [pscustomobject]@{
+                    Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/deny'
+                    Scope = '/subscriptions/sub-1'
+                    NotScope = @(
+                        '/subscriptions/sub-1/resourceGroups/excluded'
+                    )
+                }
+            )
+        }
+        Mock Get-AzPolicyExemption {
+            @(
+                [pscustomobject]@{
+                    Id = '/subscriptions/sub-1/resourceGroups/waived/providers/Microsoft.Authorization/policyExemptions/waiver'
+                }
+            )
+        }
+    }
+
+    It 'uses live descendant queries to discover notScope and exemption boundaries' {
+        $result = Get-RadarPolicyBoundaryScope -Scopes @(
+            (New-RadarScope -Id '/subscriptions/sub-1')
+        )
+
+        $result.IsComplete | Should -BeTrue
+        $result.Scopes.Id |
+            Should -Contain '/subscriptions/sub-1/resourceGroups/excluded'
+        $result.Scopes.Id |
+            Should -Contain '/subscriptions/sub-1/resourceGroups/waived'
+        Should -Invoke Get-AzPolicyAssignment -ParameterFilter {
+            $IncludeDescendent -and
+            $Scope -eq '/subscriptions/sub-1'
+        }
+        Should -Invoke Get-AzPolicyExemption -ParameterFilter {
+            $IncludeDescendent -and
+            $Scope -eq '/subscriptions/sub-1'
+        }
+    }
+
+    It 'keeps exact-scope exemption evaluation separate from boundary discovery' {
+        Mock Get-AzPolicyAssignment { @() }
+        Mock Get-AzPolicyExemption { @() }
+
+        $null = Get-RadarPolicyInventory -Scopes @(
+            (New-RadarScope -Id '/subscriptions/sub-1')
+        )
+
+        Should -Invoke Get-AzPolicyExemption -ParameterFilter {
+            -not $IncludeDescendent -and
+            $Scope -eq '/subscriptions/sub-1'
+        }
+    }
 }
 
 Describe 'Test-RadarPolicyRuleForRole' {
@@ -514,7 +940,7 @@ Describe 'Test-RadarPolicyRuleForRole' {
                 allOf = @(
                     @{
                         field = 'type'
-                        equals = 'Microsoft.Authorization/roleAssignments'
+                        like = 'Microsoft.Authorization/*'
                     },
                     @{
                         field = 'Microsoft.Authorization/roleAssignments/roleDefinitionId'
@@ -549,7 +975,7 @@ Describe 'Test-RadarPolicyRuleForRole' {
                 allOf = @(
                     @{
                         field = 'type'
-                        equals = 'Microsoft.Authorization/roleAssignments'
+                        like = 'Microsoft.Authorization/*'
                     },
                     @{
                         not = @{
@@ -978,6 +1404,10 @@ Describe 'Resolve-RadarPolicyAssignment' {
 
 Describe 'Get-RadarRoleDenyCoverage' {
     BeforeAll {
+        $script:ownerRole = [pscustomobject]@{
+            Id = '/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635'
+            Name = 'Owner'
+        }
         $script:denyRule = @{
             if = @{
                 field = 'Microsoft.Authorization/roleAssignments/roleDefinitionId'
@@ -985,6 +1415,144 @@ Describe 'Get-RadarRoleDenyCoverage' {
             }
             then = @{ effect = 'Deny' }
         }
+        $script:directAssignmentPath = @(
+            [pscustomobject]@{
+                Name = 'Direct role assignment'
+                ResourceType =
+                    'Microsoft.Authorization/roleAssignments'
+            }
+        )
+    }
+
+    It 'does not treat a direct-assignment-only deny as covering PIM paths' {
+        $directOnlyRule = [pscustomobject]@{
+            AssignmentId = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/direct-only'
+            AssignmentName = 'Deny direct role assignments'
+            AssignmentScope = '/subscriptions/sub-1'
+            NotScopes = @()
+            DefinitionName = 'Deny direct role assignments'
+            ReferenceId = $null
+            PolicyRule = @{
+                if = @{
+                    allOf = @(
+                        @{
+                            field = 'type'
+                            equals = 'Microsoft.Authorization/roleAssignments'
+                        },
+                        @{
+                            field = 'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                            in = @($ownerRole.Id)
+                        }
+                    )
+                }
+                then = @{ effect = 'Deny' }
+            }
+            Parameters = @{}
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($directOnlyRule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+            }
+        }
+
+        $coverage = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-1') `
+            -PolicyInventory $inventory
+
+        $coverage.Status | Should -Be 'None'
+        $coverage.IsAlreadyDenied | Should -BeFalse
+        $coverage.UnblockedAssignmentPaths |
+            Should -Contain (
+                '/subscriptions/sub-1 :: PIM active assignment request'
+            )
+    }
+
+    It 'does not let a direct roleDefinitionId alias block PIM paths' {
+        $aliasOnlyRule = [pscustomobject]@{
+            AssignmentId = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/direct-alias'
+            AssignmentName = 'Deny direct role alias'
+            AssignmentScope = '/subscriptions/sub-1'
+            NotScopes = @()
+            DefinitionName = 'Deny direct role alias'
+            ReferenceId = $null
+            PolicyRule = @{
+                if = @{
+                    field =
+                        'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                    in = @($ownerRole.Id)
+                }
+                then = @{ effect = 'Deny' }
+            }
+            Parameters = @{}
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($aliasOnlyRule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+            }
+        }
+
+        $coverage = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-1') `
+            -PolicyInventory $inventory
+
+        $coverage.Status | Should -Be 'None'
+        $coverage.UnblockedAssignmentPaths |
+            Should -Contain (
+                '/subscriptions/sub-1 :: PIM eligible assignment request'
+            )
+    }
+
+    It 'does not let an unrelated Authorization alias block assignment paths' {
+        $unrelatedAliasRule = [pscustomobject]@{
+            AssignmentId = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/schedule-instance'
+            AssignmentName = 'Deny schedule instance'
+            AssignmentScope = '/subscriptions/sub-1'
+            NotScopes = @()
+            DefinitionName = 'Deny schedule instance'
+            ReferenceId = $null
+            PolicyRule = @{
+                if = @{
+                    field =
+                        'Microsoft.Authorization/roleAssignmentScheduleInstances/roleDefinitionId'
+                    in = @($ownerRole.Id)
+                }
+                then = @{ effect = 'Deny' }
+            }
+            Parameters = @{}
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($unrelatedAliasRule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+            }
+        }
+
+        $coverage = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-1') `
+            -PolicyInventory $inventory
+
+        $coverage.Status | Should -Be 'None'
+        $coverage.IsAlreadyDenied | Should -BeFalse
     }
 
     It 'treats a role denied at only some scopes as still obtainable' {
@@ -1017,7 +1585,8 @@ Describe 'Get-RadarRoleDenyCoverage' {
                 '/subscriptions/sub-1',
                 '/subscriptions/sub-2'
             ) `
-            -PolicyInventory $inventory
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath
 
         $coverage.Status | Should -Be 'Partial'
         $coverage.IsAlreadyDenied | Should -BeFalse
@@ -1055,7 +1624,8 @@ Describe 'Get-RadarRoleDenyCoverage' {
         $coverage = Get-RadarRoleDenyCoverage `
             -Role $ownerRole `
             -RoleScopes @('/subscriptions/sub-1') `
-            -PolicyInventory $inventory
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath
 
         $coverage.Status | Should -Be 'None'
         $coverage.IsAlreadyDenied | Should -BeFalse
@@ -1079,18 +1649,71 @@ Describe 'Get-RadarRoleDenyCoverage' {
             IsEvaluated = $true
             RulesByScope = @{
                 '/subscriptions/sub-1' = @($rule)
+                '/subscriptions/sub-1/resourcegroups/excluded' = @($rule)
             }
             ExemptionsByScope = @{
                 '/subscriptions/sub-1' = @()
+                '/subscriptions/sub-1/resourcegroups/excluded' = @()
             }
         }
 
         $coverage = Get-RadarRoleDenyCoverage `
             -Role $ownerRole `
-            -RoleScopes @('/subscriptions/sub-1') `
-            -PolicyInventory $inventory
+            -RoleScopes @(
+                '/subscriptions/sub-1',
+                '/subscriptions/sub-1/resourceGroups/excluded'
+            ) `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath
 
-        $coverage.Status | Should -Be 'Unknown'
+        $coverage.Status | Should -Be 'Partial'
+        $coverage.IsAlreadyDenied | Should -BeFalse
+        $coverage.UnblockedScopes |
+            Should -Contain '/subscriptions/sub-1/resourceGroups/excluded'
+    }
+
+    It 'honours management-group notScopes through the hierarchy' {
+        $rule = [pscustomobject]@{
+            AssignmentId = '/providers/Microsoft.Management/managementGroups/root/providers/Microsoft.Authorization/policyAssignments/deny'
+            AssignmentName = 'Deny Owner'
+            AssignmentScope = '/providers/Microsoft.Management/managementGroups/root'
+            NotScopes = @(
+                '/providers/Microsoft.Management/managementGroups/uat'
+            )
+            DefinitionName = 'Deny Owner'
+            ReferenceId = $null
+            PolicyRule = $denyRule
+            Parameters = @{}
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-uat' = @($rule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-uat' = @()
+            }
+        }
+        $hierarchy = [pscustomobject]@{
+            AncestorsByScope = @{
+                '/subscriptions/sub-uat' = @(
+                    '/providers/Microsoft.Management/managementGroups/root',
+                    '/providers/Microsoft.Management/managementGroups/uat'
+                )
+            }
+            UnresolvedAncestorRoots = @()
+        }
+
+        $coverage = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-uat') `
+            -PolicyInventory $inventory `
+            -ScopeHierarchy $hierarchy `
+            -AssignmentPaths $directAssignmentPath
+
+        $coverage.Status | Should -Be 'None'
         $coverage.IsAlreadyDenied | Should -BeFalse
     }
 
@@ -1109,6 +1732,7 @@ Describe 'Get-RadarRoleDenyCoverage' {
         $inventory = [pscustomobject]@{
             IsEvaluated = $true
             IsComplete = $false
+            UncertainScopes = @('/subscriptions/sub-1')
             RulesByScope = @{
                 '/subscriptions/sub-1' = @($rule)
             }
@@ -1120,10 +1744,45 @@ Describe 'Get-RadarRoleDenyCoverage' {
         $coverage = Get-RadarRoleDenyCoverage `
             -Role $ownerRole `
             -RoleScopes @('/subscriptions/sub-1') `
-            -PolicyInventory $inventory
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath
 
         $coverage.Status | Should -Be 'Unknown'
         $coverage.IsAlreadyDenied | Should -BeFalse
+    }
+
+    It 'does not let an unrelated failed policy scope downgrade full coverage' {
+        $rule = [pscustomobject]@{
+            AssignmentId = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/deny'
+            AssignmentName = 'Deny Owner'
+            AssignmentScope = '/subscriptions/sub-1'
+            NotScopes = @()
+            DefinitionName = 'Deny Owner'
+            ReferenceId = $null
+            PolicyRule = $denyRule
+            Parameters = @{}
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $false
+            UncertainScopes = @('/subscriptions/sub-2')
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($rule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+            }
+        }
+
+        $coverage = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-1') `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath
+
+        $coverage.Status | Should -Be 'Full'
+        $coverage.IsAlreadyDenied | Should -BeTrue
     }
 }
 
@@ -1151,6 +1810,7 @@ Describe 'Invoke-Radar end-to-end empty result' {
                     Name = 'Test'
                 }
             }
+
         }
         Mock Get-AzAccessToken {
             [pscustomobject]@{ Token = 'test' }
@@ -1171,6 +1831,12 @@ Describe 'Invoke-Radar end-to-end empty result' {
                     )
                 }
             )
+        }
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @()
+                SkipToken = $null
+            }
         }
         Mock Get-AzPolicyExemption { @() }
     }
@@ -1242,16 +1908,8 @@ Describe 'Invoke-Radar end-to-end empty result' {
                 Parameter = [pscustomobject]@{}
                 PolicyRule = @{
                     if = @{
-                        allOf = @(
-                            @{
-                                field = 'type'
-                                equals = 'Microsoft.Authorization/roleAssignments'
-                            },
-                            @{
-                                field = 'Microsoft.Authorization/roleAssignments/roleDefinitionId'
-                                in = "[parameters('roleIds')]"
-                            }
-                        )
+                        field = 'type'
+                        like = 'Microsoft.Authorization/*'
                     }
                     then = @{ effect = 'Deny' }
                 }
@@ -1270,7 +1928,11 @@ Describe 'Invoke-Radar end-to-end empty result' {
         $result.CoverageWarnings | Should -BeNullOrEmpty
         $result.DenyCoverage | Should -Be 'Full'
         $result.IsAlreadyDenied | Should -Be 'True'
-        $result.BlockingPolicies | Should -Be 'Deny Reader'
+        $result.BlockingPolicies |
+            Should -Match (
+                'Deny Reader \[/subscriptions/sub-1\] via ' +
+                'Direct role assignment'
+            )
     }
 
     It 'falls back to the bundled CSV when automatic baseline discovery finds no role' {
@@ -1306,5 +1968,177 @@ Describe 'Invoke-Radar end-to-end empty result' {
         Test-Path -LiteralPath $outputCsv | Should -BeTrue
         (Get-Content -LiteralPath $outputCsv -Raw) |
             Should -Match '"RestrictedAction"'
+    }
+}
+
+Describe 'Invoke-Radar scoped baseline gap model' {
+    BeforeEach {
+        Mock Get-AzContext {
+            [pscustomobject]@{
+                Account = [pscustomobject]@{
+                    Id = 'test@example.invalid'
+                }
+                Tenant = [pscustomobject]@{ Id = 'tenant-1' }
+                Subscription = [pscustomobject]@{
+                    Id = 'sub-1'
+                    Name = 'Test'
+                }
+            }
+        }
+        Mock Get-AzAccessToken {
+            [pscustomobject]@{ Token = 'test' }
+        }
+        Mock Get-AzRoleDefinition {
+            @(
+                [pscustomobject]@{
+                    Name = 'Dangerous Built-in'
+                    Id = '/providers/Microsoft.Authorization/roleDefinitions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                    IsCustom = $false
+                    AssignableScopes = @('/')
+                    Permissions = @(
+                        [pscustomobject]@{
+                            Actions = @('Dangerous.Provider/*')
+                            NotActions = @()
+                        }
+                    )
+                }
+            )
+        }
+        Mock Search-AzGraph {
+            if ($Query -match 'roledefinitions') {
+                return [pscustomobject]@{
+                    Data = @(
+                        [pscustomobject]@{
+                            Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+                            RoleName = 'Customer-Platform-Owner'
+                            AssignableScopes = @('/subscriptions/sub-1')
+                            Permissions = @(
+                                [pscustomobject]@{
+                                    actions = @('*')
+                                    notActions = @(
+                                        'Dangerous.Provider/write',
+                                        'Dangerous.Provider/delete',
+                                        'Dangerous.Provider/action',
+                                        'Microsoft.Authorization/roleAssignmentScheduleRequests/write',
+                                        'Microsoft.Authorization/roleEligibilityScheduleRequests/write'
+                                    )
+                                }
+                            )
+                        },
+                        [pscustomobject]@{
+                            Id = '/subscriptions/sub-2/providers/Microsoft.Authorization/roleDefinitions/22222222-2222-2222-2222-222222222222'
+                            RoleName = 'Customer-Platform-Owner-UAT'
+                            AssignableScopes = @('/subscriptions/sub-2')
+                            Permissions = @(
+                                [pscustomobject]@{
+                                    actions = @('*')
+                                    notActions = @(
+                                        'Dangerous.Provider/write',
+                                        'Dangerous.Provider/delete',
+                                        'Dangerous.Provider/action',
+                                        'Microsoft.Authorization/roleAssignmentScheduleRequests/write',
+                                        'Microsoft.Authorization/roleEligibilityScheduleRequests/write'
+                                    )
+                                }
+                            )
+                        }
+                    )
+                    SkipToken = $null
+                }
+            }
+
+            return [pscustomobject]@{
+                Data = @()
+                SkipToken = $null
+            }
+        }
+        Mock Get-AzPolicyAssignment {
+            if ($Scope -ieq '/subscriptions/sub-1') {
+                return @(
+                    [pscustomobject]@{
+                        Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/deny-danger'
+                        Name = 'deny-danger'
+                        DisplayName = 'Deny Dangerous Built-in'
+                        Scope = '/subscriptions/sub-1'
+                        PolicyDefinitionId = '/providers/Microsoft.Authorization/policyDefinitions/deny-danger'
+                        EnforcementMode = 'Default'
+                        Parameter = [pscustomobject]@{
+                            roleIds = [pscustomobject]@{
+                                value = @(
+                                    '/providers/Microsoft.Authorization/roleDefinitions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                                )
+                            }
+                        }
+                        NotScope = @()
+                    }
+                )
+            }
+            return @()
+        }
+        Mock Get-AzPolicyDefinition {
+            [pscustomobject]@{
+                Id = $Id
+                Name = 'deny-danger'
+                DisplayName = 'Deny Dangerous Built-in'
+                Mode = 'All'
+                Parameter = [pscustomobject]@{}
+                PolicyRule = @{
+                    if = @{
+                        allOf = @(
+                            @{
+                                field = 'type'
+                                like = 'Microsoft.Authorization/*'
+                            },
+                            @{
+                                field = 'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                                in = "[parameters('roleIds')]"
+                            }
+                        )
+                    }
+                    then = @{ effect = 'Deny' }
+                }
+            }
+        }
+        Mock Get-AzPolicyExemption { @() }
+    }
+
+    It 'keeps customer-style baselines separate and exposes the unblocked scope' {
+        $outputCsv = Join-Path $TestDrive 'scoped-gaps.csv'
+
+        & $scriptPath `
+            -NoMenu `
+            -Scope '/subscriptions/sub-1','/subscriptions/sub-2' `
+            -DynamicRestrictedActions `
+            -BaselineRolePattern 'Customer-Platform-*' `
+            -OutputCsv $outputCsv
+
+        $results = @(Import-Csv -LiteralPath $outputCsv)
+        $production = @(
+            $results |
+                Where-Object {
+                    $_.AnalysisMode -eq 'BaselineNotActions' -and
+                    $_.BaselineRoleName -eq 'Customer-Platform-Owner' -and
+                    $_.RoleName -eq 'Dangerous Built-in' -and
+                    $_.RestrictedAction -eq 'Dangerous.Provider/write'
+                }
+        )
+        $uat = @(
+            $results |
+                Where-Object {
+                    $_.AnalysisMode -eq 'BaselineNotActions' -and
+                    $_.BaselineRoleName -eq 'Customer-Platform-Owner-UAT' -and
+                    $_.RoleName -eq 'Dangerous Built-in' -and
+                    $_.RestrictedAction -eq 'Dangerous.Provider/write'
+                }
+        )
+
+        $production.Count | Should -Be 1
+        $production[0].BaselineScope |
+            Should -Be '/subscriptions/sub-1'
+        $production[0].DenyCoverage | Should -Be 'Full'
+        $uat.Count | Should -Be 1
+        $uat[0].BaselineScope | Should -Be '/subscriptions/sub-2'
+        $uat[0].DenyCoverage | Should -Be 'None'
+        $uat[0].UnblockedScopes | Should -Be '/subscriptions/sub-2'
     }
 }

@@ -8,64 +8,91 @@
 ![Forks](https://img.shields.io/github/forks/danielfears/azure-radar?style=flat-square&logo=github)
 ![Last commit](https://img.shields.io/github/last-commit/danielfears/azure-radar?style=flat-square)
 
-RADAR identifies Azure RBAC roles that grant defined **restricted actions** and
-compares those roles with the Azure Policies that block role assignment. It
-then reports the restricted actions that remain obtainable through a role that
-is not denied at every evaluated scope.
+RADAR performs scope-aware Azure RBAC gap analysis. It answers:
 
-By default, RADAR discovers the management groups and subscriptions visible to
-the current identity. It scans built-in and custom roles, direct policies and
-initiatives, `notScopes`, and active policy exemptions without relying on a
-customer-specific management group or policy name.
+> A customer baseline role removes an action with `NotActions`. Can a principal
+> regain that action through another role available in the same scope tree, and
+> does Azure Policy actually block every relevant assignment route?
 
-RADAR supports both the legacy flattened role model and the `Permissions[]`
-model introduced by Az.Resources 10 / Azure PowerShell 16.
+RADAR discovers the accessible estate, retains each baseline role and
+`AssignableScope` as a separate security context, finds roles that grant the
+baseline's restricted actions, and evaluates effective deny policies,
+`notScopes`, exemptions, and direct/PIM assignment paths.
 
-## How it works
+RADAR supports the legacy flattened role model and the `Permissions[]` model
+introduced by Az.Resources 10 / Azure PowerShell 16.
+
+## Analysis model
 
 ```mermaid
 flowchart LR
-    A(["restricted-actions.csv"]) --> M
-    B(["Accessible Azure estate<br/>built-in + custom roles"]) --> M
-    P(["Policy assignments<br/>definitions + initiatives<br/>exemptions + notScopes"]) --> D
-    M{{"Wildcard-aware permission match<br/>Actions minus NotActions"}} --> R
-    R[("Roles granting<br/>restricted actions")] --> D
-    D{{"Evaluate deny coverage<br/>at each role-availability scope"}} --> H
-    H[/"CSV + self-contained HTML<br/>full / partial / unknown / none"/]
+    B["Baseline role<br/>Actions = *<br/>NotActions = restricted set"]
+    S["Exact AssignableScope<br/>and known descendants"]
+    R["Built-in and custom roles<br/>available in that subtree"]
+    P["Effective Azure Policy<br/>assignments, notScopes,<br/>exemptions and versions"]
+    G["Scope-specific gap:<br/>restricted action remains<br/>obtainable"]
+
+    B --> S
+    S --> R
+    R --> G
+    P --> G
 ```
 
-The restricted-action list can come from a CSV, from the `NotActions` of broad
-customer baseline roles, or from both sources. A role is counted as safely
-denied only when an effective deny policy blocks it at **every** scope where the
-role is available. Partial or uncertain coverage is treated as obtainable.
+The semantic unit is:
+
+```text
+baseline role × baseline AssignableScope × restricted action × granting role
+```
+
+Baseline roles are never unioned. If production and UAT variants have the same
+`NotActions`, production can be fully protected while UAT remains exposed, and
+RADAR reports those independently.
+
+An `AssignableScope` is treated as a subtree:
+
+- A management-group scope includes known descendant management groups,
+  subscriptions, resource groups, and resources.
+- A subscription scope includes known descendant resource groups and resources.
+- A resource-group scope includes known descendant resources.
+
+RADAR discovers additional evaluation scopes from custom-role
+`AssignableScopes`, policy assignments, policy `notScopes`, and policy
+exemptions. Resource Graph provides the broad inventory; live ARM queries
+confirm policy boundary scopes before a result can be considered fully covered.
 
 ## Features
 
-- Scans built-in and custom roles across an accessible customer estate.
-- Uses Azure Resource Graph for tenant-wide custom-role discovery when
-  available, with scoped Az.Resources queries as a fallback.
-- Matches exact permissions and intersecting wildcards on either side.
-- Supports role definitions returned by Az.Resources 9 and Az.Resources 10+.
-- Honours `NotActions` when calculating effective control-plane permissions.
-- Resolves direct policy definitions and initiative member policies.
-- Distinguishes deny-lists from allow-lists rather than treating every policy
-  parameter value as a blocked role.
-- Resolves assignment parameters, definition defaults, parameterised effects,
-  `notScopes`, `DoNotEnforce`, and active policy exemptions.
-- Reports unsupported policy expressions as unknown coverage instead of
-  silently claiming that a role is blocked.
-- Emits a CSV and a self-contained HTML dashboard.
+- Discovers accessible management groups and enabled subscriptions.
+- Scans built-in and custom roles using Azure Resource Graph, with a conservative
+  Az.Resources fallback.
+- Supports Az.Resources 9 and Az.Resources 10+ role object shapes.
+- Matches exact permissions and intersecting wildcards in either direction.
+- Performs exact wildcard set subtraction for `Actions`, `NotActions`, and the
+  restricted pattern.
+- Keeps separate `Permissions[]` blocks independent.
+- Creates one dynamic baseline context per role and exact `AssignableScope`.
+- Resolves direct policy definitions and initiative members.
+- Resolves assignment parameters, defaults, effects, and pinned/effective
+  definition versions.
+- Distinguishes role deny-lists from role allow-lists.
+- Applies policy mode, `EnforcementMode`, `notScopes`, and active exemptions at
+  each exact evaluation scope.
+- Treats overrides, selectors, unsupported expressions, failed scope queries,
+  and unresolved hierarchy relationships as `Unknown`, never safely denied.
+- Evaluates direct role assignment and any PIM assignment-request paths granted
+  by the baseline role.
+- Emits a detailed CSV and a self-contained HTML dashboard.
 
 ## Requirements
 
-- PowerShell 7+ (Windows PowerShell 5.1 remains supported)
+- PowerShell 7+; Windows PowerShell 5.1 remains supported
 - [`Az.Accounts`](https://learn.microsoft.com/powershell/module/az.accounts/)
 - [`Az.Resources`](https://learn.microsoft.com/powershell/module/az.resources/)
 - [`Az.ResourceGraph`](https://learn.microsoft.com/powershell/module/az.resourcegraph/)
-  is optional but recommended for estate-wide custom-role discovery
+  is strongly recommended
 - An authenticated Azure context
 
-The identity needs read access to the estate being assessed:
+The identity needs read access to the estate:
 
 ```text
 Microsoft.Authorization/roleDefinitions/read
@@ -77,14 +104,15 @@ Microsoft.Management/managementGroups/read
 Microsoft.Resources/subscriptions/read
 ```
 
-`Reader` at the customer root management group is the simplest way to provide
-the necessary visibility. RADAR never creates, changes, or deletes Azure
-resources.
+`Reader` at the customer root management group is the simplest assignment.
+Tenant Root Group access is not required: RADAR falls back to visible customer
+roots when tenant-root hierarchy is unreadable.
 
-### Azure Cloud Shell
+RADAR never creates, updates, or deletes Azure resources.
 
-Azure Cloud Shell already supplies PowerShell, Azure authentication, and the Az
-modules:
+## Azure Cloud Shell
+
+PowerShell Cloud Shell already supplies Azure authentication and the Az modules:
 
 ```powershell
 git clone https://github.com/danielfears/azure-radar.git
@@ -92,8 +120,11 @@ Set-Location ./azure-radar
 ./Invoke-Radar.ps1
 ```
 
-Use the PowerShell Cloud Shell. Download the generated HTML and CSV before an
-ephemeral session ends, or use a mounted Cloud Shell storage account.
+Use mounted Cloud Shell storage for persistence, or download the generated CSV
+and HTML before an ephemeral session ends.
+
+Large estates can take time: policy assignments and exemptions are queried at
+each relevant exact scope to prevent a parent result hiding a descendant gap.
 
 ## Repository layout
 
@@ -107,7 +138,9 @@ azure-radar/
 └── output/                    # Created at runtime
 ```
 
-## Input
+## Inputs
+
+### Restricted actions CSV
 
 `restricted-actions.csv` must contain an `Action` column:
 
@@ -119,8 +152,13 @@ Microsoft.KeyVault/vaults/delete
 Microsoft.Storage/storageAccounts/listKeys/action
 ```
 
-`denied-roles.csv` is an optional manual supplement. It must contain a
-`RoleName` column:
+CSV actions are an independent, estate-wide safety audit. They are **not**
+attributed to, or unioned into, a particular dynamic baseline role.
+
+### Denied roles CSV
+
+`denied-roles.csv` is an optional manual assertion that named roles are blocked
+throughout the assessed estate:
 
 ```csv
 RoleName
@@ -129,165 +167,173 @@ Contributor
 User Access Administrator
 ```
 
-The CSV supplement is used only when passed explicitly with
-`-DeniedRolesCsv`; it is not loaded automatically. Listed roles are asserted to
-be denied across the full assessed estate.
+It is loaded only when passed explicitly with `-DeniedRolesCsv`. Live policy
+discovery remains enabled unless `-NoPolicyDiscovery` is supplied.
 
 ## Usage
 
-The interactive default scans the accessible estate:
+### Interactive estate scan
 
 ```powershell
 Connect-AzAccount
 ./Invoke-Radar.ps1
 ```
 
-For a non-interactive run:
+The interactive menu keeps the bundled CSV safety audit and can additionally
+enable dynamic baseline analysis.
+
+### Full customer gap analysis
 
 ```powershell
 ./Invoke-Radar.ps1 -NoMenu `
+    -DynamicRestrictedActions `
     -InputCsv ./restricted-actions.csv `
     -OutputCsv ./output/radar-report.csv `
     -OutputHtml ./output/radar-report.html
 ```
+
+### Explicit customer baseline roles
+
+Auto-detection selects every visible custom wildcard role with non-empty
+`NotActions` and `Owner`, `Contributor`, or `Baseline` in its name. Every role
+is analysed separately; their restrictions are never merged.
+
+Use `-BaselineRolePattern` when customer naming differs or when only approved
+canonical baselines should be analysed:
+
+```powershell
+./Invoke-Radar.ps1 -NoMenu `
+    -DynamicRestrictedActions `
+    -BaselineRolePattern 'Customer-Platform-Owner*','Customer-Platform-Contributor*' `
+    -InputCsv ./restricted-actions.csv `
+    -OutputCsv ./output/radar-report.csv `
+    -OutputHtml ./output/radar-report.html
+```
+
+Patterns are authoritative and can match production and UAT variants. If
+automatic discovery finds no baseline, RADAR falls back to the bundled CSV
+instead of aborting.
+
+Because role intent cannot be inferred perfectly from Azure metadata, inspect
+the baseline-context list in the report. Use explicit patterns when a customer's
+canonical roles are known.
 
 ### Scope controls
 
 | Parameter | Behaviour |
 | --- | --- |
 | No scope parameter | Discover accessible management groups and enabled subscriptions |
-| `-Scope <id>[,<id>...]` | Scan explicit Azure resource scope IDs |
+| `-Scope <id>[,<id>...]` | Restrict discovery to explicit Azure scope IDs |
 | `-ManagementGroup <name>` | Backwards-compatible shortcut for one management group |
-| `-CurrentSubscriptionOnly` | Limit the scan to the current subscription |
-| `-BuiltInOnly` | Skip custom-role discovery |
+| `-CurrentSubscriptionOnly` | Limit discovery to the current subscription |
+| `-BuiltInOnly` | Skip custom roles; incompatible with dynamic baselines |
 
 Examples:
 
 ```powershell
-# One management group
+# One customer management group
 ./Invoke-Radar.ps1 -NoMenu `
     -ManagementGroup customer-root `
-    -InputCsv ./restricted-actions.csv `
+    -DynamicRestrictedActions `
     -OutputCsv ./output/customer-root.csv
 
-# Two explicit subscriptions
+# Two subscriptions
 ./Invoke-Radar.ps1 -NoMenu `
     -Scope /subscriptions/<SUBSCRIPTION_ID_1>,/subscriptions/<SUBSCRIPTION_ID_2> `
-    -InputCsv ./restricted-actions.csv `
+    -DynamicRestrictedActions `
     -OutputCsv ./output/subscriptions.csv
 ```
 
-An explicit management-group-only scan cannot enumerate every exemption below
-that group through the Azure PowerShell API. RADAR therefore marks its discovery
-incomplete and will not claim `Full` deny coverage. Use the default estate scan
-or pass the descendant subscriptions explicitly when full coverage matters.
+If management-group ancestry above an accessible customer root cannot be read,
+RADAR keeps that relationship unresolved and fails open. It never assumes the
+customer root is unrelated to an unreadable parent.
 
-### Dynamic restricted actions
+## Policy and assignment-path evaluation
 
-`-DynamicRestrictedActions` derives restricted actions from broad custom roles
-that grant `*` and claw permissions back with `NotActions`. It does not require
-a particular management group or customer-specific default role name.
+For each relevant exact scope, RADAR:
 
-Without `-BaselineRolePattern`, RADAR auto-detects Owner and Contributor role
-families and selects the role with the fewest `NotActions` in each family. That
-favours broad platform baselines over narrow workload roles that grant `*` but
-claw back most Azure operations.
-
-```powershell
-# Auto-detect broad Owner/Contributor wildcard roles
-./Invoke-Radar.ps1 -NoMenu `
-    -DynamicRestrictedActions `
-    -OutputCsv ./output/radar-report.csv `
-    -OutputHtml ./output/radar-report.html
-
-# Override auto-detection for differently named customer baseline roles
-./Invoke-Radar.ps1 -NoMenu `
-    -DynamicRestrictedActions `
-    -BaselineRolePattern '*Platform Baseline Admin*' `
-    -OutputCsv ./output/radar-report.csv `
-    -OutputHtml ./output/radar-report.html
-```
-
-The interactive menu always keeps `restricted-actions.csv` as a safety baseline
-and optionally augments it with dynamically derived actions. A non-interactive
-automatic run also falls back to the bundled CSV if no usable baseline role is
-visible, rather than failing with no actions to evaluate.
-
-Combine `-DynamicRestrictedActions` with a custom `-InputCsv` to union both
-sources. Use narrow explicit role-name patterns: purpose-built wildcard roles
-often have broad `NotActions` lists that do not represent the customer's
-restricted baseline.
-
-### Policy discovery
-
-Live policy discovery is enabled by default. RADAR:
-
-1. Lists policy assignments effective at each role-availability scope.
+1. Gets effective policy assignments at that scope and its ancestors.
 2. Resolves direct definitions and initiative members.
-3. Resolves assignment parameters and definition defaults.
-4. Uses pinned/effective policy and initiative-member definition versions.
-5. Evaluates deny conditions against every discovered role.
-6. Applies policy mode, `EnforcementMode`, `notScopes`, and active exemptions.
-7. Treats assignment overrides and resource selectors as unknown unless their
-   effect can be proven safely.
-8. Calculates whether each role is denied everywhere, denied at some scopes,
-   not denied, or cannot be determined safely.
+3. Resolves parameters, effects, and effective definition versions.
+4. Rejects `Indexed` definitions for role-assignment enforcement.
+5. Applies `DoNotEnforce`, `notScopes`, and active exact-scope exemptions.
+6. Marks selectors, overrides, and unsupported runtime expressions as unknown.
+7. Evaluates the granting role against:
+   - direct `Microsoft.Authorization/roleAssignments`;
+   - PIM active assignment requests, when the baseline can create them;
+   - PIM eligible assignment requests, when the baseline can create them.
 
-Use `-NoPolicyDiscovery` for a role-only scan or when relying entirely on an
-explicit `-DeniedRolesCsv` supplement.
+A role is `Full` only when every relevant scope and every available assignment
+path is definitely blocked. One unblocked or uncertain path keeps the action
+obtainable.
+
+`-NoPolicyDiscovery` performs role matching without claiming policy coverage.
 
 ## Coverage states
 
 | State | Meaning | Counted as obtainable |
 | --- | --- | --- |
-| `Full` | The role is blocked at every evaluated availability scope | No |
-| `Partial` | The role is blocked at some scopes but available at others | Yes |
-| `None` | No evaluated deny rule blocks the role | Yes |
-| `Unknown` | A rule, override, exclusion, or discovery gap cannot be resolved safely | Yes |
+| `Full` | Every relevant scope and assignment path is definitely blocked | No |
+| `Partial` | Some relevant scopes are blocked and others remain open | Yes |
+| `None` | No evaluated deny rule blocks every required path | Yes |
+| `Unknown` | Coverage cannot be proven at one or more relevant scopes | Yes |
 | `NotEvaluated` | Live policy discovery was disabled | Yes |
 
-The tool is deliberately conservative: only `Full` coverage removes a role
-from the obtainable-action calculation.
+Completeness is scope-local. A failed query in subscription B does not downgrade
+a fully proven result in unrelated subscription A.
 
 ## Output
 
-The CSV has one row per matched role and restricted action:
+The detailed CSV contains:
 
+- `AnalysisMode`
+- `BaselineRoleName`, `BaselineRoleId`, `BaselineScope`
+- `RestrictionSource`
+- `AssignmentPath`
 - `RoleName`, `RoleId`, `IsCustom`
 - `RestrictedAction`, `MatchedPattern`
-- `IsAlreadyDenied` (`True` only for `Full` coverage)
-- `DenyCoverage`
+- `IsAlreadyDenied`, `DenyCoverage`
 - `DeniedScopeCount`, `EvaluatedScopeCount`
 - `BlockingPolicies`
-- `UnblockedScopes`
+- `DeniedScopes`, `UnblockedScopes`
+- `UnblockedAssignmentPaths`
 - `CoverageWarnings`
 
 The HTML report includes:
 
-- estate, role, policy-rule, and exemption counts;
-- scope-aware deny coverage;
-- currently obtainable restricted actions;
-- Full, Partial, Unknown, and Not Denied role badges;
-- discovery warnings embedded in the report;
-- searchable per-role permission matches.
+- role, policy, exemption, scope, and baseline-context counts;
+- per-baseline obtainable-action totals;
+- an explicitly labelled estate-wide union;
+- source baseline and scope on every granting-role section;
+- full, partial, unknown, and not-denied badges;
+- blocking policy names and assignment scopes;
+- unblocked assignment paths;
+- embedded discovery warnings and searchable findings.
+
+## Interpretation
+
+RADAR is a **latent capability** analysis. A finding means an available role can
+grant an action that a baseline removes and policy does not conclusively block
+throughout the relevant subtree.
+
+RADAR does not claim that a specific person has already exploited that path.
+The `AssignmentPath` field indicates whether the baseline itself can create
+direct/PIM assignments or whether another principal or delivery process is
+required.
 
 ## Safety and limitations
 
-- Results are limited to scopes and objects readable by the current identity.
-- Azure Resource Graph is eventually consistent. If it fails, RADAR falls back
-  to live scoped role queries and surfaces any failed scopes.
-- Policy expressions involving unsupported runtime fields or functions are
-  reported as `Unknown`, never as fully denied.
-- Definition-version ranges without an effective version, assignment resource
-  selectors, and assignment overrides are reported as `Unknown`.
-- Role-definition ABAC conditions are not evaluated against a particular
-  request or principal. A conditional permission is treated as potentially
-  obtainable.
-- RADAR evaluates whether a role could grant an action and whether policy blocks
-  assigning it. It does not determine which individual principals currently
-  possess `roleAssignments/write`.
-- The restricted-action matcher currently evaluates control-plane `Actions`;
-  it does not assess `DataActions`.
+- Results are limited to objects readable by the current identity.
+- Azure metadata cannot prove which wildcard role represents business intent;
+  explicit baseline patterns are recommended for known customers.
+- Resource Graph is eventually consistent, so live ARM queries independently
+  confirm descendant policy and exemption boundary scopes.
+- Conditional role-definition permissions are treated as potentially
+  obtainable because request attributes are unknown.
+- Unsupported policy logic remains `Unknown`.
+- `DataActions` are not currently analysed.
+- Actual principal/group membership and existing combined role assignments are
+  not correlated; this is capability analysis rather than a principal audit.
 
 ## Testing
 
@@ -297,17 +343,28 @@ Tests require Pester 5:
 Invoke-Pester -Path ./Invoke-Radar.Tests.ps1 -Output Detailed
 ```
 
-The suite runs offline with mocked Azure responses. It covers Az.Resources 9
-and 10 role shapes, wildcard intersections, policy deny/allow lists,
-initiatives, exemptions, partial scope coverage, and empty reports.
+The offline suite covers:
+
+- Az.Resources 9 and 10 role shapes;
+- cross-position wildcard intersection and exact wildcard subtraction;
+- independent permission blocks;
+- management-group hierarchy and fallback roots;
+- separate production/UAT baseline contexts;
+- direct and PIM assignment paths;
+- direct policies, initiatives, allow-lists, versions, selectors, overrides,
+  `notScopes`, and exemptions;
+- scope-local incomplete discovery;
+- empty CSV/HTML reports.
 
 ## Roadmap
 
 - [x] Az.Resources 10 `Permissions[]` compatibility
 - [x] Estate-wide custom-role discovery
-- [x] Generic direct-policy and initiative deny discovery
-- [x] Scope-aware coverage with `notScopes` and exemptions
-- [x] Conservative unsupported-policy reporting
+- [x] Per-role, per-AssignableScope baseline contexts
+- [x] Scope-specific policy gap analysis
+- [x] Direct and PIM assignment-path coverage
+- [x] Scope-local conservative failure handling
+- [ ] Optional principal/role-assignment correlation
 - [ ] Markdown report format
 - [ ] CI-friendly exit codes
 

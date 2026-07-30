@@ -44,8 +44,8 @@
 
 .PARAMETER BaselineRolePattern
     Optional role-name wildcard patterns used by -DynamicRestrictedActions.
-    When omitted, RADAR selects the broadest custom wildcard roles with Owner
-    or Contributor in the name. Supply patterns to override auto-detection.
+    When omitted, RADAR selects custom wildcard roles with Owner, Contributor,
+    or Baseline in the name. Supply patterns to override auto-detection.
 
 .PARAMETER NoPolicyDiscovery
     Disables live discovery of Azure Policy assignments that deny roles.
@@ -163,7 +163,7 @@ if (-not $invokedWithArgs -and -not $NoMenu) {
             Write-Host "  Baseline patterns: $($BaselineRolePattern -join ', ')"
         }
         else {
-            Write-Host '  Baseline roles:    automatic (broadest Owner/Contributor wildcard roles)'
+            Write-Host '  Baseline roles:    automatic (Owner/Contributor/Baseline wildcard roles)'
         }
         Write-Host "  InputCsv:          $InputCsv"
     } else {
@@ -208,7 +208,7 @@ if ($DynamicRestrictedActions) {
         Write-Host "Dynamic derivation scoped to baseline role pattern(s): $($BaselineRolePattern -join ', ')"
     }
     else {
-        Write-Host 'Dynamic derivation will auto-detect the broadest Owner/Contributor wildcard roles.'
+        Write-Host 'Dynamic derivation will auto-detect Owner/Contributor/Baseline wildcard roles.'
     }
 }
 
@@ -276,8 +276,17 @@ function New-RadarScope {
     ) {
         'ManagementGroup'
     }
-    elseif ($normalisedId -like '/subscriptions/*') {
+    elseif (
+        $normalisedId -match
+        '(?i)^/subscriptions/[^/]+$'
+    ) {
         'Subscription'
+    }
+    elseif (
+        $normalisedId -match
+        '(?i)^/subscriptions/[^/]+/resourceGroups/[^/]+$'
+    ) {
+        'ResourceGroup'
     }
     else {
         'Resource'
@@ -459,6 +468,386 @@ function Get-RadarScanScope {
         IsComplete = $isComplete
         Warnings = $warnings.ToArray()
         DiscoveryMode = $discoveryMode
+    }
+}
+
+function Add-RadarHierarchyNode {
+    param(
+        [object]$Node,
+        [string[]]$AncestorIds,
+        [hashtable]$AncestorsByScope,
+        [hashtable]$ScopeById
+    )
+
+    $id = [string](
+        Get-RadarPropertyValue -InputObject $Node -Name 'Id'
+    )
+    if ([string]::IsNullOrWhiteSpace($id)) { return }
+    $normalisedId = $id.TrimEnd('/')
+    $key = $normalisedId.ToLowerInvariant()
+    $AncestorsByScope[$key] = @($AncestorIds)
+    $ScopeById[$key] = New-RadarScope `
+        -Id $normalisedId `
+        -Name (
+            Get-RadarPropertyValue -InputObject $Node -Name 'Name'
+        ) `
+        -DisplayName (
+            Get-RadarPropertyValue `
+                -InputObject $Node `
+                -Name 'DisplayName'
+        )
+
+    $nextAncestors = @($AncestorIds + $normalisedId)
+    foreach (
+        $child in @(
+            Get-RadarPropertyValue -InputObject $Node -Name 'Children' |
+                Where-Object { $null -ne $_ }
+        )
+    ) {
+        Add-RadarHierarchyNode `
+            -Node $child `
+            -AncestorIds $nextAncestors `
+            -AncestorsByScope $AncestorsByScope `
+            -ScopeById $ScopeById
+    }
+}
+
+function Get-RadarScopeHierarchy {
+    <#
+    Builds management-group and subscription ancestry once. Resource-group and
+    resource scopes inherit their subscription's management-group ancestors.
+    #>
+    param([object[]]$KnownScopes = @())
+
+    $ancestorsByScope = @{}
+    $scopeById = @{}
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $isComplete = $true
+    $fallbackParentByRoot = @{}
+    $unresolvedAncestorRoots =
+        New-Object System.Collections.Generic.HashSet[string] (
+            [StringComparer]::OrdinalIgnoreCase
+        )
+
+    $requiresManagementGroupHierarchy = @(
+        $KnownScopes |
+            Where-Object {
+                $_.Type -eq 'ManagementGroup' -or
+                $_.Id -like
+                    '/providers/Microsoft.Management/managementGroups/*'
+            }
+    ).Count -gt 0
+    if ($requiresManagementGroupHierarchy) {
+        $hierarchyErrors =
+            New-Object System.Collections.Generic.List[string]
+        try {
+            $context = Get-AzContext -ErrorAction Stop
+            $tenantId = [string](
+                Get-RadarPropertyValue `
+                    -InputObject $context.Tenant `
+                    -Name 'Id'
+            )
+            if ([string]::IsNullOrWhiteSpace($tenantId)) {
+                throw 'The current Azure context has no tenant ID.'
+            }
+            $root = Get-AzManagementGroup `
+                -GroupName $tenantId `
+                -Expand `
+                -Recurse `
+                -ErrorAction Stop `
+                -WarningAction SilentlyContinue
+            Add-RadarHierarchyNode `
+                -Node $root `
+                -AncestorIds @() `
+                -AncestorsByScope $ancestorsByScope `
+                -ScopeById $scopeById
+        }
+        catch {
+            [void]$hierarchyErrors.Add(
+                "Tenant-root hierarchy was not readable: $($_.Exception.Message)"
+            )
+        }
+
+        # Reader is commonly granted at a customer root below the Tenant Root
+        # Group. Recurse from every still-uncovered visible MG so that deployment
+        # remains useful without tenant-root permissions.
+        foreach (
+            $knownManagementGroup in @(
+                $KnownScopes |
+                    Where-Object {
+                        $_.Type -eq 'ManagementGroup'
+                    } |
+                    Sort-Object Name
+            )
+        ) {
+            $knownKey =
+                $knownManagementGroup.Id.TrimEnd('/').ToLowerInvariant()
+            if ($scopeById.ContainsKey($knownKey)) { continue }
+            try {
+                $accessibleRoot = Get-AzManagementGroup `
+                    -GroupName $knownManagementGroup.Name `
+                    -Expand `
+                    -Recurse `
+                    -ErrorAction Stop `
+                    -WarningAction SilentlyContinue
+                $accessibleRootId = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $accessibleRoot `
+                        -Name 'Id'
+                )
+                $accessibleParentId = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $accessibleRoot `
+                        -Name 'ParentId'
+                )
+                if ($accessibleRootId -and $accessibleParentId) {
+                    $fallbackParentByRoot[
+                        $accessibleRootId.TrimEnd('/').ToLowerInvariant()
+                    ] = $accessibleParentId.TrimEnd('/')
+                }
+                Add-RadarHierarchyNode `
+                    -Node $accessibleRoot `
+                    -AncestorIds @() `
+                    -AncestorsByScope $ancestorsByScope `
+                    -ScopeById $scopeById
+            }
+            catch {
+                [void]$hierarchyErrors.Add(
+                    "Hierarchy below management group '$($knownManagementGroup.Name)' was not readable: $($_.Exception.Message)"
+                )
+            }
+        }
+
+        foreach ($fallbackRootKey in $fallbackParentByRoot.Keys) {
+            $parentKey =
+                $fallbackParentByRoot[$fallbackRootKey].ToLowerInvariant()
+            if (-not $scopeById.ContainsKey($parentKey)) {
+                [void]$unresolvedAncestorRoots.Add($fallbackRootKey)
+            }
+        }
+
+        $unresolvedHierarchyScopes = @(
+            $KnownScopes |
+                Where-Object {
+                    $scopeId = $_.Id.TrimEnd('/').ToLowerInvariant()
+                    (
+                        $_.Type -eq 'ManagementGroup' -or
+                        $_.Type -eq 'Subscription'
+                    ) -and
+                    -not $scopeById.ContainsKey($scopeId)
+                }
+        )
+        if ($unresolvedHierarchyScopes.Count -gt 0) {
+            $isComplete = $false
+            [void]$warnings.Add(
+                "Hierarchy discovery could not place $($unresolvedHierarchyScopes.Count) visible management-group or subscription scope(s)."
+            )
+            foreach ($hierarchyError in $hierarchyErrors) {
+                [void]$warnings.Add($hierarchyError)
+            }
+        }
+    }
+
+    foreach ($scope in $KnownScopes) {
+        if ($null -eq $scope) { continue }
+        $scopeId = [string](
+            Get-RadarPropertyValue -InputObject $scope -Name 'Id'
+        )
+        if ([string]::IsNullOrWhiteSpace($scopeId)) { continue }
+        $normalisedId = $scopeId.TrimEnd('/')
+        $key = $normalisedId.ToLowerInvariant()
+        if (-not $scopeById.ContainsKey($key)) {
+            $scopeById[$key] = if ($scope.PSObject.Properties['Type']) {
+                $scope
+            }
+            else {
+                New-RadarScope -Id $normalisedId
+            }
+        }
+
+        if ($ancestorsByScope.ContainsKey($key)) { continue }
+        $subscriptionMatch = [regex]::Match(
+            $normalisedId,
+            '(?i)^(/subscriptions/[^/]+)'
+        )
+        if ($subscriptionMatch.Success) {
+            $subscriptionKey =
+                $subscriptionMatch.Groups[1].Value.ToLowerInvariant()
+            if ($ancestorsByScope.ContainsKey($subscriptionKey)) {
+                $ancestorsByScope[$key] = @(
+                    $ancestorsByScope[$subscriptionKey] +
+                    $subscriptionMatch.Groups[1].Value
+                )
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        AncestorsByScope = $ancestorsByScope
+        ScopeById = $scopeById
+        Scopes = @($scopeById.Values | Sort-Object Type, Id)
+        IsComplete = $isComplete
+        UnresolvedAncestorRoots = @(
+            $unresolvedAncestorRoots |
+                Sort-Object
+        )
+        Warnings = $warnings.ToArray()
+    }
+}
+
+function Test-RadarScopeDescendsFrom {
+    param(
+        [string]$Scope,
+        [string]$RootScope,
+        [object]$Hierarchy
+    )
+
+    $normalisedScope = $Scope.TrimEnd('/')
+    $normalisedRoot = $RootScope.TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($normalisedRoot)) {
+        $normalisedRoot = '/'
+    }
+
+    if ($normalisedRoot -eq '/') {
+        return [pscustomobject]@{
+            State = 'True'
+            Reason = $null
+        }
+    }
+    if ($normalisedScope -ieq $normalisedRoot) {
+        return [pscustomobject]@{
+            State = 'True'
+            Reason = $null
+        }
+    }
+
+    if (
+        $normalisedRoot -notlike
+        '/providers/Microsoft.Management/managementGroups/*'
+    ) {
+        return [pscustomobject]@{
+            State = if (
+                $normalisedScope.StartsWith(
+                    "$normalisedRoot/",
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                'True'
+            }
+            else {
+                'False'
+            }
+            Reason = $null
+        }
+    }
+
+    $scopeKey = $normalisedScope.ToLowerInvariant()
+    if (-not $Hierarchy.AncestorsByScope.ContainsKey($scopeKey)) {
+        $subscriptionMatch = [regex]::Match(
+            $normalisedScope,
+            '(?i)^(/subscriptions/[^/]+)'
+        )
+        if ($subscriptionMatch.Success) {
+            $scopeKey =
+                $subscriptionMatch.Groups[1].Value.ToLowerInvariant()
+        }
+    }
+
+    if ($Hierarchy.AncestorsByScope.ContainsKey($scopeKey)) {
+        $scopeAncestors = @($Hierarchy.AncestorsByScope[$scopeKey])
+        $isDescendant = @(
+            $scopeAncestors |
+                Where-Object {
+                    [string]::Equals(
+                        [string]$_,
+                        $normalisedRoot,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                }
+        ).Count -gt 0
+        if (-not $isDescendant) {
+            $scopeOrAncestors = @($scopeKey) + @(
+                $scopeAncestors |
+                    ForEach-Object {
+                        ([string]$_).ToLowerInvariant()
+                    }
+            )
+            if (
+                @(
+                    Get-RadarPropertyValue `
+                        -InputObject $Hierarchy `
+                        -Name 'UnresolvedAncestorRoots' |
+                        Where-Object {
+                            $scopeOrAncestors -contains
+                                ([string]$_).ToLowerInvariant()
+                        }
+                ).Count -gt 0
+            ) {
+                return [pscustomobject]@{
+                    State = 'Unknown'
+                    Reason = "The ancestry of '$Scope' above an accessible management-group root is unresolved."
+                }
+            }
+        }
+        return [pscustomobject]@{
+            State = if ($isDescendant) { 'True' } else { 'False' }
+            Reason = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        State = 'Unknown'
+        Reason = "Could not resolve whether '$Scope' is below management group '$RootScope'."
+    }
+}
+
+function Get-RadarSubtreeScope {
+    param(
+        [string]$RootScope,
+        [object[]]$Scopes,
+        [object]$Hierarchy,
+        [switch]$IncludeRootIfMissing
+    )
+
+    $scopeById = @{}
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $isComplete = $true
+    foreach ($scope in $Scopes) {
+        $scopeId = [string](
+            Get-RadarPropertyValue -InputObject $scope -Name 'Id'
+        )
+        if ([string]::IsNullOrWhiteSpace($scopeId)) { continue }
+        $relationship = Test-RadarScopeDescendsFrom `
+            -Scope $scopeId `
+            -RootScope $RootScope `
+            -Hierarchy $Hierarchy
+        if ($relationship.State -eq 'True') {
+            $scopeById[$scopeId.TrimEnd('/').ToLowerInvariant()] = $scope
+        }
+        elseif ($relationship.State -eq 'Unknown') {
+            # Fail open so an unresolved branch cannot hide an obtainable role.
+            $scopeById[$scopeId.TrimEnd('/').ToLowerInvariant()] = $scope
+            $isComplete = $false
+            [void]$warnings.Add($relationship.Reason)
+        }
+    }
+
+    $normalisedRoot = $RootScope.TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($normalisedRoot)) {
+        $normalisedRoot = '/'
+    }
+    $rootKey = $normalisedRoot.ToLowerInvariant()
+    if (
+        $IncludeRootIfMissing -and
+        -not $scopeById.ContainsKey($rootKey)
+    ) {
+        $scopeById[$rootKey] = New-RadarScope -Id $normalisedRoot
+    }
+
+    [pscustomobject]@{
+        Scopes = @($scopeById.Values | Sort-Object Type, Id)
+        IsComplete = $isComplete
+        Warnings = @($warnings | Sort-Object -Unique)
     }
 }
 
@@ -671,6 +1060,10 @@ authorizationresources
                         $graphParameters.Subscription = $subscriptionIds
                     }
                     else {
+                        # Mixed MG and standalone subscription roots cannot be
+                        # represented in one scoped ARG parameter set. Query
+                        # the tenant and apply the requested-root hierarchy
+                        # filter after discovery.
                         $graphParameters.UseTenantScope = $true
                     }
                     if ($skipToken) {
@@ -730,6 +1123,15 @@ authorizationresources
                             # can never be hidden by a parent-only result.
                             $allScopeIds
                         }
+                        elseif (
+                            $managementGroupNames.Count -gt 0
+                        ) {
+                            # A management-group-scoped Graph query includes
+                            # descendant subscription/RG role definitions. Keep
+                            # their declared scopes; hierarchy intersection is
+                            # performed after the full estate graph is built.
+                            $assignableScopes
+                        }
                         else {
                             $roleScopeSet =
                                 New-Object System.Collections.Generic.HashSet[string] (
@@ -778,6 +1180,47 @@ authorizationresources
 
                 $resourceGraphSucceeded = $true
                 $customSource = 'Azure Resource Graph'
+
+                # Scoped Resource Graph queries primarily enumerate roles at or
+                # below the query scope. Merge live ARM results so custom roles
+                # defined at ancestor management groups remain available.
+                if (-not $UseTenantDiscovery) {
+                    $roleDefinitionCommand =
+                        Get-Command Get-AzRoleDefinition
+                    foreach ($scanScope in $Scopes) {
+                        try {
+                            $armParameters = @{
+                                Custom = $true
+                                Scope = $scanScope.Id
+                                WarningAction = 'SilentlyContinue'
+                                ErrorAction = 'Stop'
+                            }
+                            if (
+                                $roleDefinitionCommand.Parameters.ContainsKey(
+                                    'SkipClientSideScopeValidation'
+                                )
+                            ) {
+                                $armParameters.SkipClientSideScopeValidation =
+                                    $true
+                            }
+                            foreach (
+                                $role in @(
+                                    Get-AzRoleDefinition @armParameters
+                                )
+                            ) {
+                                & $addRole $role @($scanScope.Id)
+                            }
+                        }
+                        catch {
+                            $isComplete = $false
+                            [void]$warnings.Add(
+                                "Ancestor custom-role discovery failed at $($scanScope.Id): $($_.Exception.Message)"
+                            )
+                        }
+                    }
+                    $customSource =
+                        'Azure Resource Graph + scoped ARM ancestors'
+                }
             }
             catch {
                 [void]$warnings.Add(
@@ -857,6 +1300,295 @@ authorizationresources
         IsComplete = $isComplete
         Warnings = $warnings.ToArray()
         CustomRoleSource = $customSource
+    }
+}
+
+function Get-RadarPolicyBoundaryScope {
+    <#
+    Discovers exact scopes that can change a parent policy result: policy
+    assignment notScopes and policy exemption resource scopes. These scopes are
+    added to baseline subtrees and evaluated independently.
+    #>
+    param(
+        [object[]]$Scopes,
+        [switch]$UseTenantDiscovery,
+        [switch]$NoPolicyDiscovery
+    )
+
+    $scopeById = @{}
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $uncertainRootScopes =
+        New-Object System.Collections.Generic.HashSet[string] (
+            [StringComparer]::OrdinalIgnoreCase
+        )
+    $addBoundary = {
+        param([string]$ScopeId)
+        if ([string]::IsNullOrWhiteSpace($ScopeId)) { return }
+        $normalised = $ScopeId.TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($normalised)) { return }
+        $scopeById[$normalised.ToLowerInvariant()] =
+            New-RadarScope -Id $normalised
+    }
+    $addAssignmentBoundaries = {
+        param([object]$Assignment)
+        & $addBoundary (
+            [string](
+                Get-RadarPolicyProperty `
+                    -InputObject $Assignment `
+                    -Name 'Scope'
+            )
+        )
+        foreach (
+            $notScope in @(
+                Get-RadarPolicyProperty `
+                    -InputObject $Assignment `
+                    -Name 'NotScope' |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    }
+            )
+        ) {
+            & $addBoundary ([string]$notScope)
+        }
+    }
+    $addExemptionBoundary = {
+        param([object]$Exemption)
+        $resourceId = [string](
+            Get-RadarPolicyProperty `
+                -InputObject $Exemption `
+                -Name 'Id'
+        )
+        $resourceScope = $resourceId -replace (
+            '(?i)/providers/Microsoft\.Authorization/' +
+            'policyExemptions/[^/]+$'
+        ), ''
+        if ($resourceScope -ne $resourceId) {
+            & $addBoundary $resourceScope
+        }
+    }
+    if ($NoPolicyDiscovery) {
+        return [pscustomobject]@{
+            Scopes = @()
+            IsComplete = $true
+            UncertainRootScopes = @()
+            Warnings = @()
+        }
+    }
+    if (-not (Get-Command Search-AzGraph -ErrorAction SilentlyContinue)) {
+        [void]$warnings.Add(
+            'Azure Resource Graph is unavailable; policy boundary discovery is using live subscription queries only.'
+        )
+    }
+    else {
+        try {
+        $query = @'
+authorizationresources
+| where type in~ (
+    'microsoft.authorization/policyassignments',
+    'microsoft.authorization/policyexemptions'
+)
+| project
+    id,
+    type,
+    Scope = tostring(properties.scope),
+    NotScopes = properties.notScopes
+'@
+        $pageSize = 1000
+        $skipToken = $null
+        $skip = 0
+        do {
+            $parameters = @{
+                Query = $query
+                First = $pageSize
+                ErrorAction = 'Stop'
+            }
+            $subscriptionIds = @(
+                $Scopes |
+                    ForEach-Object {
+                        $match = [regex]::Match(
+                            $_.Id,
+                            '(?i)^/subscriptions/([^/]+)'
+                        )
+                        if ($match.Success) {
+                            $match.Groups[1].Value
+                        }
+                    } |
+                    Sort-Object -Unique
+            )
+            $managementGroupNames = @(
+                $Scopes |
+                    Where-Object {
+                        $_.Type -eq 'ManagementGroup'
+                    } |
+                    ForEach-Object { $_.Name } |
+                    Sort-Object -Unique
+            )
+            if ($UseTenantDiscovery) {
+                $parameters.UseTenantScope = $true
+            }
+            elseif (
+                $subscriptionIds.Count -gt 0 -and
+                $managementGroupNames.Count -eq 0
+            ) {
+                $parameters.Subscription = $subscriptionIds
+            }
+            elseif (
+                $managementGroupNames.Count -gt 0 -and
+                $subscriptionIds.Count -eq 0
+            ) {
+                $parameters.ManagementGroup = $managementGroupNames
+            }
+            else {
+                $parameters.UseTenantScope = $true
+            }
+            if ($skipToken) {
+                $parameters.SkipToken = $skipToken
+            }
+            elseif ($skip -gt 0) {
+                $parameters.Skip = $skip
+            }
+
+            $response = Search-AzGraph @parameters
+            $wrapped = Test-RadarHasProperty `
+                -InputObject $response `
+                -Name 'Data'
+            if ($wrapped) {
+                $rows = @(
+                    Get-RadarPropertyValue `
+                        -InputObject $response `
+                        -Name 'Data' |
+                        Where-Object { $null -ne $_ }
+                )
+                $skipToken = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $response `
+                        -Name 'SkipToken'
+                )
+            }
+            else {
+                $rows = @($response | Where-Object { $null -ne $_ })
+                $skip += $rows.Count
+                $skipToken = $null
+            }
+
+            foreach ($row in $rows) {
+                $candidateScopes = New-Object System.Collections.Generic.List[string]
+                $propertyScope = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $row `
+                        -Name 'Scope'
+                )
+                if ($propertyScope) {
+                    [void]$candidateScopes.Add($propertyScope)
+                }
+
+                $resourceId = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $row `
+                        -Name 'Id'
+                )
+                $resourceScope = $resourceId -replace (
+                    '(?i)/providers/Microsoft\.Authorization/' +
+                    '(policyAssignments|policyExemptions)/[^/]+$'
+                ), ''
+                if (
+                    $resourceScope -and
+                    $resourceScope -ne $resourceId
+                ) {
+                    [void]$candidateScopes.Add($resourceScope)
+                }
+
+                foreach (
+                    $notScope in @(
+                        Get-RadarPropertyValue `
+                            -InputObject $row `
+                            -Name 'NotScopes' |
+                            Where-Object {
+                                -not [string]::IsNullOrWhiteSpace($_)
+                            }
+                    )
+                ) {
+                    [void]$candidateScopes.Add([string]$notScope)
+                }
+
+                foreach ($candidateScope in $candidateScopes) {
+                    & $addBoundary ([string]$candidateScope)
+                }
+            }
+        } while (
+            $skipToken -or
+            (-not $wrapped -and $rows.Count -eq $pageSize)
+        )
+        }
+        catch {
+            [void]$warnings.Add(
+                "Azure Resource Graph policy boundary discovery failed: $($_.Exception.Message)"
+            )
+        }
+    }
+
+    # Resource Graph is eventually consistent. Confirm descendant policy and
+    # exemption boundaries through live ARM queries for every visible
+    # subscription. These results are used only to discover exact scopes; each
+    # scope is evaluated later without IncludeDescendent.
+    foreach (
+        $subscriptionScope in @(
+            $Scopes |
+                Where-Object {
+                    $_.Type -ne 'ManagementGroup'
+                } |
+                Sort-Object Id -Unique
+        )
+    ) {
+        try {
+            foreach (
+                $assignment in @(
+                    Get-AzPolicyAssignment `
+                        -Scope $subscriptionScope.Id `
+                        -IncludeDescendent `
+                        -ErrorAction Stop `
+                        -WarningAction SilentlyContinue
+                )
+            ) {
+                & $addAssignmentBoundaries $assignment
+            }
+        }
+        catch {
+            [void]$uncertainRootScopes.Add($subscriptionScope.Id)
+            [void]$warnings.Add(
+                "Live descendant policy-assignment boundary discovery failed at $($subscriptionScope.Id): $($_.Exception.Message)"
+            )
+        }
+
+        try {
+            foreach (
+                $exemption in @(
+                    Get-AzPolicyExemption `
+                        -Scope $subscriptionScope.Id `
+                        -IncludeDescendent `
+                        -ErrorAction Stop `
+                        -WarningAction SilentlyContinue
+                )
+            ) {
+                & $addExemptionBoundary $exemption
+            }
+        }
+        catch {
+            [void]$uncertainRootScopes.Add($subscriptionScope.Id)
+            [void]$warnings.Add(
+                "Live descendant policy-exemption boundary discovery failed at $($subscriptionScope.Id): $($_.Exception.Message)"
+            )
+        }
+    }
+
+    [pscustomobject]@{
+        Scopes = @($scopeById.Values | Sort-Object Type, Id)
+        IsComplete = $uncertainRootScopes.Count -eq 0
+        UncertainRootScopes = @(
+            $uncertainRootScopes |
+                Sort-Object
+        )
+        Warnings = $warnings.ToArray()
     }
 }
 
@@ -987,6 +1719,10 @@ function ConvertTo-RadarHtmlReport {
 
         [int]$ScopeCount = 0,
 
+        [int]$BaselineContextCount = 0,
+
+        [object[]]$BaselineSummaries = @(),
+
         [int]$PolicyAssignmentCount = 0,
 
         [int]$RoleDenyRuleCount = 0,
@@ -1003,21 +1739,25 @@ function ConvertTo-RadarHtmlReport {
     $discoveryWarningArray = @($DiscoveryWarnings)
     $sourceRoleNameArray = @($SourceRoleNames)
     $totalMatches = $resultArray.Count
-    $rolesAffected = (
+    $uniqueRolesAffected = (
         $resultArray |
             Select-Object -ExpandProperty RoleId -Unique |
             Measure-Object
     ).Count
     $actionsTriggered = ($resultArray | Select-Object -ExpandProperty RestrictedAction -Unique | Measure-Object).Count
 
-    # Group by role for a collapsible per-role section.
+    # Group by baseline context and granting role so distinct customer
+    # restriction models are never collapsed into a global role result.
     $grouped = @(
         $resultArray |
-            Group-Object -Property RoleId |
+            Group-Object {
+                "$($_.AnalysisMode)$([char]31)$($_.BaselineRoleId)$([char]31)$($_.BaselineScope)$([char]31)$($_.RoleId)"
+            } |
             Sort-Object {
-                $_.Group[0].RoleName
+                "$($_.Group[0].BaselineRoleName)$([char]31)$($_.Group[0].BaselineScope)$([char]31)$($_.Group[0].RoleName)"
             }
     )
+    $rolesAffected = $grouped.Count
 
     $sb = [System.Text.StringBuilder]::new()
     [void]$sb.AppendLine('<!DOCTYPE html>')
@@ -1234,8 +1974,8 @@ function ConvertTo-RadarHtmlReport {
     $customMatches  = @(@($Results) | Where-Object { $_.IsCustom }).Count
     $builtInMatches = $totalMatches - $customMatches
 
-    # Compute scope-aware deny coverage across affected roles.
-    $affectedRoles = @($Results) | Group-Object -Property RoleId
+    # Compute scope-aware deny coverage across baseline/granting-role pairs.
+    $affectedRoles = $grouped
     $rolesAlreadyDenied = 0
     $rolesPartiallyDenied = 0
     $rolesUnknown = 0
@@ -1266,9 +2006,9 @@ function ConvertTo-RadarHtmlReport {
         [void]$sb.AppendLine('</svg>')
         [void]$sb.AppendLine('<div class="compliance-info">')
         [void]$sb.AppendLine('  <h2>Deny-policy coverage</h2>')
-        [void]$sb.AppendLine('  <p>Share of affected roles blocked at every evaluated scope. Partial and unknown coverage remains obtainable and is never counted as safe.</p>')
+        [void]$sb.AppendLine('  <p>Share of baseline/granting-role pairs blocked throughout the relevant baseline subtree. Partial and unknown coverage remains obtainable and is never counted as safe.</p>')
         [void]$sb.AppendLine('  <div class="nums">')
-        [void]$sb.AppendLine('    <div class="num"><b>' + $rolesAffected + '</b>roles affected</div>')
+        [void]$sb.AppendLine('    <div class="num"><b>' + $rolesAffected + '</b>baseline/role pairs</div>')
         [void]$sb.AppendLine('    <div class="num ok"><b>' + $rolesAlreadyDenied + '</b>fully denied</div>')
         [void]$sb.AppendLine('    <div class="num"><b>' + $rolesPartiallyDenied + '</b>partially denied</div>')
         [void]$sb.AppendLine('    <div class="num"><b>' + $rolesUnknown + '</b>coverage unknown</div>')
@@ -1287,12 +2027,16 @@ function ConvertTo-RadarHtmlReport {
     if ($ScopeCount -gt 0) {
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Scopes Evaluated</div><div class=`"value accent`">$ScopeCount</div></div>")
     }
+    if ($BaselineContextCount -gt 0) {
+        [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Baseline Contexts</div><div class=`"value accent`">$BaselineContextCount</div></div>")
+    }
     if ($DeniedListProvided) {
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Policy Assignments</div><div class=`"value`">$PolicyAssignmentCount</div></div>")
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Role-Deny Rules</div><div class=`"value`">$RoleDenyRuleCount</div></div>")
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Active Exemptions</div><div class=`"value`">$PolicyExemptionCount</div></div>")
     }
     [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Restricted Actions</div><div class=`"value`">$($RestrictedActions.Count)</div></div>")
+    [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Granting Roles</div><div class=`"value`">$uniqueRolesAffected</div></div>")
     if ($sourceRoleNameArray.Count -gt 0) {
         $srcTitle = ConvertTo-HtmlSafe ($sourceRoleNameArray -join ', ')
         [void]$sb.AppendLine("<div class=`"card`" title=`"$srcTitle`"><div class=`"label`">Source Roles</div><div class=`"value accent`">$($sourceRoleNameArray.Count)</div></div>")
@@ -1315,28 +2059,57 @@ function ConvertTo-RadarHtmlReport {
             if (-not $isDen) {
                 $act = [string]$item.RestrictedAction
                 if (-not $obtainable.Contains($act)) { $obtainable[$act] = New-Object System.Collections.Generic.List[string] }
-                $rn = [string]$item.RoleName
-                if (-not $obtainable[$act].Contains($rn)) { [void]$obtainable[$act].Add($rn) }
+                $via = "$($item.RoleName) via $($item.BaselineRoleName) @ $($item.BaselineScope)"
+                if (-not $obtainable[$act].Contains($via)) { [void]$obtainable[$act].Add($via) }
             }
         }
         $obtainableActions = @($obtainable.Keys | Sort-Object)
         $obtainClass = if ($obtainableActions.Count -gt 0) { 'actions-list exposed' } else { 'actions-list' }
-        [void]$sb.AppendLine('<details class="' + $obtainClass + '"><summary>Currently obtainable restricted actions (' + $obtainableActions.Count + ' of ' + $RestrictedActions.Count + ')</summary>')
-        [void]$sb.AppendLine('<p class="note">Restricted actions still granted by at least one role that is not on the deny list. A user who can assign roles could regain these by self-assigning an un-denied role. Hover an action to see which roles grant it.</p>')
+        [void]$sb.AppendLine('<details class="' + $obtainClass + '"><summary>Estate-wide union of obtainable restricted actions (' + $obtainableActions.Count + ' of ' + $RestrictedActions.Count + ')</summary>')
+        [void]$sb.AppendLine('<p class="note">Union across every baseline context and the optional CSV audit. Use the per-baseline section below to distinguish a covered production baseline from a gap in another scope.</p>')
         if ($obtainableActions.Count -eq 0) {
             [void]$sb.AppendLine('<p class="note">None - every restricted action is granted only by roles already on the deny list.</p>')
         }
         else {
             [void]$sb.AppendLine('<ul>')
             foreach ($act in $obtainableActions) {
-                $roles = $obtainable[$act]
-                $titleSafe = ConvertTo-HtmlSafe ((@($roles) | Sort-Object) -join ', ')
-                $plural = if ($roles.Count -ne 1) { 's' } else { '' }
-                [void]$sb.AppendLine('<li title="' + $titleSafe + '">' + (ConvertTo-HtmlSafe $act) + ' <span class="via">(' + $roles.Count + ' role' + $plural + ')</span></li>')
+                $paths = $obtainable[$act]
+                $titleSafe = ConvertTo-HtmlSafe ((@($paths) | Sort-Object) -join ', ')
+                $plural = if ($paths.Count -ne 1) { 's' } else { '' }
+                [void]$sb.AppendLine('<li title="' + $titleSafe + '">' + (ConvertTo-HtmlSafe $act) + ' <span class="via">(' + $paths.Count + ' path' + $plural + ')</span></li>')
             }
             [void]$sb.AppendLine('</ul>')
         }
         [void]$sb.AppendLine('</details>')
+    }
+
+    if (@($BaselineSummaries).Count -gt 0) {
+        [void]$sb.AppendLine('<details class="actions-list" open><summary>Obtainable actions by baseline context (' + @($BaselineSummaries).Count + ')</summary>')
+        [void]$sb.AppendLine('<p class="note">Each baseline role and exact AssignableScope is evaluated independently. A context is exposed when at least one relevant role remains assignable through an unblocked or uncertain path.</p>')
+        [void]$sb.AppendLine('<ul>')
+        foreach (
+            $baselineSummary in @(
+                $BaselineSummaries |
+                    Sort-Object BaselineRoleName, BaselineScope
+            )
+        ) {
+            $summaryTitle = ConvertTo-HtmlSafe (
+                @($baselineSummary.ObtainableActions) -join ', '
+            )
+            $contextLabel = "$($baselineSummary.BaselineRoleName) @ $($baselineSummary.BaselineScope)"
+            [void]$sb.AppendLine(
+                '<li title="' + $summaryTitle + '">' +
+                (ConvertTo-HtmlSafe $contextLabel) +
+                ' <span class="via">(' +
+                $baselineSummary.ObtainableActionCount +
+                ' of ' +
+                $baselineSummary.RestrictedActionCount +
+                ' obtainable via ' +
+                $baselineSummary.GapRoleCount +
+                ' role(s))</span></li>'
+            )
+        }
+        [void]$sb.AppendLine('</ul></details>')
     }
 
     # Toolbar / filter.
@@ -1352,6 +2125,8 @@ function ConvertTo-RadarHtmlReport {
             $roleName = $first.RoleName
             $isCustom = $first.IsCustom
             $roleId = $first.RoleId
+            $baselineRoleName = $first.BaselineRoleName
+            $baselineScope = $first.BaselineScope
             $isAlreadyDenied = $first.PSObject.Properties['IsAlreadyDenied'] -and $first.IsAlreadyDenied
             $denyCoverage = if ($first.PSObject.Properties['DenyCoverage']) {
                 [string]$first.DenyCoverage
@@ -1364,6 +2139,9 @@ function ConvertTo-RadarHtmlReport {
             }
 
             $badge = if ($isCustom) { '<span class="badge custom">Custom</span>' } else { '<span class="badge">Built-in</span>' }
+            $baselineBadge = ' <span class="badge">' +
+                (ConvertTo-HtmlSafe $baselineRoleName) +
+                '</span>'
 
             $denyBadge = ''
             if ($DeniedListProvided) {
@@ -1399,9 +2177,18 @@ function ConvertTo-RadarHtmlReport {
 
             $matchWord = if ($items.Count -eq 1) { 'match' } else { 'matches' }
             [void]$sb.AppendLine('<details class="' + $roleClass + '">')
-            [void]$sb.AppendLine('<summary><span class="chev">&#9656;</span><span class="name">' + (ConvertTo-HtmlSafe $roleName) + '</span> ' + $badge + $denyBadge + ' <span class="role-id" title="' + (ConvertTo-HtmlSafe $roleId) + '">' + (ConvertTo-HtmlSafe $roleId) + '</span><span class="count">' + $items.Count + ' ' + $matchWord + '</span></summary>')
+            [void]$sb.AppendLine('<summary><span class="chev">&#9656;</span><span class="name">' + (ConvertTo-HtmlSafe $roleName) + '</span> ' + $badge + $baselineBadge + $denyBadge + ' <span class="role-id" title="' + (ConvertTo-HtmlSafe $roleId) + '">' + (ConvertTo-HtmlSafe $roleId) + '</span><span class="count">' + $items.Count + ' ' + $matchWord + '</span></summary>')
+            [void]$sb.AppendLine(
+                '<div class="coverage-note">Baseline scope: ' +
+                (ConvertTo-HtmlSafe $baselineScope) +
+                ' &middot; Restriction source: ' +
+                (ConvertTo-HtmlSafe $first.RestrictionSource) +
+                ' &middot; Assignment path: ' +
+                (ConvertTo-HtmlSafe $first.AssignmentPath) +
+                '</div>'
+            )
             if ($DeniedListProvided) {
-                $scopeCoverage = "$($first.DeniedScopeCount) of $($first.EvaluatedScopeCount) role-availability scopes denied"
+                $scopeCoverage = "$($first.DeniedScopeCount) of $($first.EvaluatedScopeCount) relevant evaluation scopes denied"
                 $policyText = if ($first.BlockingPolicies) {
                     ' &middot; Policies: ' +
                         (ConvertTo-HtmlSafe $first.BlockingPolicies)
@@ -1415,6 +2202,13 @@ function ConvertTo-RadarHtmlReport {
                     $policyText +
                     '</div>'
                 )
+                if ($first.UnblockedAssignmentPaths) {
+                    [void]$sb.AppendLine(
+                        '<div class="coverage-note">Unblocked assignment paths: ' +
+                        (ConvertTo-HtmlSafe $first.UnblockedAssignmentPaths) +
+                        '</div>'
+                    )
+                }
             }
             [void]$sb.AppendLine('<div class="table-wrap"><table><thead><tr><th>Restricted Action</th><th>Matched Pattern</th></tr></thead><tbody>')
 
@@ -1905,9 +2699,9 @@ function Get-ActionMatch {
 function Get-RadarBaselineRole {
     <#
     Selects dynamic restricted-action source roles. Explicit patterns are
-    authoritative. Auto-detection chooses the wildcard role with the fewest
-    NotActions in each Owner and Contributor name family, which favours broad
-    platform roles over narrow roles that claw back most Azure operations.
+    authoritative. Auto-detection retains every wildcard Owner, Contributor,
+    or Baseline role with non-empty NotActions. Each role is analysed separately
+    later, so their distinct restriction sets are never unioned.
     #>
     param(
         [object[]]$Roles,
@@ -1976,28 +2770,18 @@ function Get-RadarBaselineRole {
         $mode = 'ExplicitPattern'
     }
     else {
-        foreach ($family in @('owner', 'contributor')) {
-            $familyCandidates = @(
+        foreach (
+            $candidate in @(
                 $candidates |
                     Where-Object {
+                        $_.NotActionCount -gt 0 -and
                         $_.Name -match
-                            "(?i)(^|[^a-z0-9])$family([^a-z0-9]|$)"
+                            '(?i)(^|[^a-z0-9])(owner|contributor|baseline)([^a-z0-9]|$)'
                     } |
-                    Sort-Object NotActionCount, Name
+                    Sort-Object Name
             )
-            if ($familyCandidates.Count -eq 0) { continue }
-
-            $minimumExclusions = $familyCandidates[0].NotActionCount
-            foreach (
-                $candidate in @(
-                    $familyCandidates |
-                        Where-Object {
-                            $_.NotActionCount -eq $minimumExclusions
-                        }
-                )
-            ) {
+        ) {
                 & $addSelection $candidate
-            }
         }
         $mode = 'Automatic'
     }
@@ -2006,6 +2790,254 @@ function Get-RadarBaselineRole {
         Roles = $selected.ToArray()
         Candidates = $candidates
         SelectionMode = $mode
+    }
+}
+
+function Get-RadarBaselineContext {
+    param(
+        [object[]]$BaselineRoles,
+        [object[]]$KnownScopes,
+        [object]$Hierarchy
+    )
+
+    $contexts = New-Object System.Collections.Generic.List[object]
+    $warnings = New-Object System.Collections.Generic.List[string]
+    foreach ($role in $BaselineRoles) {
+        $roleName = [string](
+            Get-RadarPropertyValue -InputObject $role -Name 'Name'
+        )
+        $roleId = [string](
+            Get-RadarPropertyValue -InputObject $role -Name 'Id'
+        )
+        $assignableScopes = @(
+            Get-RadarPropertyValue `
+                -InputObject $role `
+                -Name 'AssignableScopes' |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                } |
+                ForEach-Object { ([string]$_).TrimEnd('/') } |
+                Sort-Object -Unique
+        )
+        if ($assignableScopes.Count -eq 0) {
+            [void]$warnings.Add(
+                "Baseline role '$roleName' has no readable AssignableScopes."
+            )
+            continue
+        }
+
+        $declaredNotActions = @(
+            Get-RoleProperty -Role $role -Name 'NotActions' |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                } |
+                ForEach-Object { $_.Trim() } |
+                Sort-Object -Unique
+        )
+        $restrictionWarnings =
+            New-Object System.Collections.Generic.List[string]
+        $restrictedActions = New-Object System.Collections.Generic.List[string]
+        $restrictionComplete = $true
+        foreach ($declaredNotAction in $declaredNotActions) {
+            $regranted = Get-ActionMatch `
+                -Role $role `
+                -Action $declaredNotAction
+            if ($null -eq $regranted) {
+                [void]$restrictedActions.Add($declaredNotAction)
+                continue
+            }
+
+            if (-not $declaredNotAction.Contains('*')) {
+                [void]$restrictionWarnings.Add(
+                    "NotAction '$declaredNotAction' is re-granted by permission pattern '$($regranted.MatchedPattern)' and was excluded from the baseline restriction set."
+                )
+                continue
+            }
+
+            # Some of a wildcard NotAction may still be restricted, but its
+            # exact residual language cannot be represented as one Azure action
+            # string. Retain it conservatively and prevent a Full conclusion.
+            [void]$restrictedActions.Add($declaredNotAction)
+            $restrictionComplete = $false
+            [void]$restrictionWarnings.Add(
+                "Wildcard NotAction '$declaredNotAction' overlaps re-granted permission '$($regranted.MatchedPattern)'; findings for this action are conservative."
+            )
+        }
+        if ($restrictedActions.Count -eq 0) { continue }
+
+        $assignmentPaths = New-Object System.Collections.Generic.List[object]
+        $directSelfAssignment = $null -ne (
+            Get-ActionMatch `
+                -Role $role `
+                -Action 'Microsoft.Authorization/roleAssignments/write'
+        )
+        [void]$assignmentPaths.Add([pscustomobject]@{
+            Name = 'Direct role assignment'
+            ResourceType =
+                'Microsoft.Authorization/roleAssignments'
+            Reachability = if ($directSelfAssignment) {
+                'Baseline role can create direct role assignments'
+            }
+            else {
+                'Requires another principal or assignment process'
+            }
+        })
+
+        foreach (
+            $pimPath in @(
+                [pscustomobject]@{
+                    Name = 'PIM active assignment request'
+                    ResourceType =
+                        'Microsoft.Authorization/roleAssignmentScheduleRequests'
+                    Action =
+                        'Microsoft.Authorization/roleAssignmentScheduleRequests/write'
+                },
+                [pscustomobject]@{
+                    Name = 'PIM eligible assignment request'
+                    ResourceType =
+                        'Microsoft.Authorization/roleEligibilityScheduleRequests'
+                    Action =
+                        'Microsoft.Authorization/roleEligibilityScheduleRequests/write'
+                }
+            )
+        ) {
+            if (
+                $null -ne (
+                    Get-ActionMatch `
+                        -Role $role `
+                        -Action $pimPath.Action
+                )
+            ) {
+                [void]$assignmentPaths.Add([pscustomobject]@{
+                    Name = $pimPath.Name
+                    ResourceType = $pimPath.ResourceType
+                    Reachability =
+                        'Baseline role can create this PIM request'
+                })
+            }
+        }
+
+        foreach ($assignableScope in $assignableScopes) {
+            $rootScope = if ($assignableScope) {
+                $assignableScope
+            }
+            else {
+                '/'
+            }
+            $subtree = Get-RadarSubtreeScope `
+                -RootScope $rootScope `
+                -Scopes $KnownScopes `
+                -Hierarchy $Hierarchy
+            if (@($subtree.Scopes).Count -eq 0) {
+                continue
+            }
+            foreach ($warning in $subtree.Warnings) {
+                [void]$warnings.Add(
+                    "$roleName at ${rootScope}: $warning"
+                )
+            }
+            foreach ($warning in $restrictionWarnings) {
+                [void]$warnings.Add(
+                    "${roleName}: $warning"
+                )
+            }
+
+            [void]$contexts.Add([pscustomobject]@{
+                BaselineRole = $role
+                BaselineRoleName = $roleName
+                BaselineRoleId = $roleId
+                BaselineScope = $rootScope
+                RestrictedActions = $restrictedActions.ToArray()
+                EvaluationScopes = @($subtree.Scopes)
+                IsComplete = (
+                    $subtree.IsComplete -and
+                    $restrictionComplete
+                )
+                RestrictionWarnings =
+                    $restrictionWarnings.ToArray()
+                AssignmentPaths = $assignmentPaths.ToArray()
+                AssignmentPath = @(
+                    $assignmentPaths |
+                        ForEach-Object {
+                            "$($_.Name): $($_.Reachability)"
+                        }
+                ) -join '; '
+            })
+        }
+    }
+
+    [pscustomobject]@{
+        Contexts = $contexts.ToArray()
+        IsComplete = @(
+            $contexts |
+                Where-Object { -not $_.IsComplete }
+        ).Count -eq 0
+        Warnings = @($warnings | Sort-Object -Unique)
+    }
+}
+
+function Get-RadarRoleScopesInContext {
+    param(
+        [object]$Role,
+        [object[]]$ContextScopes,
+        [object]$Hierarchy
+    )
+
+    $isCustom = [bool](
+        Get-RadarPropertyValue -InputObject $Role -Name 'IsCustom'
+    )
+    if (-not $isCustom) {
+        return [pscustomobject]@{
+            Scopes = @($ContextScopes)
+            IsComplete = $true
+            Warnings = @()
+        }
+    }
+
+    $assignableScopes = @(
+        Get-RadarPropertyValue `
+            -InputObject $Role `
+            -Name 'AssignableScopes' |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            }
+    )
+    $availableScopeById = @{}
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $isComplete = $true
+    foreach ($contextScope in $ContextScopes) {
+        $scopeId = [string](
+            Get-RadarPropertyValue `
+                -InputObject $contextScope `
+                -Name 'Id'
+        )
+        foreach ($assignableScope in $assignableScopes) {
+            $relationship = Test-RadarScopeDescendsFrom `
+                -Scope $scopeId `
+                -RootScope ([string]$assignableScope) `
+                -Hierarchy $Hierarchy
+            if ($relationship.State -eq 'True') {
+                $availableScopeById[
+                    $scopeId.TrimEnd('/').ToLowerInvariant()
+                ] = $contextScope
+                break
+            }
+            if ($relationship.State -eq 'Unknown') {
+                # Include uncertain availability so it cannot hide a gap.
+                $availableScopeById[
+                    $scopeId.TrimEnd('/').ToLowerInvariant()
+                ] = $contextScope
+                $isComplete = $false
+                [void]$warnings.Add($relationship.Reason)
+                break
+            }
+        }
+    }
+
+    [pscustomobject]@{
+        Scopes = @($availableScopeById.Values | Sort-Object Type, Id)
+        IsComplete = $isComplete
+        Warnings = @($warnings | Sort-Object -Unique)
     }
 }
 
@@ -2374,7 +3406,9 @@ function Test-RadarPolicyCondition {
     param(
         [object]$Condition,
         [object]$Role,
-        [hashtable]$Parameters = @{}
+        [hashtable]$Parameters = @{},
+        [string]$AssignmentResourceType =
+            'Microsoft.Authorization/roleAssignments'
     )
 
     $Condition = ConvertFrom-RadarJsonObject -InputObject $Condition
@@ -2390,7 +3424,8 @@ function Test-RadarPolicyCondition {
             $result = Test-RadarPolicyCondition `
                 -Condition $child `
                 -Role $Role `
-                -Parameters $Parameters
+                -Parameters $Parameters `
+                -AssignmentResourceType $AssignmentResourceType
             if ($result.State -eq 'False') { return $result }
             if ($result.State -eq 'Unknown') {
                 $sawUnknown = $true
@@ -2416,7 +3451,8 @@ function Test-RadarPolicyCondition {
             $result = Test-RadarPolicyCondition `
                 -Condition $child `
                 -Role $Role `
-                -Parameters $Parameters
+                -Parameters $Parameters `
+                -AssignmentResourceType $AssignmentResourceType
             if ($result.State -eq 'True') { return $result }
             if ($result.State -eq 'Unknown') {
                 $sawUnknown = $true
@@ -2437,7 +3473,8 @@ function Test-RadarPolicyCondition {
                 Get-RadarPropertyValue -InputObject $Condition -Name 'Not'
             ) `
             -Role $Role `
-            -Parameters $Parameters
+            -Parameters $Parameters `
+            -AssignmentResourceType $AssignmentResourceType
         if ($innerResult.State -eq 'Unknown') { return $innerResult }
         return New-RadarPolicyEvaluation `
             -State $(if ($innerResult.State -eq 'True') { 'False' } else { 'True' })
@@ -2449,9 +3486,23 @@ function Test-RadarPolicyCondition {
             Get-RadarPropertyValue -InputObject $Condition -Name 'Field'
         )
         if ($field -ieq 'type') {
-            $actual = 'Microsoft.Authorization/roleAssignments'
+            $actual = $AssignmentResourceType
         }
         elseif ($field -match '(?i)/roleDefinitionId$') {
+            $aliasResourceType = $field -replace (
+                '(?i)/roleDefinitionId$'
+            ), ''
+            if (
+                -not [string]::Equals(
+                    $aliasResourceType,
+                    $AssignmentResourceType,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            ) {
+                return New-RadarPolicyEvaluation `
+                    -State 'False' `
+                    -Reason "Alias '$field' does not apply to assignment resource type '$AssignmentResourceType'."
+            }
             $actual = Get-RadarPropertyValue -InputObject $Role -Name 'Id'
             $isRoleDefinitionField = $true
         }
@@ -2470,6 +3521,32 @@ function Test-RadarPolicyCondition {
             $valueExpression -match '(?i)roleDefinitionId' -and
             $valueExpression -match '(?i)last\s*\(\s*split\s*\('
         ) {
+            $fieldMatch = [regex]::Match(
+                $valueExpression,
+                "(?i)field\(\s*['`"](?<field>[^'`"]+/roleDefinitionId)['`"]\s*\)"
+            )
+            if ($fieldMatch.Success) {
+                $aliasResourceType =
+                    $fieldMatch.Groups['field'].Value -replace (
+                        '(?i)/roleDefinitionId$'
+                    ), ''
+                if (
+                    -not [string]::Equals(
+                        $aliasResourceType,
+                        $AssignmentResourceType,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                ) {
+                    return New-RadarPolicyEvaluation `
+                        -State 'False' `
+                        -Reason "Value-expression alias '$($fieldMatch.Groups['field'].Value)' does not apply to assignment resource type '$AssignmentResourceType'."
+                }
+            }
+            else {
+                return New-RadarPolicyEvaluation `
+                    -State 'Unknown' `
+                    -Reason 'The roleDefinitionId value-expression alias could not be resolved.'
+            }
             $actual = Get-RadarRoleDefinitionGuid -RoleOrId $Role
             $isRoleDefinitionField = $true
         }
@@ -2553,7 +3630,9 @@ function Test-RadarPolicyRuleForRole {
     param(
         [object]$PolicyRule,
         [object]$Role,
-        [hashtable]$Parameters = @{}
+        [hashtable]$Parameters = @{},
+        [string]$AssignmentResourceType =
+            'Microsoft.Authorization/roleAssignments'
     )
 
     $PolicyRule = ConvertFrom-RadarJsonObject -InputObject $PolicyRule
@@ -2591,7 +3670,8 @@ function Test-RadarPolicyRuleForRole {
             Get-RadarPropertyValue -InputObject $PolicyRule -Name 'If'
         ) `
         -Role $Role `
-        -Parameters $Parameters
+        -Parameters $Parameters `
+        -AssignmentResourceType $AssignmentResourceType
     switch ($conditionResult.State) {
         'True' {
             return [pscustomobject]@{
@@ -2749,6 +3829,11 @@ function Resolve-RadarPolicyAssignment {
 
     $warnings = New-Object System.Collections.Generic.List[string]
     $rules = New-Object System.Collections.Generic.List[object]
+    $assignmentResourceTypes = @(
+        'Microsoft.Authorization/roleAssignments',
+        'Microsoft.Authorization/roleAssignmentScheduleRequests',
+        'Microsoft.Authorization/roleEligibilityScheduleRequests'
+    )
 
     $enforcementMode = [string](
         Get-RadarPolicyProperty `
@@ -2915,19 +4000,40 @@ function Resolve-RadarPolicyAssignment {
         $classificationWarning = $null
         if (
             $targetEvidence -notmatch
-            '(?i)Microsoft\.Authorization/roleAssignments'
+            '(?i)Microsoft\.Authorization/(roleAssignments|roleAssignmentScheduleRequests|roleEligibilityScheduleRequests)(?:/|["''])'
         ) {
             $probeRole = [pscustomobject]@{
                 Id = '/providers/Microsoft.Authorization/roleDefinitions/00000000-0000-0000-0000-000000000000'
             }
-            $probe = Test-RadarPolicyRuleForRole `
-                -PolicyRule $policyRule `
-                -Role $probeRole `
-                -Parameters $Parameters
-            if ($probe.State -eq 'NotBlocked') { return }
-            if ($probe.State -eq 'Unknown') {
+            $probeResults = @(
+                foreach ($assignmentResourceType in $assignmentResourceTypes) {
+                    Test-RadarPolicyRuleForRole `
+                        -PolicyRule $policyRule `
+                        -Role $probeRole `
+                        -Parameters $Parameters `
+                        -AssignmentResourceType $assignmentResourceType
+                }
+            )
+            if (
+                @(
+                    $probeResults |
+                        Where-Object {
+                            $_.State -ne 'NotBlocked'
+                        }
+                ).Count -eq 0
+            ) {
+                return
+            }
+            if (
+                @(
+                    $probeResults |
+                        Where-Object {
+                            $_.State -eq 'Unknown'
+                        }
+                ).Count -gt 0
+            ) {
                 $classificationWarning =
-                    "Policy targeting could not be ruled out safely: $($probe.Reason)"
+                    'Policy targeting could not be ruled out safely for every supported role-assignment path.'
             }
         }
 
@@ -3090,6 +4196,7 @@ function Get-RadarPolicyInventory {
             ExemptionCount = 0
             IsEvaluated = $false
             IsComplete = $true
+            UncertainScopes = @()
             Warnings = @()
         }
     }
@@ -3104,9 +4211,13 @@ function Get-RadarPolicyInventory {
         [StringComparer]::OrdinalIgnoreCase
     )
     $warnings = New-Object System.Collections.Generic.List[string]
-    $isComplete = $true
+    $uncertainScopes =
+        New-Object System.Collections.Generic.HashSet[string] (
+            [StringComparer]::OrdinalIgnoreCase
+        )
 
     foreach ($scope in $Scopes) {
+        $scopeKey = $scope.Id.TrimEnd('/').ToLowerInvariant()
         try {
             $assignmentParameters = @{
                 Scope = $scope.Id
@@ -3118,7 +4229,7 @@ function Get-RadarPolicyInventory {
             )
         }
         catch {
-            $isComplete = $false
+            [void]$uncertainScopes.Add($scopeKey)
             [void]$warnings.Add(
                 "Policy-assignment discovery failed at $($scope.Id): $($_.Exception.Message)"
             )
@@ -3147,6 +4258,7 @@ function Get-RadarPolicyInventory {
                         -WarningAction SilentlyContinue
                 }
                 catch {
+                    [void]$uncertainScopes.Add($scopeKey)
                     [void]$warnings.Add(
                         "Could not resolve the effective definition version for assignment '$assignmentId': $($_.Exception.Message)"
                     )
@@ -3162,10 +4274,16 @@ function Get-RadarPolicyInventory {
                     -DefinitionCache $definitionCache `
                     -PolicySetCache $policySetCache
                 $resolvedAssignmentCache[$assignmentKey] = $resolved
-                foreach ($warning in $resolved.Warnings) {
-                    $isComplete = $false
-                    [void]$warnings.Add($warning)
-                }
+            }
+            foreach (
+                $warning in @(
+                    $resolvedAssignmentCache[$assignmentKey].Warnings
+                )
+            ) {
+                [void]$uncertainScopes.Add($scopeKey)
+                [void]$warnings.Add(
+                    "$($scope.Id): $warning"
+                )
             }
             foreach (
                 $resolvedRule in @(
@@ -3183,14 +4301,6 @@ function Get-RadarPolicyInventory {
                 Scope = $scope.Id
                 ErrorAction = 'Stop'
                 WarningAction = 'SilentlyContinue'
-            }
-            if (
-                $scope.Type -ne 'ManagementGroup' -and
-                (Get-Command Get-AzPolicyExemption).Parameters.ContainsKey(
-                    'IncludeDescendent'
-                )
-            ) {
-                $exemptionParameters.IncludeDescendent = $true
             }
             foreach (
                 $exemption in @(
@@ -3210,7 +4320,7 @@ function Get-RadarPolicyInventory {
                         }
                     }
                     catch {
-                        $isComplete = $false
+                        [void]$uncertainScopes.Add($scopeKey)
                         [void]$warnings.Add(
                             "Could not parse policy exemption expiry '$expiresOn' at $($scope.Id)."
                         )
@@ -3236,7 +4346,7 @@ function Get-RadarPolicyInventory {
                 $activeExemptions.ToArray()
         }
         catch {
-            $isComplete = $false
+            [void]$uncertainScopes.Add($scopeKey)
             [void]$warnings.Add(
                 "Policy-exemption discovery failed at $($scope.Id): $($_.Exception.Message)"
             )
@@ -3261,7 +4371,8 @@ function Get-RadarPolicyInventory {
         RelevantRuleCount = $uniqueRuleKeys.Count
         ExemptionCount = $exemptionIds.Count
         IsEvaluated = $true
-        IsComplete = $isComplete
+        IsComplete = $uncertainScopes.Count -eq 0
+        UncertainScopes = @($uncertainScopes | Sort-Object)
         Warnings = @($warnings | Sort-Object -Unique)
     }
 }
@@ -3319,13 +4430,43 @@ function Test-RadarPolicyRuleExempted {
 function Get-RadarPolicyScopeApplicability {
     param(
         [object]$Rule,
-        [string]$Scope
+        [string]$Scope,
+        [object]$ScopeHierarchy
     )
 
     foreach ($notScope in @($Rule.NotScopes)) {
         if ([string]::IsNullOrWhiteSpace([string]$notScope)) { continue }
         $normalisedNotScope = ([string]$notScope).TrimEnd('/')
         $normalisedScope = $Scope.TrimEnd('/')
+        if (
+            $normalisedNotScope -like
+            '/providers/Microsoft.Management/managementGroups/*'
+        ) {
+            if (-not $ScopeHierarchy) {
+                return [pscustomobject]@{
+                    State = 'Unknown'
+                    Reason = "Management-group exclusion '$notScope' could not be resolved without a scope hierarchy."
+                }
+            }
+            $relationship = Test-RadarScopeDescendsFrom `
+                -Scope $normalisedScope `
+                -RootScope $normalisedNotScope `
+                -Hierarchy $ScopeHierarchy
+            if ($relationship.State -eq 'True') {
+                return [pscustomobject]@{
+                    State = 'Excluded'
+                    Reason = "Scope is excluded by management-group notScopes entry '$notScope'."
+                }
+            }
+            if ($relationship.State -eq 'Unknown') {
+                return [pscustomobject]@{
+                    State = 'Unknown'
+                    Reason = $relationship.Reason
+                }
+            }
+            continue
+        }
+
         if (
             $normalisedScope -ieq $normalisedNotScope -or
             $normalisedScope.StartsWith(
@@ -3339,38 +4480,6 @@ function Get-RadarPolicyScopeApplicability {
             }
         }
 
-        if (
-            $normalisedNotScope.StartsWith(
-                "$normalisedScope/",
-                [System.StringComparison]::OrdinalIgnoreCase
-            )
-        ) {
-            return [pscustomobject]@{
-                State = 'Unknown'
-                Reason = "The assignment excludes descendant scope '$notScope', so estate-wide coverage is not complete."
-            }
-        }
-
-        if (
-            $normalisedScope -like
-                '/providers/Microsoft.Management/managementGroups/*'
-        ) {
-            return [pscustomobject]@{
-                State = 'Unknown'
-                Reason = "The assignment has notScopes entries whose management-group relationship cannot be proven from resource IDs."
-            }
-        }
-
-        if (
-            $normalisedNotScope -like
-                '/providers/Microsoft.Management/managementGroups/*' -and
-            $normalisedScope -like '/subscriptions/*'
-        ) {
-            return [pscustomobject]@{
-                State = 'Unknown'
-                Reason = "Could not determine whether subscription scope is below excluded management group '$notScope'."
-            }
-        }
     }
 
     return [pscustomobject]@{
@@ -3391,8 +4500,32 @@ function Get-RadarRoleDenyCoverage {
 
         [System.Collections.Generic.HashSet[string]]$DeniedRoleNames,
 
-        [bool]$DiscoveryComplete = $true
+        [bool]$DiscoveryComplete = $true,
+
+        [object]$ScopeHierarchy,
+
+        [object[]]$AssignmentPaths = @()
     )
+
+    if (@($AssignmentPaths).Count -eq 0) {
+        $AssignmentPaths = @(
+            [pscustomobject]@{
+                Name = 'Direct role assignment'
+                ResourceType =
+                    'Microsoft.Authorization/roleAssignments'
+            },
+            [pscustomobject]@{
+                Name = 'PIM active assignment request'
+                ResourceType =
+                    'Microsoft.Authorization/roleAssignmentScheduleRequests'
+            },
+            [pscustomobject]@{
+                Name = 'PIM eligible assignment request'
+                ResourceType =
+                    'Microsoft.Authorization/roleEligibilityScheduleRequests'
+            }
+        )
+    }
 
     $roleName = [string](
         Get-RadarPropertyValue -InputObject $Role -Name 'Name'
@@ -3407,7 +4540,9 @@ function Get-RadarRoleDenyCoverage {
             DeniedScopeCount = @($RoleScopes).Count
             ScopeCount = @($RoleScopes).Count
             BlockingPolicies = @('Denied-roles CSV supplement')
+            DeniedScopes = @($RoleScopes)
             UnblockedScopes = @()
+            UnblockedAssignmentPaths = @()
             UnknownReasons = @()
         }
     }
@@ -3419,7 +4554,15 @@ function Get-RadarRoleDenyCoverage {
             DeniedScopeCount = 0
             ScopeCount = @($RoleScopes).Count
             BlockingPolicies = @()
+            DeniedScopes = @()
             UnblockedScopes = @($RoleScopes)
+            UnblockedAssignmentPaths = @(
+                foreach ($roleScope in $RoleScopes) {
+                    foreach ($assignmentPath in $AssignmentPaths) {
+                        "$roleScope :: $($assignmentPath.Name)"
+                    }
+                }
+            )
             UnknownReasons = @('Live policy discovery was disabled.')
         }
     }
@@ -3429,13 +4572,31 @@ function Get-RadarRoleDenyCoverage {
         New-Object System.Collections.Generic.HashSet[string] (
             [StringComparer]::OrdinalIgnoreCase
         )
+    $deniedScopes = New-Object System.Collections.Generic.List[string]
     $unblockedScopes = New-Object System.Collections.Generic.List[string]
+    $unblockedAssignmentPaths =
+        New-Object System.Collections.Generic.List[string]
     $unknownReasons = New-Object System.Collections.Generic.List[string]
-
+    $policyUncertainScopes = @(
+        Get-RadarPropertyValue `
+            -InputObject $PolicyInventory `
+            -Name 'UncertainScopes'
+    )
     foreach ($roleScope in @($RoleScopes | Sort-Object -Unique)) {
-        $scopeBlocked = $false
         $scopeUnknown = $false
-        $scopeKey = $roleScope.TrimEnd('/').ToLowerInvariant()
+        $normalisedRoleScope = $roleScope.TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($normalisedRoleScope)) {
+            $normalisedRoleScope = '/'
+        }
+        $scopeKey = $normalisedRoleScope.ToLowerInvariant()
+        if (
+            $policyUncertainScopes -contains $scopeKey
+        ) {
+            $scopeUnknown = $true
+            [void]$unknownReasons.Add(
+                "Policy or exemption discovery was incomplete at '$roleScope'."
+            )
+        }
         $rules = if ($PolicyInventory.RulesByScope.ContainsKey($scopeKey)) {
             @($PolicyInventory.RulesByScope[$scopeKey])
         }
@@ -3451,56 +4612,86 @@ function Get-RadarRoleDenyCoverage {
             @()
         }
 
-        foreach ($rule in $rules) {
-            if (
-                Test-RadarPolicyRuleExempted `
+        $blockedPathCount = 0
+        $unblockedPathCount = 0
+        foreach ($assignmentPath in $AssignmentPaths) {
+            $pathBlocked = $false
+            $pathUnknown = $false
+            foreach ($rule in $rules) {
+                if (
+                    Test-RadarPolicyRuleExempted `
+                        -Rule $rule `
+                        -Exemptions $exemptions
+                ) {
+                    continue
+                }
+                if ($rule.UnsupportedReason) {
+                    $pathUnknown = $true
+                    [void]$unknownReasons.Add(
+                        "$($rule.AssignmentName): $($rule.UnsupportedReason)"
+                    )
+                    continue
+                }
+
+                $applicability = Get-RadarPolicyScopeApplicability `
                     -Rule $rule `
-                    -Exemptions $exemptions
-            ) {
-                continue
-            }
-            if ($rule.UnsupportedReason) {
-                $scopeUnknown = $true
-                [void]$unknownReasons.Add(
-                    "$($rule.AssignmentName): $($rule.UnsupportedReason)"
-                )
-                continue
+                    -Scope $roleScope `
+                    -ScopeHierarchy $ScopeHierarchy
+                if ($applicability.State -eq 'Excluded') { continue }
+                if ($applicability.State -eq 'Unknown') {
+                    $pathUnknown = $true
+                    [void]$unknownReasons.Add(
+                        "$($rule.AssignmentName): $($applicability.Reason)"
+                    )
+                    continue
+                }
+
+                $evaluation = Test-RadarPolicyRuleForRole `
+                    -PolicyRule $rule.PolicyRule `
+                    -Role $Role `
+                    -Parameters $rule.Parameters `
+                    -AssignmentResourceType $assignmentPath.ResourceType
+                if ($evaluation.State -eq 'Blocked') {
+                    $pathBlocked = $true
+                    [void]$blockingPolicies.Add(
+                        "$($rule.AssignmentName) [$($rule.AssignmentScope)] via $($assignmentPath.Name)"
+                    )
+                }
+                elseif ($evaluation.State -eq 'Unknown') {
+                    $pathUnknown = $true
+                    [void]$unknownReasons.Add(
+                        "$($rule.AssignmentName) via $($assignmentPath.Name): $($evaluation.Reason)"
+                    )
+                }
             }
 
-            $applicability = Get-RadarPolicyScopeApplicability `
-                -Rule $rule `
-                -Scope $roleScope
-            if ($applicability.State -eq 'Excluded') { continue }
-            if ($applicability.State -eq 'Unknown') {
+            if ($pathBlocked) {
+                $blockedPathCount++
+            }
+            elseif ($pathUnknown) {
                 $scopeUnknown = $true
                 [void]$unknownReasons.Add(
-                    "$($rule.AssignmentName): $($applicability.Reason)"
+                    "$($assignmentPath.Name) coverage at '$roleScope' is uncertain."
                 )
-                continue
             }
-
-            $evaluation = Test-RadarPolicyRuleForRole `
-                -PolicyRule $rule.PolicyRule `
-                -Role $Role `
-                -Parameters $rule.Parameters
-            if ($evaluation.State -eq 'Blocked') {
-                $scopeBlocked = $true
-                [void]$blockingPolicies.Add($rule.AssignmentName)
-            }
-            elseif ($evaluation.State -eq 'Unknown') {
-                $scopeUnknown = $true
-                [void]$unknownReasons.Add(
-                    "$($rule.AssignmentName): $($evaluation.Reason)"
+            else {
+                $unblockedPathCount++
+                [void]$unblockedAssignmentPaths.Add(
+                    "$roleScope :: $($assignmentPath.Name)"
                 )
             }
         }
 
-        if ($scopeBlocked) {
+        if (
+            $blockedPathCount -eq $AssignmentPaths.Count -and
+            -not $scopeUnknown
+        ) {
             $blockedScopeCount++
+            [void]$deniedScopes.Add($roleScope)
         }
         else {
             [void]$unblockedScopes.Add($roleScope)
-            if ($scopeUnknown) {
+            if ($scopeUnknown -and $unblockedPathCount -eq 0) {
                 [void]$unknownReasons.Add(
                     "Deny coverage at '$roleScope' is uncertain."
                 )
@@ -3509,13 +4700,6 @@ function Get-RadarRoleDenyCoverage {
     }
 
     $scopeCount = @($RoleScopes | Sort-Object -Unique).Count
-    $policyInventoryComplete = Get-RadarPropertyValue `
-        -InputObject $PolicyInventory `
-        -Name 'IsComplete'
-    if ($null -ne $policyInventoryComplete) {
-        $DiscoveryComplete =
-            $DiscoveryComplete -and [bool]$policyInventoryComplete
-    }
     $status = if ($scopeCount -eq 0) {
         'Unknown'
     }
@@ -3544,7 +4728,12 @@ function Get-RadarRoleDenyCoverage {
         DeniedScopeCount = $blockedScopeCount
         ScopeCount = $scopeCount
         BlockingPolicies = @($blockingPolicies | Sort-Object)
+        DeniedScopes = @($deniedScopes | Sort-Object -Unique)
         UnblockedScopes = @($unblockedScopes | Sort-Object -Unique)
+        UnblockedAssignmentPaths = @(
+            $unblockedAssignmentPaths |
+                Sort-Object -Unique
+        )
         UnknownReasons = @($unknownReasons | Sort-Object -Unique)
     }
 }
@@ -3618,10 +4807,101 @@ if (
     throw 'Role definitions were returned without readable Actions. Check the installed Az.Resources version and object shape.'
 }
 
-# Derive restricted actions from broad wildcard roles discovered anywhere in
-# the selected estate.
+# Build one scope universe containing the estate hierarchy and every explicit
+# custom-role AssignableScope. Baseline subtrees and granting-role availability
+# are derived from this same index.
+$knownScopeById = @{}
+foreach ($scanScope in $scanScopes) {
+    $knownScopeById[$scanScope.Id.TrimEnd('/').ToLowerInvariant()] =
+        $scanScope
+}
+foreach ($customRole in $customRoles) {
+    foreach (
+        $assignableScope in @(
+            Get-RadarPropertyValue `
+                -InputObject $customRole `
+                -Name 'AssignableScopes' |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                }
+        )
+    ) {
+        $normalisedScope = ([string]$assignableScope).TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($normalisedScope)) {
+            $normalisedScope = '/'
+        }
+        $key = $normalisedScope.ToLowerInvariant()
+        if (-not $knownScopeById.ContainsKey($key)) {
+            $knownScopeById[$key] =
+                New-RadarScope -Id $normalisedScope
+        }
+    }
+}
+
+$policyBoundaryInventory = Get-RadarPolicyBoundaryScope `
+    -Scopes $scanScopes `
+    -UseTenantDiscovery:(
+        $scopeDiscovery.DiscoveryMode -eq 'Estate'
+    ) `
+    -NoPolicyDiscovery:$NoPolicyDiscovery
+foreach ($boundaryScope in $policyBoundaryInventory.Scopes) {
+    $knownScopeById[
+        $boundaryScope.Id.TrimEnd('/').ToLowerInvariant()
+    ] = $boundaryScope
+}
+
+$scopeHierarchy = Get-RadarScopeHierarchy `
+    -KnownScopes @($knownScopeById.Values)
+foreach ($hierarchyScope in $scopeHierarchy.Scopes) {
+    $knownScopeById[
+        $hierarchyScope.Id.TrimEnd('/').ToLowerInvariant()
+    ] = $hierarchyScope
+}
+$scopeLimitWarnings = New-Object System.Collections.Generic.List[string]
+if ($scopeDiscovery.DiscoveryMode -ne 'Estate') {
+    $limitedScopeById = @{}
+    foreach ($candidateScope in $knownScopeById.Values) {
+        $includeCandidate = $false
+        foreach ($requestedRoot in $scanScopes) {
+            $relationship = Test-RadarScopeDescendsFrom `
+                -Scope $candidateScope.Id `
+                -RootScope $requestedRoot.Id `
+                -Hierarchy $scopeHierarchy
+            if ($relationship.State -eq 'True') {
+                $includeCandidate = $true
+                break
+            }
+            if ($relationship.State -eq 'Unknown') {
+                [void]$scopeLimitWarnings.Add(
+                    "Scope '$($candidateScope.Id)' was excluded from the limited scan because its relationship to requested root '$($requestedRoot.Id)' could not be resolved."
+                )
+            }
+        }
+        if ($includeCandidate) {
+            $limitedScopeById[
+                $candidateScope.Id.TrimEnd('/').ToLowerInvariant()
+            ] = $candidateScope
+        }
+    }
+    foreach ($requestedRoot in $scanScopes) {
+        $limitedScopeById[
+            $requestedRoot.Id.TrimEnd('/').ToLowerInvariant()
+        ] = $requestedRoot
+    }
+    $knownScopeById = $limitedScopeById
+}
+$knownScopes = @($knownScopeById.Values | Sort-Object Type, Id)
+$scopeLimitComplete = $scopeLimitWarnings.Count -eq 0
+
+# Dynamic restrictions remain partitioned by baseline role and exact
+# AssignableScope. CSV restrictions retain their separate estate-wide audit.
 $dynamicActions = @()
 $dynamicSourceRoleNames = @()
+$baselineContextInventory = [pscustomobject]@{
+    Contexts = @()
+    IsComplete = $true
+    Warnings = @()
+}
 if ($DynamicRestrictedActions) {
     $baselineSelection = Get-RadarBaselineRole `
         -Roles $customRoles `
@@ -3634,21 +4914,22 @@ if ($DynamicRestrictedActions) {
             } |
             Sort-Object
     )
-
-    $naSet = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($sr in $sourceRoles) {
-        foreach ($na in @(Get-RoleProperty -Role $sr -Name 'NotActions')) {
-            if (-not [string]::IsNullOrWhiteSpace($na)) { [void]$naSet.Add($na.Trim()) }
-        }
-    }
-    $dynamicActions = @($naSet | Sort-Object)
+    $baselineContextInventory = Get-RadarBaselineContext `
+        -BaselineRoles $sourceRoles `
+        -KnownScopes $knownScopes `
+        -Hierarchy $scopeHierarchy
+    $dynamicActions = @(
+        $baselineContextInventory.Contexts |
+            ForEach-Object { $_.RestrictedActions } |
+            Sort-Object -Unique
+    )
 
     if ($sourceRoles.Count -eq 0) {
         if ($BaselineRolePattern.Count -gt 0) {
             Write-Warning "Dynamic mode: no custom wildcard roles matched the explicit baseline pattern(s): $($BaselineRolePattern -join ', ')."
         }
         else {
-            Write-Warning 'Dynamic mode: no usable Owner/Contributor wildcard baseline roles were auto-detected.'
+            Write-Warning 'Dynamic mode: no usable Owner/Contributor/Baseline wildcard roles were auto-detected.'
         }
     }
     else {
@@ -3660,7 +4941,12 @@ if ($DynamicRestrictedActions) {
         else {
             'pattern-matched'
         }
-        Write-Host "  Derived $($dynamicActions.Count) restricted action(s) from $($sourceRoles.Count) $selectionLabel wildcard role(s): $($dynamicSourceRoleNames -join ', ')"
+        Write-Host "  Baseline roles:       $($sourceRoles.Count) $selectionLabel role(s)"
+        Write-Host "  Baseline contexts:    $($baselineContextInventory.Contexts.Count) role/AssignableScope pair(s)"
+        Write-Host "  Dynamic actions:      $($dynamicActions.Count) unique NotAction(s)"
+        foreach ($sourceRoleName in $dynamicSourceRoleNames) {
+            Write-Host "    - $sourceRoleName"
+        }
     }
 
     if (
@@ -3677,41 +4963,66 @@ if ($DynamicRestrictedActions) {
     }
 }
 
-# Final restricted-action set: CSV actions and/or dynamically derived NotActions.
-$restrictedActions = @(@($csvActions) + @($dynamicActions) |
-    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-    ForEach-Object { $_.Trim() } |
-    Sort-Object -Unique)
-
+$restrictedActions = @(
+    @($csvActions) + @($dynamicActions) |
+        Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_)
+        } |
+        ForEach-Object { $_.Trim() } |
+        Sort-Object -Unique
+)
 if ($restrictedActions.Count -eq 0) {
-    throw 'No restricted actions to evaluate. Provide -InputCsv, broaden -BaselineRolePattern, or ensure an Owner/Contributor wildcard baseline role is visible.'
+    throw 'No restricted actions to evaluate. Provide -InputCsv, broaden -BaselineRolePattern, or ensure an Owner/Contributor/Baseline wildcard role is visible.'
 }
-
 Write-Host "Total restricted actions to evaluate: $($restrictedActions.Count)"
 
-# Policy coverage is evaluated at every role-availability scope. Resource Graph
-# can surface resource-group-scoped custom roles that were not in the initial
-# management-group/subscription discovery set, so include those scopes here.
 $policyScopeById = @{}
-foreach ($scanScope in $scanScopes) {
-    $policyScopeById[$scanScope.Id.ToLowerInvariant()] = $scanScope
+if ($csvActions.Count -gt 0) {
+    foreach ($knownScope in $knownScopes) {
+        $policyScopeById[
+            $knownScope.Id.TrimEnd('/').ToLowerInvariant()
+        ] = $knownScope
+    }
 }
-foreach ($roleScopeList in $roleInventory.RoleScopes.Values) {
-    foreach ($roleScope in @($roleScopeList)) {
-        if ([string]::IsNullOrWhiteSpace([string]$roleScope)) { continue }
-        $normalisedScope = ([string]$roleScope).TrimEnd('/')
-        $key = $normalisedScope.ToLowerInvariant()
-        if (-not $policyScopeById.ContainsKey($key)) {
-            $policyScopeById[$key] = New-RadarScope -Id $normalisedScope
-        }
+foreach ($baselineContext in $baselineContextInventory.Contexts) {
+    foreach ($evaluationScope in $baselineContext.EvaluationScopes) {
+        $policyScopeById[
+            $evaluationScope.Id.TrimEnd('/').ToLowerInvariant()
+        ] = $evaluationScope
     }
 }
 $policyScopes = @($policyScopeById.Values | Sort-Object Type, Id)
 
-Write-Host "Discovering effective deny policies across $($policyScopes.Count) role-availability scope(s)..."
+Write-Host "Discovering effective deny policies across $($policyScopes.Count) evaluation scope(s)..."
 $policyInventory = Get-RadarPolicyInventory `
     -Scopes $policyScopes `
     -NoPolicyDiscovery:$NoPolicyDiscovery
+$boundaryUncertainScopes =
+    New-Object System.Collections.Generic.HashSet[string] (
+        [StringComparer]::OrdinalIgnoreCase
+    )
+foreach ($uncertainRoot in $policyBoundaryInventory.UncertainRootScopes) {
+    foreach ($policyScope in $policyScopes) {
+        $relationship = Test-RadarScopeDescendsFrom `
+            -Scope $policyScope.Id `
+            -RootScope $uncertainRoot `
+            -Hierarchy $scopeHierarchy
+        if ($relationship.State -ne 'False') {
+            $normalisedScope = $policyScope.Id.TrimEnd('/')
+            if ([string]::IsNullOrWhiteSpace($normalisedScope)) {
+                $normalisedScope = '/'
+            }
+            [void]$boundaryUncertainScopes.Add(
+                $normalisedScope.ToLowerInvariant()
+            )
+        }
+    }
+}
+$policyInventory.UncertainScopes = @(
+    @($policyInventory.UncertainScopes) +
+    @($boundaryUncertainScopes) |
+        Sort-Object -Unique
+)
 if ($policyInventory.IsEvaluated) {
     Write-Host "  Policy assignments:   $($policyInventory.AssignmentCount)"
     Write-Host "  Role-deny rules:      $($policyInventory.RelevantRuleCount)"
@@ -3722,65 +5033,312 @@ else {
 }
 
 Write-Host "Evaluating $($roles.Count) role(s)..."
-$coverageDiscoveryComplete =
+$baseDiscoveryComplete =
     $scopeDiscovery.IsComplete -and
-    $roleInventory.IsComplete -and
-    $policyInventory.IsComplete
-$coverageByRole = @{}
-foreach ($role in $roles) {
-    $roleKey = Get-RadarRoleKey -Role $role
-    $roleScopes = if ($roleInventory.RoleScopes.ContainsKey($roleKey)) {
-        @($roleInventory.RoleScopes[$roleKey])
+    $scopeLimitComplete -and
+    $scopeHierarchy.IsComplete -and
+    $roleInventory.IsComplete
+$matchCache = @{}
+$coverageCache = @{}
+$availabilityCache = @{}
+$results = New-Object System.Collections.Generic.List[object]
+$runtimeWarnings = New-Object System.Collections.Generic.List[string]
+
+$getMatch = {
+    param(
+        [object]$Role,
+        [string]$Action
+    )
+    $roleKey = Get-RadarRoleKey -Role $Role
+    $key = "$roleKey$([char]31)$($Action.ToLowerInvariant())"
+    if (-not $matchCache.ContainsKey($key)) {
+        $matchCache[$key] = Get-ActionMatch `
+            -Role $Role `
+            -Action $Action
     }
-    else {
-        @($scanScopes | ForEach-Object { $_.Id })
-    }
-    $coverageByRole[$roleKey] = Get-RadarRoleDenyCoverage `
-        -Role $role `
-        -RoleScopes $roleScopes `
-        -PolicyInventory $policyInventory `
-        -DeniedRoleNames $deniedRoleSet `
-        -DiscoveryComplete $coverageDiscoveryComplete
+    return $matchCache[$key]
 }
 
-$results = New-Object System.Collections.Generic.List[object]
+$getAvailability = {
+    param(
+        [object]$Role,
+        [object[]]$ContextScopes,
+        [string]$ContextKey
+    )
+    $roleKey = Get-RadarRoleKey -Role $Role
+    $key = "$ContextKey$([char]31)$roleKey"
+    if (-not $availabilityCache.ContainsKey($key)) {
+        $availabilityCache[$key] =
+            Get-RadarRoleScopesInContext `
+                -Role $Role `
+                -ContextScopes $ContextScopes `
+                -Hierarchy $scopeHierarchy
+    }
+    return $availabilityCache[$key]
+}
 
-foreach ($role in $roles) {
-    $roleKey = Get-RadarRoleKey -Role $role
-    $coverage = $coverageByRole[$roleKey]
-    foreach ($action in $restrictedActions) {
-        $match = Get-ActionMatch -Role $role -Action $action
-        if ($null -ne $match) {
-            $results.Add([pscustomobject]@{
-                RoleName         = Get-RadarPropertyValue -InputObject $role -Name 'Name'
-                RoleId           = Get-RadarPropertyValue -InputObject $role -Name 'Id'
-                IsCustom         = [bool](Get-RadarPropertyValue -InputObject $role -Name 'IsCustom')
-                RestrictedAction = $action
-                MatchedPattern   = $match.MatchedPattern
-                IsAlreadyDenied  = $coverage.IsAlreadyDenied
-                DenyCoverage     = $coverage.Status
-                DeniedScopeCount = $coverage.DeniedScopeCount
-                EvaluatedScopeCount = $coverage.ScopeCount
-                BlockingPolicies = $coverage.BlockingPolicies -join '; '
-                UnblockedScopes  = $coverage.UnblockedScopes -join '; '
-                CoverageWarnings = $coverage.UnknownReasons -join '; '
-            }) | Out-Null
+$getCoverage = {
+    param(
+        [object]$Role,
+        [object]$Availability,
+        [string]$ContextKey,
+        [bool]$ContextComplete,
+        [object[]]$AssignmentPaths = @()
+    )
+    $roleKey = Get-RadarRoleKey -Role $Role
+    $pathKey = @(
+        $AssignmentPaths |
+            ForEach-Object { $_.ResourceType }
+    ) -join ','
+    $key = "$ContextKey$([char]31)$roleKey$([char]31)$pathKey"
+    if (-not $coverageCache.ContainsKey($key)) {
+        $coverageCache[$key] = Get-RadarRoleDenyCoverage `
+            -Role $Role `
+            -RoleScopes @(
+                $Availability.Scopes |
+                    ForEach-Object { $_.Id }
+            ) `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoleSet `
+            -DiscoveryComplete (
+                $baseDiscoveryComplete -and
+                $ContextComplete -and
+                $Availability.IsComplete
+            ) `
+            -ScopeHierarchy $scopeHierarchy `
+            -AssignmentPaths $AssignmentPaths
+    }
+    return $coverageCache[$key]
+}
+
+$addResult = {
+    param(
+        [string]$AnalysisMode,
+        [string]$BaselineRoleName,
+        [string]$BaselineRoleId,
+        [string]$BaselineScope,
+        [string]$RestrictionSource,
+        [string]$AssignmentPath,
+        [object]$Role,
+        [string]$Action,
+        [object]$Match,
+        [object]$Coverage,
+        [string[]]$AdditionalWarnings = @()
+    )
+
+    [void]$results.Add([pscustomobject]@{
+        AnalysisMode = $AnalysisMode
+        BaselineRoleName = $BaselineRoleName
+        BaselineRoleId = $BaselineRoleId
+        BaselineScope = $BaselineScope
+        RestrictionSource = $RestrictionSource
+        AssignmentPath = $AssignmentPath
+        RoleName = Get-RadarPropertyValue `
+            -InputObject $Role `
+            -Name 'Name'
+        RoleId = Get-RadarPropertyValue `
+            -InputObject $Role `
+            -Name 'Id'
+        IsCustom = [bool](
+            Get-RadarPropertyValue `
+                -InputObject $Role `
+                -Name 'IsCustom'
+        )
+        RestrictedAction = $Action
+        MatchedPattern = $Match.MatchedPattern
+        IsAlreadyDenied = $Coverage.IsAlreadyDenied
+        DenyCoverage = $Coverage.Status
+        DeniedScopeCount = $Coverage.DeniedScopeCount
+        EvaluatedScopeCount = $Coverage.ScopeCount
+        BlockingPolicies = $Coverage.BlockingPolicies -join '; '
+        DeniedScopes = $Coverage.DeniedScopes -join '; '
+        UnblockedScopes = $Coverage.UnblockedScopes -join '; '
+        UnblockedAssignmentPaths =
+            $Coverage.UnblockedAssignmentPaths -join '; '
+        CoverageWarnings = @(
+            @($Coverage.UnknownReasons) +
+            @($AdditionalWarnings) |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                } |
+                Sort-Object -Unique
+        ) -join '; '
+    })
+}
+
+# Baseline-specific analysis: each source role keeps its own NotActions and
+# subtree. Roles and policy coverage are intersected with that subtree before
+# any summary is calculated.
+foreach ($baselineContext in $baselineContextInventory.Contexts) {
+    $contextKey =
+        "baseline:$($baselineContext.BaselineRoleId):$($baselineContext.BaselineScope)"
+    foreach ($role in $roles) {
+        $availability = & $getAvailability `
+            $role `
+            $baselineContext.EvaluationScopes `
+            $contextKey
+        foreach ($warning in $availability.Warnings) {
+            [void]$runtimeWarnings.Add(
+                "$($baselineContext.BaselineRoleName) at $($baselineContext.BaselineScope): $warning"
+            )
+        }
+        if (@($availability.Scopes).Count -eq 0) { continue }
+
+        $coverage = & $getCoverage `
+            $role `
+            $availability `
+            $contextKey `
+            $baselineContext.IsComplete `
+            $baselineContext.AssignmentPaths
+        foreach ($action in $baselineContext.RestrictedActions) {
+            $match = & $getMatch $role $action
+            if ($null -eq $match) { continue }
+            & $addResult `
+                'BaselineNotActions' `
+                $baselineContext.BaselineRoleName `
+                $baselineContext.BaselineRoleId `
+                $baselineContext.BaselineScope `
+                'Baseline role NotActions' `
+                $baselineContext.AssignmentPath `
+                $role `
+                $action `
+                $match `
+                $coverage `
+                $baselineContext.RestrictionWarnings
+        }
+    }
+}
+
+# The CSV remains an independent estate-wide safety audit. It is not injected
+# into baseline contexts, which would incorrectly attribute global restrictions
+# to a particular customer role.
+if ($csvActions.Count -gt 0) {
+    $globalContextKey = 'csv:accessible-estate'
+    foreach ($role in $roles) {
+        $availability = & $getAvailability `
+            $role `
+            $knownScopes `
+            $globalContextKey
+        foreach ($warning in $availability.Warnings) {
+            [void]$runtimeWarnings.Add(
+                "CSV safety baseline: $warning"
+            )
+        }
+        if (@($availability.Scopes).Count -eq 0) { continue }
+        $coverage = & $getCoverage `
+            $role `
+            $availability `
+            $globalContextKey `
+            $true `
+            @()
+        foreach ($action in $csvActions) {
+            $match = & $getMatch $role $action
+            if ($null -eq $match) { continue }
+            & $addResult `
+                'GlobalCsv' `
+                'CSV safety baseline' `
+                '' `
+                'Accessible estate' `
+                'Input CSV' `
+                'Depends on the applicable assignment path' `
+                $role `
+                $action `
+                $match `
+                $coverage `
+                @()
         }
     }
 }
 
 $sortedResults = @(
     $results.ToArray() |
-        Sort-Object RoleName, RestrictedAction
+        Sort-Object `
+            AnalysisMode,
+            BaselineRoleName,
+            BaselineScope,
+            RoleName,
+            RestrictedAction
 )
+$baselineSummaries =
+    New-Object System.Collections.Generic.List[object]
+foreach ($baselineContext in $baselineContextInventory.Contexts) {
+    $contextRows = @(
+        $sortedResults |
+            Where-Object {
+                $_.AnalysisMode -eq 'BaselineNotActions' -and
+                [string]::Equals(
+                    [string]$_.BaselineRoleId,
+                    [string]$baselineContext.BaselineRoleId,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                ) -and
+                [string]::Equals(
+                    [string]$_.BaselineScope,
+                    [string]$baselineContext.BaselineScope,
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    )
+    $contextObtainableActions = @(
+        $contextRows |
+            Where-Object { -not $_.IsAlreadyDenied } |
+            Select-Object -ExpandProperty RestrictedAction -Unique |
+            Sort-Object
+    )
+    [void]$baselineSummaries.Add([pscustomobject]@{
+        BaselineRoleName = $baselineContext.BaselineRoleName
+        BaselineScope = $baselineContext.BaselineScope
+        RestrictedActionCount =
+            @($baselineContext.RestrictedActions).Count
+        ObtainableActionCount = $contextObtainableActions.Count
+        ObtainableActions = $contextObtainableActions
+        GapRoleCount = @(
+            $contextRows |
+                Where-Object { -not $_.IsAlreadyDenied } |
+                Select-Object -ExpandProperty RoleId -Unique
+        ).Count
+    })
+}
+if ($csvActions.Count -gt 0) {
+    $csvRows = @(
+        $sortedResults |
+            Where-Object { $_.AnalysisMode -eq 'GlobalCsv' }
+    )
+    $csvObtainableActions = @(
+        $csvRows |
+            Where-Object { -not $_.IsAlreadyDenied } |
+            Select-Object -ExpandProperty RestrictedAction -Unique |
+            Sort-Object
+    )
+    [void]$baselineSummaries.Add([pscustomobject]@{
+        BaselineRoleName = 'CSV safety baseline'
+        BaselineScope = 'Accessible estate'
+        RestrictedActionCount = @($csvActions | Sort-Object -Unique).Count
+        ObtainableActionCount = $csvObtainableActions.Count
+        ObtainableActions = $csvObtainableActions
+        GapRoleCount = @(
+            $csvRows |
+                Where-Object { -not $_.IsAlreadyDenied } |
+                Select-Object -ExpandProperty RoleId -Unique
+        ).Count
+    })
+}
 $discoveryWarnings = @(
     @($scopeDiscovery.Warnings) +
+    @($policyBoundaryInventory.Warnings) +
+    @($scopeHierarchy.Warnings) +
     @($roleInventory.Warnings) +
-    @($policyInventory.Warnings)
+    @($baselineContextInventory.Warnings) +
+    @($scopeLimitWarnings) +
+    @($policyInventory.Warnings) +
+    @($runtimeWarnings)
 ) | Sort-Object -Unique
 $discoveryComplete =
     $scopeDiscovery.IsComplete -and
+    $scopeLimitComplete -and
+    $policyBoundaryInventory.IsComplete -and
+    $scopeHierarchy.IsComplete -and
     $roleInventory.IsComplete -and
+    $baselineContextInventory.IsComplete -and
     $policyInventory.IsComplete
 
 $outputDir = Split-Path -Parent $OutputCsv
@@ -3796,7 +5354,7 @@ else {
     Set-Content `
         -LiteralPath $OutputCsv `
         -Encoding UTF8 `
-        -Value '"RoleName","RoleId","IsCustom","RestrictedAction","MatchedPattern","IsAlreadyDenied","DenyCoverage","DeniedScopeCount","EvaluatedScopeCount","BlockingPolicies","UnblockedScopes","CoverageWarnings"'
+        -Value '"AnalysisMode","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictionSource","AssignmentPath","RoleName","RoleId","IsCustom","RestrictedAction","MatchedPattern","IsAlreadyDenied","DenyCoverage","DeniedScopeCount","EvaluatedScopeCount","BlockingPolicies","DeniedScopes","UnblockedScopes","UnblockedAssignmentPaths","CoverageWarnings"'
 }
 
 if ($OutputHtml) {
@@ -3822,6 +5380,8 @@ if ($OutputHtml) {
         -DeniedListProvided ([bool]$denyCoverageEvaluated) `
         -SourceRoleNames $dynamicSourceRoleNames `
         -ScopeCount $policyScopes.Count `
+        -BaselineContextCount $baselineContextInventory.Contexts.Count `
+        -BaselineSummaries $baselineSummaries.ToArray() `
         -PolicyAssignmentCount $policyInventory.AssignmentCount `
         -RoleDenyRuleCount $policyInventory.RelevantRuleCount `
         -PolicyExemptionCount $policyInventory.ExemptionCount `
@@ -3835,19 +5395,25 @@ $customMatches = @($sortedResults | Where-Object { $_.IsCustom }).Count
 $builtInMatches = $sortedResults.Count - $customMatches
 $affectedRoles = @(
     $sortedResults |
-        Group-Object RoleId |
+        Select-Object -ExpandProperty RoleId -Unique
+)
+$gapTargets = @(
+    $sortedResults |
+        Group-Object {
+            "$($_.AnalysisMode)$([char]31)$($_.BaselineRoleId)$([char]31)$($_.BaselineScope)$([char]31)$($_.RoleId)"
+        } |
         ForEach-Object { $_.Group[0] }
 )
 $fullyDenied = @(
-    $affectedRoles |
+    $gapTargets |
         Where-Object { $_.DenyCoverage -eq 'Full' }
 )
 $partiallyDenied = @(
-    $affectedRoles |
+    $gapTargets |
         Where-Object { $_.DenyCoverage -eq 'Partial' }
 )
 $unknownCoverage = @(
-    $affectedRoles |
+    $gapTargets |
         Where-Object { $_.DenyCoverage -in @('Unknown', 'NotEvaluated') }
 )
 $obtainableActions = @(
@@ -3861,19 +5427,36 @@ Write-Host "RADAR scan complete."
 Write-Host "  Roles scanned:        $($roles.Count) (built-in: $($builtInRoles.Count), custom: $($customRoles.Count))"
 Write-Host "  Matches found:        $($sortedResults.Count) (built-in: $builtInMatches, custom: $customMatches)"
 Write-Host "  Roles affected:       $($affectedRoles.Count)"
+Write-Host "  Baseline/role pairs:  $($gapTargets.Count)"
 if ($policyInventory.IsEvaluated -or $deniedRoleSet.Count -gt 0) {
-    Write-Host "  Fully denied roles:   $($fullyDenied.Count)"
+    Write-Host "  Fully denied pairs:   $($fullyDenied.Count)"
     Write-Host "  Partially denied:     $($partiallyDenied.Count)"
     Write-Host "  Coverage uncertain:   $($unknownCoverage.Count)"
-    Write-Host "  Obtainable actions:   $($obtainableActions.Count) of $($restrictedActions.Count)"
+    Write-Host "  Estate-wide action union: $($obtainableActions.Count) of $($restrictedActions.Count) obtainable"
+    if ($baselineSummaries.Count -gt 0) {
+        Write-Host '  Per-baseline action gaps:'
+        foreach (
+            $baselineSummary in @(
+                $baselineSummaries |
+                    Sort-Object BaselineRoleName, BaselineScope
+            )
+        ) {
+            Write-Host "    - $($baselineSummary.BaselineRoleName) @ $($baselineSummary.BaselineScope): $($baselineSummary.ObtainableActionCount) of $($baselineSummary.RestrictedActionCount) obtainable"
+        }
+    }
     $rolesStillObtainable = @(
-        $affectedRoles |
+        $gapTargets |
             Where-Object { -not $_.IsAlreadyDenied }
     )
     if ($rolesStillObtainable.Count -gt 0) {
-        Write-Host '  Roles still obtainable at one or more scopes:'
-        foreach ($roleResult in ($rolesStillObtainable | Sort-Object RoleName)) {
-            Write-Host "    - $($roleResult.RoleName) [$($roleResult.DenyCoverage)]"
+        Write-Host '  Baseline/role pairs still obtainable:'
+        foreach (
+            $roleResult in @(
+                $rolesStillObtainable |
+                    Sort-Object BaselineRoleName, BaselineScope, RoleName
+            )
+        ) {
+            Write-Host "    - $($roleResult.BaselineRoleName) @ $($roleResult.BaselineScope) -> $($roleResult.RoleName) [$($roleResult.DenyCoverage)]"
         }
     }
 }
