@@ -184,21 +184,39 @@ or pass the descendant subscriptions explicitly when full coverage matters.
 
 ### Dynamic restricted actions
 
-`-DynamicRestrictedActions` derives the restricted set from the `NotActions` of
-custom wildcard roles whose names match `-BaselineRolePattern`. This no longer
-requires a particular management group.
+`-DynamicRestrictedActions` derives restricted actions from broad custom roles
+that grant `*` and claw permissions back with `NotActions`. It does not require
+a particular management group or customer-specific default role name.
+
+Without `-BaselineRolePattern`, RADAR auto-detects Owner and Contributor role
+families and selects the role with the fewest `NotActions` in each family. That
+favours broad platform baselines over narrow workload roles that grant `*` but
+claw back most Azure operations.
 
 ```powershell
+# Auto-detect broad Owner/Contributor wildcard roles
 ./Invoke-Radar.ps1 -NoMenu `
     -DynamicRestrictedActions `
-    -BaselineRolePattern '*-Owner-*','*-Contributor-*' `
+    -OutputCsv ./output/radar-report.csv `
+    -OutputHtml ./output/radar-report.html
+
+# Override auto-detection for differently named customer baseline roles
+./Invoke-Radar.ps1 -NoMenu `
+    -DynamicRestrictedActions `
+    -BaselineRolePattern '*Platform Baseline Admin*' `
     -OutputCsv ./output/radar-report.csv `
     -OutputHtml ./output/radar-report.html
 ```
 
-Combine `-DynamicRestrictedActions` with `-InputCsv` to union both sources.
-Use narrow role-name patterns: purpose-built wildcard roles often have broad
-`NotActions` lists that do not represent the customer's restricted baseline.
+The interactive menu always keeps `restricted-actions.csv` as a safety baseline
+and optionally augments it with dynamically derived actions. A non-interactive
+automatic run also falls back to the bundled CSV if no usable baseline role is
+visible, rather than failing with no actions to evaluate.
+
+Combine `-DynamicRestrictedActions` with a custom `-InputCsv` to union both
+sources. Use narrow explicit role-name patterns: purpose-built wildcard roles
+often have broad `NotActions` lists that do not represent the customer's
+restricted baseline.
 
 ### Policy discovery
 

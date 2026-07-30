@@ -43,8 +43,9 @@
     the selected estate, instead of (or together with) -InputCsv.
 
 .PARAMETER BaselineRolePattern
-    Role-name wildcard patterns used by -DynamicRestrictedActions to identify
-    the broad baseline roles whose NotActions define the restricted set.
+    Optional role-name wildcard patterns used by -DynamicRestrictedActions.
+    When omitted, RADAR selects the broadest custom wildcard roles with Owner
+    or Contributor in the name. Supply patterns to override auto-detection.
 
 .PARAMETER NoPolicyDiscovery
     Disables live discovery of Azure Policy assignments that deny roles.
@@ -84,10 +85,7 @@ param(
 
     [switch]$DynamicRestrictedActions,
 
-    [string[]]$BaselineRolePattern = @(
-        'Custom-Owner-*',
-        'Custom-Contributor-*'
-    ),
+    [string[]]$BaselineRolePattern = @(),
 
     [switch]$NoPolicyDiscovery
 )
@@ -97,6 +95,8 @@ $ErrorActionPreference = 'Stop'
 
 # Suppress noisy "Upcoming breaking changes" warnings emitted by Az.Resources cmdlets.
 $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
+$scriptDir = Split-Path -Parent $PSCommandPath
+$defaultInputCsv = Join-Path $scriptDir 'restricted-actions.csv'
 
 # Interactive menu when launched with no scoping parameters.
 $invokedWithArgs =
@@ -109,8 +109,7 @@ $invokedWithArgs =
     $BuiltInOnly -or
     $DynamicRestrictedActions
 if (-not $invokedWithArgs -and -not $NoMenu) {
-    $scriptDir = Split-Path -Parent $PSCommandPath
-    $defaultIn     = Join-Path $scriptDir 'restricted-actions.csv'
+    $defaultIn     = $defaultInputCsv
     $defaultCsv    = Join-Path $scriptDir 'output/radar-report.csv'
     $defaultHtml   = Join-Path $scriptDir 'output/radar-report.html'
 
@@ -146,22 +145,27 @@ if (-not $invokedWithArgs -and -not $NoMenu) {
     }
 
     if (-not $BuiltInOnly) {
-        $dynAns = Read-Host 'Derive restricted actions from baseline wildcard-role NotActions instead of the CSV? [y/N]'
+        $dynAns = Read-Host 'Also derive restricted actions from baseline wildcard-role NotActions? [y/N]'
         if ($dynAns.Trim().ToUpperInvariant() -eq 'Y') {
             $DynamicRestrictedActions = $true
         }
     }
 
-    if (-not $InputCsv -and -not $DynamicRestrictedActions) { $InputCsv = $defaultIn }
+    if (-not $InputCsv) { $InputCsv = $defaultIn }
     if (-not $OutputCsv)      { $OutputCsv      = $defaultCsv }
     if (-not $OutputHtml)     { $OutputHtml     = $defaultHtml }
 
     Write-Host ''
     Write-Host 'Running with:'
     if ($DynamicRestrictedActions) {
-        Write-Host '  Restricted from: dynamic (NotActions of matching baseline roles)'
-        Write-Host "  Baseline patterns: $($BaselineRolePattern -join ', ')"
-        if ($InputCsv) { Write-Host "  + InputCsv:      $InputCsv" }
+        Write-Host '  Restricted from: CSV + dynamic baseline-role NotActions'
+        if ($BaselineRolePattern.Count -gt 0) {
+            Write-Host "  Baseline patterns: $($BaselineRolePattern -join ', ')"
+        }
+        else {
+            Write-Host '  Baseline roles:    automatic (broadest Owner/Contributor wildcard roles)'
+        }
+        Write-Host "  InputCsv:          $InputCsv"
     } else {
         Write-Host "  InputCsv:        $InputCsv"
     }
@@ -196,14 +200,16 @@ if (($Scope -or $ManagementGroup) -and $CurrentSubscriptionOnly) {
 if ($DynamicRestrictedActions -and $BuiltInOnly) {
     throw '-DynamicRestrictedActions requires custom-role discovery; remove -BuiltInOnly.'
 }
-if ($DynamicRestrictedActions -and $BaselineRolePattern.Count -eq 0) {
-    throw '-DynamicRestrictedActions requires at least one -BaselineRolePattern.'
-}
 
 $IncludeCustomRoles = -not $BuiltInOnly
 
 if ($DynamicRestrictedActions) {
-    Write-Host "Dynamic derivation scoped to baseline role pattern(s): $($BaselineRolePattern -join ', ')"
+    if ($BaselineRolePattern.Count -gt 0) {
+        Write-Host "Dynamic derivation scoped to baseline role pattern(s): $($BaselineRolePattern -join ', ')"
+    }
+    else {
+        Write-Host 'Dynamic derivation will auto-detect the broadest Owner/Contributor wildcard roles.'
+    }
 }
 
 function Test-RadarAzSession {
@@ -1896,6 +1902,158 @@ function Get-ActionMatch {
     return $null
 }
 
+function Get-RadarBaselineRole {
+    <#
+    Selects dynamic restricted-action source roles. Explicit patterns are
+    authoritative. Auto-detection chooses the wildcard role with the fewest
+    NotActions in each Owner and Contributor name family, which favours broad
+    platform roles over narrow roles that claw back most Azure operations.
+    #>
+    param(
+        [object[]]$Roles,
+        [string[]]$Pattern = @()
+    )
+
+    $patterns = @(
+        $Pattern |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    $candidates = @(
+        foreach ($role in $Roles) {
+            $actions = @(
+                Get-RoleProperty -Role $role -Name 'Actions'
+            )
+            $notActions = @(
+                Get-RoleProperty -Role $role -Name 'NotActions' |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    } |
+                    Sort-Object -Unique
+            )
+            if (
+                $actions -contains '*' -and
+                $notActions.Count -gt 0
+            ) {
+                [pscustomobject]@{
+                    Role = $role
+                    Name = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $role `
+                            -Name 'Name'
+                    )
+                    NotActionCount = $notActions.Count
+                }
+            }
+        }
+    )
+
+    $selected = New-Object System.Collections.Generic.List[object]
+    $selectedKeys =
+        New-Object System.Collections.Generic.HashSet[string] (
+            [StringComparer]::OrdinalIgnoreCase
+        )
+    $addSelection = {
+        param([object]$Candidate)
+        $key = Get-RadarRoleKey -Role $Candidate.Role
+        if ($selectedKeys.Add($key)) {
+            [void]$selected.Add($Candidate.Role)
+        }
+    }
+
+    if ($patterns.Count -gt 0) {
+        foreach ($candidate in $candidates) {
+            if (
+                @(
+                    $patterns |
+                        Where-Object {
+                            $candidate.Name -like $_
+                        }
+                ).Count -gt 0
+            ) {
+                & $addSelection $candidate
+            }
+        }
+        $mode = 'ExplicitPattern'
+    }
+    else {
+        foreach ($family in @('owner', 'contributor')) {
+            $familyCandidates = @(
+                $candidates |
+                    Where-Object {
+                        $_.Name -match
+                            "(?i)(^|[^a-z0-9])$family([^a-z0-9]|$)"
+                    } |
+                    Sort-Object NotActionCount, Name
+            )
+            if ($familyCandidates.Count -eq 0) { continue }
+
+            $minimumExclusions = $familyCandidates[0].NotActionCount
+            foreach (
+                $candidate in @(
+                    $familyCandidates |
+                        Where-Object {
+                            $_.NotActionCount -eq $minimumExclusions
+                        }
+                )
+            ) {
+                & $addSelection $candidate
+            }
+        }
+        $mode = 'Automatic'
+    }
+
+    [pscustomobject]@{
+        Roles = $selected.ToArray()
+        Candidates = $candidates
+        SelectionMode = $mode
+    }
+}
+
+function Import-RadarRestrictedActionCsv {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        throw "Input CSV not found: $Path"
+    }
+
+    $rows = @(Import-Csv -LiteralPath $Path)
+    if ($rows.Count -gt 0) {
+        if (
+            -not (
+                $rows[0].PSObject.Properties |
+                    Where-Object { $_.Name -ieq 'Action' }
+            )
+        ) {
+            throw "Input CSV must contain an 'Action' column."
+        }
+    }
+    else {
+        $header = Get-Content -LiteralPath $Path -TotalCount 1
+        if (
+            $header -notmatch
+            '(?i)(^|,)\s*"?Action"?\s*(,|$)'
+        ) {
+            throw "Input CSV must contain an 'Action' column."
+        }
+    }
+
+    return @(
+        $rows |
+            ForEach-Object {
+                Get-RadarPropertyValue `
+                    -InputObject $_ `
+                    -Name 'Action'
+            } |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            } |
+            ForEach-Object { $_.Trim() }
+    )
+}
+
 function Test-RadarHasProperty {
     param(
         [object]$InputObject,
@@ -3397,18 +3555,9 @@ Connect-RadarAzAccount
 
 $csvActions = @()
 if ($InputCsv) {
-    if (-not (Test-Path -LiteralPath $InputCsv)) {
-        throw "Input CSV not found: $InputCsv"
-    }
-
-    $restricted = Import-Csv -LiteralPath $InputCsv
-    if (-not ($restricted | Get-Member -Name 'Action' -MemberType NoteProperty)) {
-        throw "Input CSV must contain an 'Action' column."
-    }
-
-    $csvActions = @($restricted.Action |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
-        ForEach-Object { $_.Trim() })
+    $csvActions = @(
+        Import-RadarRestrictedActionCsv -Path $InputCsv
+    )
 
     Write-Host "Loaded $(@($csvActions | Sort-Object -Unique).Count) restricted action(s) from $InputCsv"
 }
@@ -3474,28 +3623,16 @@ if (
 $dynamicActions = @()
 $dynamicSourceRoleNames = @()
 if ($DynamicRestrictedActions) {
-    $sourceRoles = @(
-        $customRoles |
-            Where-Object {
-                @(Get-RoleProperty -Role $_ -Name 'Actions') -contains '*'
-            } |
-            Where-Object {
-                $roleName = [string](
-                    Get-RadarPropertyValue `
-                        -InputObject $_ `
-                        -Name 'Name'
-                )
-                @(
-                    $BaselineRolePattern |
-                        Where-Object { $roleName -like $_ }
-                ).Count -gt 0
-            }
-    )
+    $baselineSelection = Get-RadarBaselineRole `
+        -Roles $customRoles `
+        -Pattern $BaselineRolePattern
+    $sourceRoles = @($baselineSelection.Roles)
     $dynamicSourceRoleNames = @(
         $sourceRoles |
             ForEach-Object {
                 Get-RadarPropertyValue -InputObject $_ -Name 'Name'
-            }
+            } |
+            Sort-Object
     )
 
     $naSet = New-Object System.Collections.Generic.HashSet[string] ([StringComparer]::OrdinalIgnoreCase)
@@ -3507,10 +3644,36 @@ if ($DynamicRestrictedActions) {
     $dynamicActions = @($naSet | Sort-Object)
 
     if ($sourceRoles.Count -eq 0) {
-        Write-Warning "Dynamic mode: no custom wildcard roles matched the baseline pattern(s): $($BaselineRolePattern -join ', ')."
+        if ($BaselineRolePattern.Count -gt 0) {
+            Write-Warning "Dynamic mode: no custom wildcard roles matched the explicit baseline pattern(s): $($BaselineRolePattern -join ', ')."
+        }
+        else {
+            Write-Warning 'Dynamic mode: no usable Owner/Contributor wildcard baseline roles were auto-detected.'
+        }
     }
     else {
-        Write-Host "  Derived $($dynamicActions.Count) restricted action(s) from $($sourceRoles.Count) wildcard role(s): $($dynamicSourceRoleNames -join ', ')"
+        $selectionLabel = if (
+            $baselineSelection.SelectionMode -eq 'Automatic'
+        ) {
+            'auto-selected'
+        }
+        else {
+            'pattern-matched'
+        }
+        Write-Host "  Derived $($dynamicActions.Count) restricted action(s) from $($sourceRoles.Count) $selectionLabel wildcard role(s): $($dynamicSourceRoleNames -join ', ')"
+    }
+
+    if (
+        $dynamicActions.Count -eq 0 -and
+        $csvActions.Count -eq 0 -and
+        $BaselineRolePattern.Count -eq 0 -and
+        (Test-Path -LiteralPath $defaultInputCsv)
+    ) {
+        $csvActions = @(
+            Import-RadarRestrictedActionCsv -Path $defaultInputCsv
+        )
+        $InputCsv = $defaultInputCsv
+        Write-Warning "Dynamic derivation produced no actions; falling back to bundled input CSV $defaultInputCsv."
     }
 }
 
@@ -3521,7 +3684,7 @@ $restrictedActions = @(@($csvActions) + @($dynamicActions) |
     Sort-Object -Unique)
 
 if ($restrictedActions.Count -eq 0) {
-    throw "No restricted actions to evaluate. Provide -InputCsv with entries and/or -DynamicRestrictedActions with wildcard roles present at the scope."
+    throw 'No restricted actions to evaluate. Provide -InputCsv, broaden -BaselineRolePattern, or ensure an Owner/Contributor wildcard baseline role is visible.'
 }
 
 Write-Host "Total restricted actions to evaluate: $($restrictedActions.Count)"

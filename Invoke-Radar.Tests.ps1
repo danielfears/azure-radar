@@ -197,6 +197,103 @@ Describe 'Get-ActionMatch' {
     }
 }
 
+Describe 'Get-RadarBaselineRole' {
+    BeforeAll {
+        function New-TestWildcardRole {
+            param(
+                [string]$Name,
+                [string]$Id,
+                [string[]]$NotActions
+            )
+
+            [pscustomobject]@{
+                Name = $Name
+                Id = "/providers/Microsoft.Authorization/roleDefinitions/$Id"
+                IsCustom = $true
+                Permissions = @(
+                    [pscustomobject]@{
+                        Actions = @('*')
+                        NotActions = $NotActions
+                    }
+                )
+            }
+        }
+    }
+
+    It 'auto-selects the broadest Owner and Contributor wildcard roles' {
+        $roles = @(
+            (New-TestWildcardRole `
+                -Name 'Customer-Platform-Owner' `
+                -Id '11111111-1111-1111-1111-111111111111' `
+                -NotActions @('restricted/a', 'restricted/b')),
+            (New-TestWildcardRole `
+                -Name 'Workload-Storage-Owner' `
+                -Id '22222222-2222-2222-2222-222222222222' `
+                -NotActions @(
+                    'restricted/a',
+                    'restricted/b',
+                    'Microsoft.Sql/*',
+                    'Microsoft.Network/*'
+                )),
+            (New-TestWildcardRole `
+                -Name 'Customer-Platform-Contributor' `
+                -Id '33333333-3333-3333-3333-333333333333' `
+                -NotActions @(
+                    'restricted/a',
+                    'restricted/b',
+                    'restricted/c'
+                )),
+            (New-TestWildcardRole `
+                -Name 'Peering Operator' `
+                -Id '44444444-4444-4444-4444-444444444444' `
+                -NotActions @('Microsoft.Sql/*'))
+        )
+
+        $selection = Get-RadarBaselineRole -Roles $roles
+
+        $selection.SelectionMode | Should -Be 'Automatic'
+        $selection.Roles.Name |
+            Should -Contain 'Customer-Platform-Owner'
+        $selection.Roles.Name |
+            Should -Contain 'Customer-Platform-Contributor'
+        $selection.Roles.Name |
+            Should -Not -Contain 'Workload-Storage-Owner'
+        $selection.Roles.Name |
+            Should -Not -Contain 'Peering Operator'
+    }
+
+    It 'uses explicit patterns instead of automatic name families' {
+        $roles = @(
+            (New-TestWildcardRole `
+                -Name 'Customer-Platform-Owner' `
+                -Id '11111111-1111-1111-1111-111111111111' `
+                -NotActions @('restricted/a')),
+            (New-TestWildcardRole `
+                -Name 'Platform Baseline Admin' `
+                -Id '22222222-2222-2222-2222-222222222222' `
+                -NotActions @('restricted/b'))
+        )
+
+        $selection = Get-RadarBaselineRole `
+            -Roles $roles `
+            -Pattern '*Baseline Admin'
+
+        $selection.SelectionMode | Should -Be 'ExplicitPattern'
+        $selection.Roles.Name | Should -Be 'Platform Baseline Admin'
+    }
+
+    It 'returns no automatic selection when no safe name family is visible' {
+        $selection = Get-RadarBaselineRole -Roles @(
+            (New-TestWildcardRole `
+                -Name 'Peering Operator' `
+                -Id '44444444-4444-4444-4444-444444444444' `
+                -NotActions @('Microsoft.Sql/*'))
+        )
+
+        $selection.Roles | Should -BeNullOrEmpty
+    }
+}
+
 Describe 'Get-RadarScanScope' {
     BeforeEach {
         Mock Get-AzContext {
@@ -1174,5 +1271,40 @@ Describe 'Invoke-Radar end-to-end empty result' {
         $result.DenyCoverage | Should -Be 'Full'
         $result.IsAlreadyDenied | Should -Be 'True'
         $result.BlockingPolicies | Should -Be 'Deny Reader'
+    }
+
+    It 'falls back to the bundled CSV when automatic baseline discovery finds no role' {
+        $outputCsv = Join-Path $TestDrive 'dynamic-fallback.csv'
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/roleDefinitions/44444444-4444-4444-4444-444444444444'
+                        RoleName = 'Peering Operator'
+                        AssignableScopes = @('/subscriptions/sub-1')
+                        Permissions = @(
+                            [pscustomobject]@{
+                                actions = @('*')
+                                notActions = @('Microsoft.Sql/*')
+                            }
+                        )
+                    }
+                )
+                SkipToken = $null
+            }
+        }
+
+        {
+            & $scriptPath `
+                -NoMenu `
+                -CurrentSubscriptionOnly `
+                -DynamicRestrictedActions `
+                -NoPolicyDiscovery `
+                -OutputCsv $outputCsv
+        } | Should -Not -Throw
+
+        Test-Path -LiteralPath $outputCsv | Should -BeTrue
+        (Get-Content -LiteralPath $outputCsv -Raw) |
+            Should -Match '"RestrictedAction"'
     }
 }
