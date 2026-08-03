@@ -1105,6 +1105,250 @@ Describe 'Test-RadarPolicyRuleForRole' {
     }
 }
 
+Describe 'Test-RadarPolicyTypeApplicability' {
+    It 'rules out an unrelated policy even when another condition is unsupported' {
+        $condition = @{
+            allOf = @(
+                @{
+                    field = 'type'
+                    equals = 'Microsoft.Consumption/budgets'
+                },
+                @{
+                    field =
+                        'Microsoft.Consumption/budgets/notifications[*].contactEmails[*]'
+                    notLike = '*@example.invalid'
+                }
+            )
+        }
+
+        Test-RadarPolicyTypeApplicability `
+            -Condition $condition `
+            -ResourceTypes @(
+                'Microsoft.Authorization/roleAssignments',
+                'Microsoft.Authorization/roleAssignmentScheduleRequests'
+            ) |
+            Should -Be 'False'
+    }
+
+    It 'retains a parameterised policy that can target role assignments' {
+        $condition = @{
+            field = 'type'
+            in = "[parameters('targetTypes')]"
+        }
+
+        Test-RadarPolicyTypeApplicability `
+            -Condition $condition `
+            -Parameters @{
+                targetTypes = @(
+                    'Microsoft.Authorization/roleAssignments'
+                )
+            } `
+            -ResourceTypes @(
+                'Microsoft.Authorization/roleAssignments'
+            ) |
+            Should -Be 'True'
+    }
+
+    It 'evaluates a negated type condition per assignment resource type' {
+        $condition = @{
+            not = @{
+                field = 'type'
+                equals = 'Microsoft.Authorization/roleAssignments'
+            }
+        }
+
+        Test-RadarPolicyTypeApplicability `
+            -Condition $condition `
+            -ResourceTypes @(
+                'Microsoft.Authorization/roleAssignments',
+                'Microsoft.Authorization/roleAssignmentScheduleRequests'
+            ) |
+            Should -Be 'True'
+    }
+
+    It 'does not exclude a negated composite with unconstrained conditions' {
+        $condition = @{
+            not = @{
+                allOf = @(
+                    @{
+                        field = 'type'
+                        like = 'Microsoft.Authorization/*'
+                    },
+                    @{
+                        field = 'name'
+                        equals = 'allowed'
+                    }
+                )
+            }
+        }
+
+        Test-RadarPolicyTypeApplicability `
+            -Condition $condition `
+            -ResourceTypes @(
+                'Microsoft.Authorization/roleAssignments'
+            ) |
+            Should -Be 'True'
+    }
+}
+
+Describe 'Resolve-RadarPolicyAssignmentVersion' {
+    It 'populates effective version through the available expansion path' {
+        $assignment = [pscustomobject]@{
+            Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/versioned'
+            DefinitionVersion = '1.*.*'
+        }
+
+        if (
+            (Get-Command Get-AzPolicyAssignment).Parameters.ContainsKey(
+                'Expand'
+            )
+        ) {
+            Mock Get-AzPolicyAssignment {
+                [pscustomobject]@{
+                    Id = $Id
+                    DefinitionVersion = '1.*.*'
+                    EffectiveDefinitionVersion = '1.2.3'
+                }
+            }
+        }
+        else {
+            Mock Invoke-AzRestMethod {
+                [pscustomobject]@{
+                    Content = '{"properties":{"effectiveDefinitionVersion":"1.2.3"}}'
+                }
+            }
+        }
+
+        $expanded = Resolve-RadarPolicyAssignmentVersion `
+            -Assignment $assignment
+
+        $expanded.EffectiveDefinitionVersion |
+            Should -Be '1.2.3'
+    }
+}
+
+Describe 'Get-RadarPolicyDefinitionCached' {
+    It 'falls back to REST when versioned Az.Resources output has no rule' {
+        Mock Get-AzPolicyDefinition { $null }
+        Mock Invoke-AzRestMethod {
+            [pscustomobject]@{
+                Content = @'
+{
+  "name": "1.2.3",
+  "properties": {
+    "displayName": "Deny selected roles",
+    "policyType": "Custom",
+    "mode": "All",
+    "parameters": {},
+    "policyRule": {
+      "if": {
+        "field": "type",
+        "equals": "Microsoft.Authorization/roleAssignments"
+      },
+      "then": {
+        "effect": "deny"
+      }
+    }
+  }
+}
+'@
+            }
+        }
+
+        $definition = Get-RadarPolicyDefinitionCached `
+            -Id '/providers/Microsoft.Authorization/policyDefinitions/deny-roles' `
+            -DefinitionCache @{} `
+            -PolicySetCache @{} `
+            -Version '1.2.3'
+
+        $definition.Mode | Should -Be 'All'
+        $definition.PolicyRule.then.effect | Should -Be 'deny'
+        Should -Invoke Invoke-AzRestMethod -ParameterFilter {
+            $Path -match '/versions/1\.2\.3\?api-version='
+        }
+    }
+
+    It 'uses expanded REST output when initiative members remain ranged' {
+        Mock Get-AzPolicySetDefinition {
+            [pscustomobject]@{
+                Id = $Id
+                PolicyDefinition = @(
+                    [pscustomobject]@{
+                        PolicyDefinitionId =
+                            '/providers/Microsoft.Authorization/policyDefinitions/member'
+                        DefinitionVersion = '1.*.*'
+                    }
+                )
+            }
+        }
+        Mock Invoke-AzRestMethod {
+            [pscustomobject]@{
+                Content = @'
+{
+  "name": "2.0.0",
+  "properties": {
+    "displayName": "Role controls",
+    "policyType": "Custom",
+    "parameters": {},
+    "policyDefinitions": [
+      {
+        "policyDefinitionId": "/providers/Microsoft.Authorization/policyDefinitions/member",
+        "definitionVersion": "1.*.*",
+        "effectiveDefinitionVersion": "1.4.2"
+      }
+    ]
+  }
+}
+'@
+            }
+        }
+
+        $set = Get-RadarPolicyDefinitionCached `
+            -Id '/providers/Microsoft.Authorization/policySetDefinitions/role-controls' `
+            -DefinitionCache @{} `
+            -PolicySetCache @{} `
+            -Version '2.0.0'
+
+        $set.PolicyDefinition[0].effectiveDefinitionVersion |
+            Should -Be '1.4.2'
+        Should -Invoke Invoke-AzRestMethod -ParameterFilter {
+            $Path -match '\$expand=EffectiveDefinitionVersion'
+        }
+    }
+
+    It 'rejects REST initiative output with unresolved member ranges' {
+        Mock Get-AzPolicySetDefinition { $null }
+        Mock Invoke-AzRestMethod {
+            [pscustomobject]@{
+                Content = @'
+{
+  "name": "2.0.0",
+  "properties": {
+    "displayName": "Role controls",
+    "policyType": "Custom",
+    "parameters": {},
+    "policyDefinitions": [
+      {
+        "policyDefinitionId": "/providers/Microsoft.Authorization/policyDefinitions/member",
+        "definitionVersion": "1.*.*"
+      }
+    ]
+  }
+}
+'@
+            }
+        }
+
+        {
+            Get-RadarPolicyDefinitionCached `
+                -Id '/providers/Microsoft.Authorization/policySetDefinitions/role-controls' `
+                -DefinitionCache @{} `
+                -PolicySetCache @{} `
+                -Version '2.0.0'
+        } | Should -Throw '*effective versions*'
+    }
+}
+
 Describe 'Resolve-RadarPolicyAssignment' {
     BeforeEach {
         Mock Get-AzPolicyDefinition {
@@ -1820,6 +2064,191 @@ Describe 'ConvertTo-RadarHtmlReport' {
     }
 }
 
+Describe 'Normalised CSV output' {
+    It 'gives separate baselines distinct stable coverage keys' {
+        $first = Get-RadarCoverageKey `
+            -AnalysisMode 'BaselineNotActions' `
+            -BaselineRoleId 'baseline-1' `
+            -BaselineScope '/subscriptions/sub-1' `
+            -RoleId 'role-1' `
+            -AssignmentPath 'Direct role assignment'
+        $repeat = Get-RadarCoverageKey `
+            -AnalysisMode 'BaselineNotActions' `
+            -BaselineRoleId 'baseline-1' `
+            -BaselineScope '/subscriptions/sub-1' `
+            -RoleId 'role-1' `
+            -AssignmentPath 'Direct role assignment'
+        $second = Get-RadarCoverageKey `
+            -AnalysisMode 'BaselineNotActions' `
+            -BaselineRoleId 'baseline-2' `
+            -BaselineScope '/subscriptions/sub-1' `
+            -RoleId 'role-1' `
+            -AssignmentPath 'Direct role assignment'
+
+        $first | Should -Be $repeat
+        $first | Should -Not -Be $second
+    }
+
+    It 'exports match and coverage files with valid joins and no temp files' {
+        $matchPath = Join-Path $TestDrive 'matches.csv'
+        $coveragePath = Join-Path $TestDrive 'matches-coverage.csv'
+        $result = [pscustomobject]@{
+            AnalysisMode = 'BaselineNotActions'
+            BaselineRoleName = 'Baseline'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = '/subscriptions/sub-1'
+            RestrictionSource = 'Baseline role NotActions'
+            AssignmentPath = 'Direct role assignment'
+            RoleName = 'Owner'
+            RoleId = 'role-1'
+            IsCustom = $false
+            RestrictedAction = 'Dangerous.Provider/write'
+            MatchedPattern = '*'
+            CoverageKey = 'CV-test'
+            IsAlreadyDenied = $false
+            DenyCoverage = 'None'
+            DeniedScopeCount = 0
+            EvaluatedScopeCount = 1
+            BlockingPolicyCount = 0
+            UnblockedScopeCount = 1
+            UnblockedAssignmentPathCount = 1
+            CoverageWarningCount = 0
+            BlockingPolicies = ''
+            DeniedScopes = ''
+            UnblockedScopes = '/subscriptions/sub-1'
+            UnblockedAssignmentPaths =
+                '/subscriptions/sub-1 :: Direct role assignment'
+            CoverageWarnings = ''
+        }
+
+        Export-RadarCsvReports `
+            -Results @($result) `
+            -MatchCsvPath $matchPath `
+            -CoverageCsvPath $coveragePath
+
+        $match = Import-Csv -LiteralPath $matchPath
+        $coverage = Import-Csv -LiteralPath $coveragePath
+        $match.CoverageKey | Should -Be $coverage.CoverageKey
+        $match.PSObject.Properties.Name |
+            Should -Not -Contain 'CoverageWarnings'
+        $coverage.UnblockedScopes |
+            Should -Be '/subscriptions/sub-1'
+        @(Get-ChildItem -LiteralPath $TestDrive -Filter '*.tmp.*').Count |
+            Should -Be 0
+        $manifestPath = "$matchPath.manifest.json"
+        Test-Path -LiteralPath $manifestPath | Should -BeTrue
+        $manifest = (
+            Get-Content -LiteralPath $manifestPath -Raw
+        ) | ConvertFrom-Json
+        Test-Path -LiteralPath $manifest.MatchCsv | Should -BeTrue
+        Test-Path -LiteralPath $manifest.CoverageCsv | Should -BeTrue
+        (
+            Import-Csv -LiteralPath $manifest.MatchCsv
+        ).CoverageKey |
+            Should -Be (
+                Import-Csv -LiteralPath $manifest.CoverageCsv
+            ).CoverageKey
+    }
+
+    It 'does not delete paths outside owned report generations' {
+        $matchPath = Join-Path $TestDrive 'matches.csv.partial'
+        $coveragePath =
+            Join-Path $TestDrive 'matches-coverage.csv.partial'
+        $victimPath = Join-Path $TestDrive 'keep-me.txt'
+        Set-Content -LiteralPath $matchPath -Value 'match'
+        Set-Content -LiteralPath $coveragePath -Value 'coverage'
+        Set-Content -LiteralPath $victimPath -Value 'important'
+        [pscustomobject]@{
+            MatchCsv = $victimPath
+            CoverageCsv = $victimPath
+        } |
+            ConvertTo-Json |
+            Set-Content `
+                -LiteralPath "$matchPath.manifest.json"
+
+        Remove-RadarCsvReportSet `
+            -MatchCsvPath $matchPath `
+            -CoverageCsvPath $coveragePath
+
+        Test-Path -LiteralPath $victimPath | Should -BeTrue
+    }
+
+    It 'uses case-sensitive directory ownership on non-Windows hosts' -Skip:(
+        [System.Environment]::OSVersion.Platform -eq
+        [System.PlatformID]::Win32NT
+    ) {
+        $lowerDirectory = Join-Path $TestDrive 'reports'
+        $upperDirectory = Join-Path $TestDrive 'Reports'
+        New-Item -ItemType Directory -Path $lowerDirectory | Out-Null
+        New-Item -ItemType Directory -Path $upperDirectory | Out-Null
+
+        Test-RadarOwnedGenerationPath `
+            -CandidatePath (
+                Join-Path `
+                    $upperDirectory `
+                    'matches.csv.generation-test'
+            ) `
+            -ReportPath (
+                Join-Path $lowerDirectory 'matches.csv'
+            ) |
+            Should -BeFalse
+    }
+
+    It 'publishes provider-resolved manifest paths for relative outputs' {
+        $originalLocation = Get-Location
+        try {
+            Set-Location $TestDrive
+            $result = [pscustomobject]@{
+                AnalysisMode = 'GlobalCsv'
+                BaselineRoleName = 'CSV'
+                BaselineRoleId = ''
+                BaselineScope = 'Estate'
+                RestrictionSource = 'Input CSV'
+                AssignmentPath = 'Direct'
+                RoleName = 'Owner'
+                RoleId = 'role-1'
+                IsCustom = $false
+                RestrictedAction = 'Dangerous/write'
+                MatchedPattern = '*'
+                CoverageKey = 'CV-relative'
+                IsAlreadyDenied = $false
+                DenyCoverage = 'None'
+                DeniedScopeCount = 0
+                EvaluatedScopeCount = 1
+                BlockingPolicyCount = 0
+                UnblockedScopeCount = 1
+                UnblockedAssignmentPathCount = 1
+                CoverageWarningCount = 0
+                BlockingPolicies = ''
+                DeniedScopes = ''
+                UnblockedScopes = '/subscriptions/sub-1'
+                UnblockedAssignmentPaths = 'Direct'
+                CoverageWarnings = ''
+            }
+
+            Export-RadarCsvReports `
+                -Results @($result) `
+                -MatchCsvPath 'relative.csv' `
+                -CoverageCsvPath 'relative-coverage.csv'
+
+            $manifest = (
+                Get-Content `
+                    -LiteralPath 'relative.csv.manifest.json' `
+                    -Raw
+            ) | ConvertFrom-Json
+            $manifest.MatchCsv.StartsWith(
+                [string]$TestDrive
+            ) | Should -BeTrue
+            $manifest.CoverageCsv.StartsWith(
+                [string]$TestDrive
+            ) | Should -BeTrue
+        }
+        finally {
+            Set-Location $originalLocation
+        }
+    }
+}
+
 Describe 'Invoke-Radar end-to-end empty result' {
     BeforeEach {
         Mock Get-AzContext {
@@ -1888,6 +2317,8 @@ Describe 'Invoke-Radar end-to-end empty result' {
         Test-Path -LiteralPath $outputHtml | Should -BeTrue
         (Get-Content -LiteralPath $outputHtml -Raw) |
             Should -Match 'No matches found'
+        Test-Path -LiteralPath "$outputCsv.manifest.json" |
+            Should -BeTrue
     }
 
     It 'derives full deny coverage from a live policy assignment' {
@@ -1949,7 +2380,13 @@ Describe 'Invoke-Radar end-to-end empty result' {
         $result.CoverageWarnings | Should -BeNullOrEmpty
         $result.DenyCoverage | Should -Be 'Full'
         $result.IsAlreadyDenied | Should -Be 'True'
-        $result.BlockingPolicies |
+        $coverageResult = Import-Csv -LiteralPath (
+            Get-RadarCoverageCsvPath -MatchCsvPath $outputCsv
+        ) |
+            Where-Object {
+                $_.CoverageKey -eq $result.CoverageKey
+            }
+        $coverageResult.BlockingPolicies |
             Should -Match (
                 'Deny Reader \[/subscriptions/sub-1\] via ' +
                 'Direct role assignment'
@@ -2160,8 +2597,26 @@ Describe 'Invoke-Radar scoped baseline gap model' {
         $uat.Count | Should -Be 1
         $uat[0].BaselineScope | Should -Be '/subscriptions/sub-2'
         $uat[0].DenyCoverage | Should -Be 'None'
-        $uat[0].UnblockedScopes | Should -Be '/subscriptions/sub-2'
+        $uat[0].UnblockedScopeCount | Should -Be '1'
+        $coverageResult = Import-Csv -LiteralPath (
+            Get-RadarCoverageCsvPath -MatchCsvPath $outputCsv
+        ) |
+            Where-Object {
+                $_.CoverageKey -eq $uat[0].CoverageKey
+            }
+        $coverageResult.UnblockedScopes |
+            Should -Be '/subscriptions/sub-2'
         Test-Path -LiteralPath "$outputCsv.partial" |
             Should -BeFalse
+        Test-Path -LiteralPath "$(
+            Get-RadarCoverageCsvPath -MatchCsvPath $outputCsv
+        ).partial" | Should -BeFalse
+        Test-Path -LiteralPath "$outputCsv.partial.manifest.json" |
+            Should -BeFalse
+        @(
+            Get-ChildItem `
+                -LiteralPath $TestDrive `
+                -Filter 'scoped-gaps*.partial.generation-*'
+        ).Count | Should -Be 0
     }
 }

@@ -127,8 +127,11 @@ Large estates can take time: policy assignments and exemptions are queried at
 each relevant exact scope to prevent a parent result hiding a descendant gap.
 The evaluation phase prints percentage, elapsed time, and estimated remaining
 time every 5%. After each completed baseline context RADAR writes
-`<OutputCsv>.partial`; an interrupted run therefore retains completed contexts,
-and a successful run replaces it with the final CSV.
+`<OutputCsv>.partial` and `<name>-coverage.csv.partial`; an interrupted run
+therefore retains completed contexts, and a successful run replaces them with
+the final CSV pair. Each pair has an atomically published
+`<OutputCsv>.manifest.json` pointing to generation-specific files, so an
+interruption cannot leave match rows joined to a different coverage generation.
 
 ## Repository layout
 
@@ -288,7 +291,7 @@ a fully proven result in unrelated subscription A.
 
 ## Output
 
-The detailed CSV contains:
+The primary match CSV contains one compact row per restricted-action match:
 
 - `AnalysisMode`
 - `BaselineRoleName`, `BaselineRoleId`, `BaselineScope`
@@ -296,12 +299,21 @@ The detailed CSV contains:
 - `AssignmentPath`
 - `RoleName`, `RoleId`, `IsCustom`
 - `RestrictedAction`, `MatchedPattern`
+- `CoverageKey`
 - `IsAlreadyDenied`, `DenyCoverage`
 - `DeniedScopeCount`, `EvaluatedScopeCount`
+- counts for blocking policies, unblocked scopes, assignment paths, and warnings
+
+RADAR also writes `<name>-coverage.csv`, one row per `CoverageKey`, containing
+the potentially large detail fields:
+
 - `BlockingPolicies`
 - `DeniedScopes`, `UnblockedScopes`
 - `UnblockedAssignmentPaths`
 - `CoverageWarnings`
+
+Normalising coverage prevents the same scope and warning lists being repeated
+for every matched action while preserving a complete audit trail.
 
 The HTML report includes:
 
@@ -332,6 +344,8 @@ required.
   explicit baseline patterns are recommended for known customers.
 - Resource Graph is eventually consistent, so live ARM queries independently
   confirm descendant policy and exemption boundary scopes.
+- Effective policy-definition versions are resolved through Az.Resources 10
+  expansion or directly through ARM when an older Az.Resources module is used.
 - Conditional role-definition permissions are treated as potentially
   obtainable because request attributes are unknown.
 - Unsupported policy logic remains `Unknown`.

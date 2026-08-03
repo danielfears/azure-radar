@@ -3637,6 +3637,181 @@ function Test-RadarPolicyCondition {
     }
 }
 
+function Get-RadarPolicyTypePossibility {
+    param(
+        [object]$Condition,
+        [hashtable]$Parameters,
+        [string]$ResourceType
+    )
+
+    $Condition = ConvertFrom-RadarJsonObject -InputObject $Condition
+    if (Test-RadarHasProperty -InputObject $Condition -Name 'AllOf') {
+        $children = @(
+            foreach (
+                $child in @(
+                    Get-RadarPropertyValue `
+                        -InputObject $Condition `
+                        -Name 'AllOf'
+                )
+            ) {
+                Get-RadarPolicyTypePossibility `
+                    -Condition $child `
+                    -Parameters $Parameters `
+                    -ResourceType $ResourceType
+            }
+        )
+        return [pscustomobject]@{
+            CanBeTrue = @(
+                $children |
+                    Where-Object { -not $_.CanBeTrue }
+            ).Count -eq 0
+            CanBeFalse = @(
+                $children |
+                    Where-Object { $_.CanBeFalse }
+            ).Count -gt 0
+        }
+    }
+
+    if (Test-RadarHasProperty -InputObject $Condition -Name 'AnyOf') {
+        $children = @(
+            foreach (
+                $child in @(
+                    Get-RadarPropertyValue `
+                        -InputObject $Condition `
+                        -Name 'AnyOf'
+                )
+            ) {
+                Get-RadarPolicyTypePossibility `
+                    -Condition $child `
+                    -Parameters $Parameters `
+                    -ResourceType $ResourceType
+            }
+        )
+        return [pscustomobject]@{
+            CanBeTrue = @(
+                $children |
+                    Where-Object { $_.CanBeTrue }
+            ).Count -gt 0
+            CanBeFalse = @(
+                $children |
+                    Where-Object { -not $_.CanBeFalse }
+            ).Count -eq 0
+        }
+    }
+
+    if (Test-RadarHasProperty -InputObject $Condition -Name 'Not') {
+        $inner = Get-RadarPolicyTypePossibility `
+            -Condition (
+                Get-RadarPropertyValue `
+                    -InputObject $Condition `
+                    -Name 'Not'
+            ) `
+            -Parameters $Parameters `
+            -ResourceType $ResourceType
+        return [pscustomobject]@{
+            CanBeTrue = $inner.CanBeFalse
+            CanBeFalse = $inner.CanBeTrue
+        }
+    }
+
+    if (-not (Test-RadarHasProperty -InputObject $Condition -Name 'Field')) {
+        return [pscustomobject]@{
+            CanBeTrue = $true
+            CanBeFalse = $true
+        }
+    }
+    $field = [string](
+        Get-RadarPropertyValue -InputObject $Condition -Name 'Field'
+    )
+    if ($field -ine 'type') {
+        return [pscustomobject]@{
+            CanBeTrue = $true
+            CanBeFalse = $true
+        }
+    }
+
+    $operator = $null
+    $expected = $null
+    foreach (
+        $operatorName in @(
+            'Equals',
+            'NotEquals',
+            'In',
+            'NotIn',
+            'Like',
+            'NotLike',
+            'Contains',
+            'NotContains'
+        )
+    ) {
+        if (
+            Test-RadarHasProperty `
+                -InputObject $Condition `
+                -Name $operatorName
+        ) {
+            $operator = $operatorName
+            $expected = Get-RadarPropertyValue `
+                -InputObject $Condition `
+                -Name $operatorName
+            break
+        }
+    }
+    if (-not $operator) {
+        return [pscustomobject]@{
+            CanBeTrue = $true
+            CanBeFalse = $true
+        }
+    }
+
+    $resolution = Resolve-RadarPolicyValue `
+        -Value $expected `
+        -Parameters $Parameters
+    if (-not $resolution.IsResolved) {
+        return [pscustomobject]@{
+            CanBeTrue = $true
+            CanBeFalse = $true
+        }
+    }
+
+    try {
+        $matches = Compare-RadarPolicyValue `
+            -Actual $ResourceType `
+            -Expected $resolution.Value `
+            -Operator $operator
+        return [pscustomobject]@{
+            CanBeTrue = $matches
+            CanBeFalse = -not $matches
+        }
+    }
+    catch {
+        return [pscustomobject]@{
+            CanBeTrue = $true
+            CanBeFalse = $true
+        }
+    }
+}
+
+function Test-RadarPolicyTypeApplicability {
+    <#
+    Returns False only when the policy condition cannot be true for any
+    supported assignment resource type. Non-type conditions remain variables.
+    #>
+    param(
+        [object]$Condition,
+        [hashtable]$Parameters = @{},
+        [string[]]$ResourceTypes
+    )
+
+    foreach ($resourceType in $ResourceTypes) {
+        $possibility = Get-RadarPolicyTypePossibility `
+            -Condition $Condition `
+            -Parameters $Parameters `
+            -ResourceType $resourceType
+        if ($possibility.CanBeTrue) { return 'True' }
+    }
+    return 'False'
+}
+
 function Test-RadarPolicyRuleForRole {
     param(
         [object]$PolicyRule,
@@ -3761,7 +3936,39 @@ function Get-RadarPolicyDefinitionCached {
             if ($command.Parameters.ContainsKey('Expand')) {
                 $parameters.Expand = 'EffectiveDefinitionVersion'
             }
-            $PolicySetCache[$key] = Get-AzPolicySetDefinition @parameters
+            try {
+                $policySet = Get-AzPolicySetDefinition @parameters
+                $members = @(
+                    Get-RadarPolicyProperty `
+                        -InputObject $policySet `
+                        -Name 'PolicyDefinition' |
+                        Where-Object { $null -ne $_ }
+                )
+                if ($members.Count -eq 0) {
+                    throw 'The versioned policy set response contained no member definitions.'
+                }
+                $unresolvedMemberVersions = @(
+                    foreach ($member in $members) {
+                        $memberVersion =
+                            Get-RadarDefinitionVersion `
+                                -InputObject $member
+                        if ($memberVersion.Warning) {
+                            $member
+                        }
+                    }
+                )
+                if ($unresolvedMemberVersions.Count -gt 0) {
+                    throw 'The versioned policy set response did not resolve every member definition version.'
+                }
+                $PolicySetCache[$key] = $policySet
+            }
+            catch {
+                $PolicySetCache[$key] =
+                    Get-RadarPolicyDefinitionVersionViaRest `
+                        -Id $Id `
+                        -Version $Version `
+                        -PolicySet
+            }
         }
         return $PolicySetCache[$key]
     }
@@ -3778,9 +3985,88 @@ function Get-RadarPolicyDefinitionCached {
             }
             $parameters.Version = $Version
         }
-        $DefinitionCache[$key] = Get-AzPolicyDefinition @parameters
+        try {
+            $definition = Get-AzPolicyDefinition @parameters
+            $policyRule = Get-RadarPolicyProperty `
+                -InputObject $definition `
+                -Name 'PolicyRule'
+            if ($null -eq $policyRule) {
+                throw 'The versioned policy definition response contained no policy rule.'
+            }
+            $DefinitionCache[$key] = $definition
+        }
+        catch {
+            $DefinitionCache[$key] =
+                Get-RadarPolicyDefinitionVersionViaRest `
+                    -Id $Id `
+                    -Version $Version
+        }
     }
     return $DefinitionCache[$key]
+}
+
+function Get-RadarPolicyDefinitionVersionViaRest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+
+        [string]$Version,
+
+        [switch]$PolicySet
+    )
+
+    if (-not (Get-Command Invoke-AzRestMethod -ErrorAction SilentlyContinue)) {
+        throw 'Invoke-AzRestMethod is required to retrieve this policy definition version.'
+    }
+    $path = $Id.TrimEnd('/')
+    if ($Version) {
+        $path += "/versions/${Version}"
+    }
+    $path += '?api-version=2023-04-01'
+    if ($PolicySet) {
+        $path += '&$expand=EffectiveDefinitionVersion'
+    }
+    $raw = (
+        Invoke-AzRestMethod `
+            -Path $path `
+            -Method GET `
+            -ErrorAction Stop
+    ).Content | ConvertFrom-Json
+    $properties = $raw.properties
+
+    $converted = [pscustomobject]@{
+        Id = $Id
+        Name = $raw.name
+        DisplayName = $properties.displayName
+        Description = $properties.description
+        PolicyType = $properties.policyType
+        Mode = $properties.mode
+        Metadata = $properties.metadata
+        Parameter = $properties.parameters
+        PolicyRule = $properties.policyRule
+        PolicyDefinition = if ($PolicySet) {
+            @($properties.policyDefinitions)
+        }
+        else {
+            @()
+        }
+        Version = $Version
+    }
+    if ($PolicySet) {
+        $unresolved = @(
+            foreach ($member in @($converted.PolicyDefinition)) {
+                $memberVersion =
+                    Get-RadarDefinitionVersion -InputObject $member
+                if ($memberVersion.Warning) {
+                    $member
+                }
+            }
+        )
+        if ($unresolved.Count -gt 0) {
+            throw 'ARM did not return effective versions for every initiative member.'
+        }
+    }
+    return $converted
 }
 
 function Get-RadarDefinitionVersion {
@@ -3820,6 +4106,79 @@ function Get-RadarDefinitionVersion {
         Version = $null
         Warning = "Definition version '$requestedVersion' is a range, but Azure did not return its effective version."
     }
+}
+
+function Resolve-RadarPolicyAssignmentVersion {
+    <#
+    Populates EffectiveDefinitionVersion on assignment objects. Az.Resources
+    10 can expand this natively; older modules use the same ARM REST API.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Assignment
+    )
+
+    $version = Get-RadarDefinitionVersion -InputObject $Assignment
+    if (-not $version.Warning) { return $Assignment }
+
+    $assignmentId = [string](
+        Get-RadarPolicyProperty `
+            -InputObject $Assignment `
+            -Name 'Id'
+    )
+    if ([string]::IsNullOrWhiteSpace($assignmentId)) {
+        throw 'The policy assignment has no resource ID for version expansion.'
+    }
+
+    $assignmentCommand = Get-Command Get-AzPolicyAssignment
+    if ($assignmentCommand.Parameters.ContainsKey('Expand')) {
+        try {
+            $expandedAssignment = Get-AzPolicyAssignment `
+                -Id $assignmentId `
+                -Expand 'EffectiveDefinitionVersion' `
+                -ErrorAction Stop `
+                -WarningAction SilentlyContinue
+            $expandedVersion =
+                Get-RadarDefinitionVersion `
+                    -InputObject $expandedAssignment
+            if (-not $expandedVersion.Warning) {
+                return $expandedAssignment
+            }
+        }
+        catch {
+            # Fall through to the direct ARM request below.
+        }
+    }
+
+    if (-not (Get-Command Invoke-AzRestMethod -ErrorAction SilentlyContinue)) {
+        throw 'Neither Get-AzPolicyAssignment -Expand nor Invoke-AzRestMethod is available.'
+    }
+
+    $path = (
+        $assignmentId +
+        '?api-version=2025-03-01&$expand=EffectiveDefinitionVersion'
+    )
+    $response = Invoke-AzRestMethod `
+        -Path $path `
+        -Method GET `
+        -ErrorAction Stop
+    $expanded = $response.Content | ConvertFrom-Json
+    $effectiveVersion = [string](
+        Get-RadarPropertyValue `
+            -InputObject $expanded.properties `
+            -Name 'EffectiveDefinitionVersion'
+    )
+    if ([string]::IsNullOrWhiteSpace($effectiveVersion)) {
+        throw 'Azure did not return effectiveDefinitionVersion.'
+    }
+
+    $Assignment |
+        Add-Member `
+            -MemberType NoteProperty `
+            -Name 'EffectiveDefinitionVersion' `
+            -Value $effectiveVersion `
+            -Force
+    return $Assignment
 }
 
 function Resolve-RadarPolicyAssignment {
@@ -4004,11 +4363,27 @@ function Resolve-RadarPolicyAssignment {
             $null
         }
 
+        $typeApplicability = Test-RadarPolicyTypeApplicability `
+            -Condition (
+                Get-RadarPropertyValue `
+                    -InputObject $policyRule `
+                    -Name 'If'
+            ) `
+            -Parameters $Parameters `
+            -ResourceTypes $assignmentResourceTypes
+        if ($typeApplicability -eq 'False') {
+            return
+        }
+
         $targetEvidence = [pscustomobject]@{
             Rule = $policyRule
             Parameters = $Parameters
         } | ConvertTo-Json -Depth 100 -Compress
         $classificationWarning = $null
+        if ($typeApplicability -eq 'Unknown') {
+            $classificationWarning =
+                'Policy resource-type targeting could not be resolved safely.'
+        }
         if (
             $targetEvidence -notmatch
             '(?i)Microsoft\.Authorization/(roleAssignments|roleAssignmentScheduleRequests|roleEligibilityScheduleRequests)(?:/|["''])'
@@ -4114,6 +4489,12 @@ function Resolve-RadarPolicyAssignment {
             )
             $memberVersion = Get-RadarDefinitionVersion `
                 -InputObject $member
+            if ($memberVersion.Warning) {
+                [void]$warnings.Add(
+                    "Initiative member '$memberDefinitionId' has no resolved effective definition version."
+                )
+                continue
+            }
             $versionWarning = @(
                 $assignedVersion.Warning,
                 $memberVersion.Warning
@@ -4250,28 +4631,16 @@ function Get-RadarPolicyInventory {
         $scopeRules = New-Object System.Collections.Generic.List[object]
         foreach ($assignment in $assignments) {
             $version = Get-RadarDefinitionVersion -InputObject $assignment
-            $assignmentId = [string](
-                Get-RadarPolicyProperty `
-                    -InputObject $assignment `
-                    -Name 'Id'
-            )
-            $assignmentCommand = Get-Command Get-AzPolicyAssignment
-            if (
-                $version.Warning -and
-                $assignmentId -and
-                $assignmentCommand.Parameters.ContainsKey('Expand')
-            ) {
+            if ($version.Warning) {
                 try {
-                    $assignment = Get-AzPolicyAssignment `
-                        -Id $assignmentId `
-                        -Expand 'EffectiveDefinitionVersion' `
-                        -ErrorAction Stop `
-                        -WarningAction SilentlyContinue
+                    $assignment =
+                        Resolve-RadarPolicyAssignmentVersion `
+                            -Assignment $assignment
                 }
                 catch {
                     [void]$uncertainScopes.Add($scopeKey)
                     [void]$warnings.Add(
-                        "Could not resolve the effective definition version for assignment '$assignmentId': $($_.Exception.Message)"
+                        "Could not resolve the effective definition version for an assignment at '$($scope.Id)': $($_.Exception.Message)"
                     )
                 }
             }
@@ -4796,6 +5165,376 @@ function Update-RadarAnalysisProgress {
     }
 }
 
+function Get-RadarCoverageCsvPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MatchCsvPath
+    )
+
+    $directory = Split-Path -Parent $MatchCsvPath
+    $fileName = (
+        [System.IO.Path]::GetFileNameWithoutExtension($MatchCsvPath) +
+        '-coverage.csv'
+    )
+    if ($directory) {
+        return Join-Path $directory $fileName
+    }
+    return $fileName
+}
+
+function Resolve-RadarFileSystemPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    return $ExecutionContext.SessionState.Path.
+        GetUnresolvedProviderPathFromPSPath($Path)
+}
+
+function Test-RadarOwnedGenerationPath {
+    param(
+        [string]$CandidatePath,
+        [string]$ReportPath
+    )
+
+    if (
+        [string]::IsNullOrWhiteSpace($CandidatePath) -or
+        [string]::IsNullOrWhiteSpace($ReportPath)
+    ) {
+        return $false
+    }
+    try {
+        $candidateFull =
+            Resolve-RadarFileSystemPath -Path $CandidatePath
+        $reportFull =
+            Resolve-RadarFileSystemPath -Path $ReportPath
+    }
+    catch {
+        return $false
+    }
+
+    $pathComparison = if (
+        [System.Environment]::OSVersion.Platform -eq
+        [System.PlatformID]::Win32NT
+    ) {
+        [System.StringComparison]::OrdinalIgnoreCase
+    }
+    else {
+        [System.StringComparison]::Ordinal
+    }
+    $sameDirectory = [string]::Equals(
+        [System.IO.Path]::GetDirectoryName($candidateFull),
+        [System.IO.Path]::GetDirectoryName($reportFull),
+        $pathComparison
+    )
+    $expectedPrefix = (
+        [System.IO.Path]::GetFileName($reportFull) +
+        '.generation-'
+    )
+    $ownedName = [System.IO.Path]::GetFileName(
+        $candidateFull
+    ).StartsWith(
+        $expectedPrefix,
+        [System.StringComparison]::Ordinal
+    )
+    return $sameDirectory -and $ownedName
+}
+
+function Get-RadarCoverageKey {
+    param(
+        [string]$AnalysisMode,
+        [string]$BaselineRoleId,
+        [string]$BaselineScope,
+        [string]$RoleId,
+        [string]$AssignmentPath,
+        [string[]]$AdditionalWarnings = @()
+    )
+
+    $identity = @(
+        $AnalysisMode,
+        $BaselineRoleId,
+        $BaselineScope,
+        $RoleId,
+        $AssignmentPath,
+        (@($AdditionalWarnings | Sort-Object -Unique) -join [char]30)
+    ) -join [char]31
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash(
+            [System.Text.Encoding]::UTF8.GetBytes($identity)
+        )
+    }
+    finally {
+        $sha.Dispose()
+    }
+    return 'CV-' + (
+        [System.BitConverter]::ToString($hash).
+            Replace('-', '').
+            Substring(0, 16)
+    )
+}
+
+function Export-RadarCsvReports {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [object[]]$Results,
+
+        [Parameter(Mandatory = $true)]
+        [string]$MatchCsvPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CoverageCsvPath
+    )
+
+    $generation = (
+        (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssfffZ') +
+        '-' +
+        [guid]::NewGuid().ToString('N').Substring(0, 8)
+    )
+    $matchGeneration = "$MatchCsvPath.generation-$generation"
+    $coverageGeneration =
+        "$CoverageCsvPath.generation-$generation"
+    $manifestPath = "$MatchCsvPath.manifest.json"
+    $suffix = ".tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+    $manifestTemp = "$manifestPath$suffix"
+    $matchTemp = "$MatchCsvPath$suffix"
+    $coverageTemp = "$CoverageCsvPath$suffix"
+    $published = $false
+    $previousGenerationPaths = @()
+    if (Test-Path -LiteralPath $manifestPath) {
+        try {
+            $previousManifest = (
+                Get-Content -LiteralPath $manifestPath -Raw
+            ) | ConvertFrom-Json
+            $previousGenerationPaths = @()
+            if (
+                Test-RadarOwnedGenerationPath `
+                    -CandidatePath $previousManifest.MatchCsv `
+                    -ReportPath $MatchCsvPath
+            ) {
+                $previousGenerationPaths +=
+                    [string]$previousManifest.MatchCsv
+            }
+            if (
+                Test-RadarOwnedGenerationPath `
+                    -CandidatePath $previousManifest.CoverageCsv `
+                    -ReportPath $CoverageCsvPath
+            ) {
+                $previousGenerationPaths +=
+                    [string]$previousManifest.CoverageCsv
+            }
+        }
+        catch {
+            $previousGenerationPaths = @()
+        }
+    }
+
+    try {
+        $matchRows = @(
+            $Results |
+            Select-Object `
+                AnalysisMode,
+                BaselineRoleName,
+                BaselineRoleId,
+                BaselineScope,
+                RestrictionSource,
+                AssignmentPath,
+                RoleName,
+                RoleId,
+                IsCustom,
+                RestrictedAction,
+                MatchedPattern,
+                CoverageKey,
+                IsAlreadyDenied,
+                DenyCoverage,
+                DeniedScopeCount,
+                EvaluatedScopeCount,
+                BlockingPolicyCount,
+                UnblockedScopeCount,
+                UnblockedAssignmentPathCount,
+                CoverageWarningCount
+        )
+        if ($matchRows.Count -gt 0) {
+            $matchRows |
+                Export-Csv `
+                -LiteralPath $matchGeneration `
+                -NoTypeInformation
+        }
+        else {
+            Set-Content `
+                -LiteralPath $matchGeneration `
+                -Encoding UTF8 `
+                -Value '"AnalysisMode","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictionSource","AssignmentPath","RoleName","RoleId","IsCustom","RestrictedAction","MatchedPattern","CoverageKey","IsAlreadyDenied","DenyCoverage","DeniedScopeCount","EvaluatedScopeCount","BlockingPolicyCount","UnblockedScopeCount","UnblockedAssignmentPathCount","CoverageWarningCount"'
+        }
+
+        $coverageRows = @(
+            $Results |
+                Group-Object CoverageKey |
+            ForEach-Object { $_.Group[0] } |
+            Sort-Object CoverageKey |
+            Select-Object `
+                CoverageKey,
+                AnalysisMode,
+                BaselineRoleName,
+                BaselineRoleId,
+                BaselineScope,
+                RoleName,
+                RoleId,
+                IsAlreadyDenied,
+                DenyCoverage,
+                DeniedScopeCount,
+                EvaluatedScopeCount,
+                BlockingPolicies,
+                DeniedScopes,
+                UnblockedScopes,
+                UnblockedAssignmentPaths,
+                CoverageWarnings
+        )
+        if ($coverageRows.Count -gt 0) {
+            $coverageRows |
+                Export-Csv `
+                -LiteralPath $coverageGeneration `
+                -NoTypeInformation
+        }
+        else {
+            Set-Content `
+                -LiteralPath $coverageGeneration `
+                -Encoding UTF8 `
+                -Value '"CoverageKey","AnalysisMode","BaselineRoleName","BaselineRoleId","BaselineScope","RoleName","RoleId","IsAlreadyDenied","DenyCoverage","DeniedScopeCount","EvaluatedScopeCount","BlockingPolicies","DeniedScopes","UnblockedScopes","UnblockedAssignmentPaths","CoverageWarnings"'
+        }
+
+        [pscustomobject]@{
+            Generation = $generation
+            MatchCsv = Resolve-RadarFileSystemPath `
+                -Path $matchGeneration
+            CoverageCsv =
+                Resolve-RadarFileSystemPath `
+                    -Path $coverageGeneration
+            PublishedAt = (
+                Get-Date
+            ).ToUniversalTime().ToString('o')
+        } |
+            ConvertTo-Json |
+            Set-Content `
+                -LiteralPath $manifestTemp `
+                -Encoding UTF8
+
+        # The manifest is the atomic publication point for a consistent pair.
+        Move-Item `
+            -LiteralPath $manifestTemp `
+            -Destination $manifestPath `
+            -Force
+        $published = $true
+
+        # Conventional filenames remain convenient after successful runs. If
+        # interrupted here, the manifest still points to a consistent pair.
+        Copy-Item `
+            -LiteralPath $coverageGeneration `
+            -Destination $coverageTemp `
+            -Force
+        Copy-Item `
+            -LiteralPath $matchGeneration `
+            -Destination $matchTemp `
+            -Force
+        Move-Item `
+            -LiteralPath $coverageTemp `
+            -Destination $CoverageCsvPath `
+            -Force
+        Move-Item `
+            -LiteralPath $matchTemp `
+            -Destination $MatchCsvPath `
+            -Force
+
+        foreach ($previousPath in $previousGenerationPaths) {
+            if (
+                $previousPath -and
+                $previousPath -notin @(
+                    $matchGeneration,
+                    $coverageGeneration
+                ) -and
+                (Test-Path -LiteralPath $previousPath)
+            ) {
+                Remove-Item -LiteralPath $previousPath -Force
+            }
+        }
+    }
+    finally {
+        foreach (
+            $tempPath in @(
+                $manifestTemp,
+                $matchTemp,
+                $coverageTemp
+            )
+        ) {
+            if (Test-Path -LiteralPath $tempPath) {
+                Remove-Item -LiteralPath $tempPath -Force
+            }
+        }
+        if (-not $published) {
+            foreach (
+                $generationPath in @(
+                    $matchGeneration,
+                    $coverageGeneration
+                )
+            ) {
+                if (Test-Path -LiteralPath $generationPath) {
+                    Remove-Item `
+                        -LiteralPath $generationPath `
+                        -Force
+                }
+            }
+        }
+    }
+}
+
+function Remove-RadarCsvReportSet {
+    param(
+        [string]$MatchCsvPath,
+        [string]$CoverageCsvPath
+    )
+
+    $manifestPath = "$MatchCsvPath.manifest.json"
+    $generationPaths = @()
+    if (Test-Path -LiteralPath $manifestPath) {
+        try {
+            $manifest = (
+                Get-Content -LiteralPath $manifestPath -Raw
+            ) | ConvertFrom-Json
+            if (
+                Test-RadarOwnedGenerationPath `
+                    -CandidatePath $manifest.MatchCsv `
+                    -ReportPath $MatchCsvPath
+            ) {
+                $generationPaths += [string]$manifest.MatchCsv
+            }
+            if (
+                Test-RadarOwnedGenerationPath `
+                    -CandidatePath $manifest.CoverageCsv `
+                    -ReportPath $CoverageCsvPath
+            ) {
+                $generationPaths += [string]$manifest.CoverageCsv
+            }
+        }
+        catch {
+            $generationPaths = @()
+        }
+    }
+    foreach (
+        $path in @(
+            $MatchCsvPath,
+            $CoverageCsvPath,
+            $manifestPath,
+            @($generationPaths)
+        )
+    ) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            Remove-Item -LiteralPath $path -Force
+        }
+    }
+}
+
 # --- Main ---------------------------------------------------------------
 
 Connect-RadarAzAccount
@@ -5209,6 +5948,8 @@ if (
         Out-Null
 }
 $partialOutputCsv = "$OutputCsv.partial"
+$coverageOutputCsv = Get-RadarCoverageCsvPath -MatchCsvPath $OutputCsv
+$partialCoverageCsv = "$coverageOutputCsv.partial"
 
 $getMatch = {
     param(
@@ -5258,7 +5999,7 @@ $getCoverage = {
     ) -join ','
     $key = "$ContextKey$([char]31)$roleKey$([char]31)$pathKey$([char]31)$ContextComplete"
     if (-not $coverageCache.ContainsKey($key)) {
-        $coverageCache[$key] = Get-RadarRoleDenyCoverage `
+        $coverage = Get-RadarRoleDenyCoverage `
             -Role $Role `
             -RoleScopes @(
                 $Availability.Scopes |
@@ -5273,6 +6014,7 @@ $getCoverage = {
             ) `
             -ScopeHierarchy $scopeHierarchy `
             -AssignmentPaths $AssignmentPaths
+        $coverageCache[$key] = $coverage
     }
     return $coverageCache[$key]
 }
@@ -5292,6 +6034,19 @@ $addResult = {
         [string[]]$AdditionalWarnings = @()
     )
 
+    $roleId = [string](
+        Get-RadarPropertyValue `
+            -InputObject $Role `
+            -Name 'Id'
+    )
+    $exportCoverageKey = Get-RadarCoverageKey `
+        -AnalysisMode $AnalysisMode `
+        -BaselineRoleId $BaselineRoleId `
+        -BaselineScope $BaselineScope `
+        -RoleId $roleId `
+        -AssignmentPath $AssignmentPath `
+        -AdditionalWarnings $AdditionalWarnings
+
     [void]$results.Add([pscustomobject]@{
         AnalysisMode = $AnalysisMode
         BaselineRoleName = $BaselineRoleName
@@ -5302,9 +6057,7 @@ $addResult = {
         RoleName = Get-RadarPropertyValue `
             -InputObject $Role `
             -Name 'Name'
-        RoleId = Get-RadarPropertyValue `
-            -InputObject $Role `
-            -Name 'Id'
+        RoleId = $roleId
         IsCustom = [bool](
             Get-RadarPropertyValue `
                 -InputObject $Role `
@@ -5312,10 +6065,23 @@ $addResult = {
         )
         RestrictedAction = $Action
         MatchedPattern = $Match.MatchedPattern
+        CoverageKey = $exportCoverageKey
         IsAlreadyDenied = $Coverage.IsAlreadyDenied
         DenyCoverage = $Coverage.Status
         DeniedScopeCount = $Coverage.DeniedScopeCount
         EvaluatedScopeCount = $Coverage.ScopeCount
+        BlockingPolicyCount = @($Coverage.BlockingPolicies).Count
+        UnblockedScopeCount = @($Coverage.UnblockedScopes).Count
+        UnblockedAssignmentPathCount =
+            @($Coverage.UnblockedAssignmentPaths).Count
+        CoverageWarningCount = @(
+            @($Coverage.UnknownReasons) +
+            @($AdditionalWarnings) |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                } |
+                Sort-Object -Unique
+        ).Count
         BlockingPolicies = $Coverage.BlockingPolicies -join '; '
         DeniedScopes = $Coverage.DeniedScopes -join '; '
         UnblockedScopes = $Coverage.UnblockedScopes -join '; '
@@ -5399,17 +6165,21 @@ foreach ($baselineContext in $baselineContextInventory.Contexts) {
     }
 
     if ($results.Count -gt 0) {
-        $results.ToArray() |
-            Sort-Object `
+        $checkpointResults = @(
+            $results.ToArray() |
+                Sort-Object `
                 AnalysisMode,
                 BaselineRoleName,
                 BaselineScope,
                 RoleName,
-                RestrictedAction |
-            Export-Csv `
-                -LiteralPath $partialOutputCsv `
-                -NoTypeInformation
-        Write-Host "  Partial checkpoint:   $partialOutputCsv"
+                RestrictedAction
+        )
+        Export-RadarCsvReports `
+            -Results $checkpointResults `
+            -MatchCsvPath $partialOutputCsv `
+            -CoverageCsvPath $partialCoverageCsv
+        Write-Host "  Partial checkpoints:  $partialOutputCsv"
+        Write-Host "                        $partialCoverageCsv"
     }
 }
 
@@ -5478,17 +6248,21 @@ if ($csvActions.Count -gt 0) {
     }
 
     if ($results.Count -gt 0) {
-        $results.ToArray() |
-            Sort-Object `
+        $checkpointResults = @(
+            $results.ToArray() |
+                Sort-Object `
                 AnalysisMode,
                 BaselineRoleName,
                 BaselineScope,
                 RoleName,
-                RestrictedAction |
-            Export-Csv `
-                -LiteralPath $partialOutputCsv `
-                -NoTypeInformation
-        Write-Host "  Partial checkpoint:   $partialOutputCsv"
+                RestrictedAction
+        )
+        Export-RadarCsvReports `
+            -Results $checkpointResults `
+            -MatchCsvPath $partialOutputCsv `
+            -CoverageCsvPath $partialCoverageCsv
+        Write-Host "  Partial checkpoints:  $partialOutputCsv"
+        Write-Host "                        $partialCoverageCsv"
     }
 }
 
@@ -5593,19 +6367,13 @@ if ($outputDir -and -not (Test-Path -LiteralPath $outputDir)) {
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
 }
 
-if ($sortedResults.Count -gt 0) {
-    $sortedResults |
-        Export-Csv -LiteralPath $OutputCsv -NoTypeInformation
-}
-else {
-    Set-Content `
-        -LiteralPath $OutputCsv `
-        -Encoding UTF8 `
-        -Value '"AnalysisMode","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictionSource","AssignmentPath","RoleName","RoleId","IsCustom","RestrictedAction","MatchedPattern","IsAlreadyDenied","DenyCoverage","DeniedScopeCount","EvaluatedScopeCount","BlockingPolicies","DeniedScopes","UnblockedScopes","UnblockedAssignmentPaths","CoverageWarnings"'
-}
-if (Test-Path -LiteralPath $partialOutputCsv) {
-    Remove-Item -LiteralPath $partialOutputCsv -Force
-}
+Export-RadarCsvReports `
+    -Results $sortedResults `
+    -MatchCsvPath $OutputCsv `
+    -CoverageCsvPath $coverageOutputCsv
+Remove-RadarCsvReportSet `
+    -MatchCsvPath $partialOutputCsv `
+    -CoverageCsvPath $partialCoverageCsv
 
 if ($OutputHtml) {
 
@@ -5711,6 +6479,7 @@ if ($policyInventory.IsEvaluated -or $deniedRoleSet.Count -gt 0) {
     }
 }
 Write-Host "  CSV report:           $OutputCsv"
+Write-Host "  Coverage detail:      $coverageOutputCsv"
 if ($OutputHtml) {
     Write-Host "  HTML report:          $OutputHtml"
 }
