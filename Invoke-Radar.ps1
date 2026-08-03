@@ -4564,6 +4564,73 @@ function Resolve-RadarPolicyAssignment {
     }
 }
 
+function Get-RadarPolicyAssignmentAtScope {
+    <#
+    Lists effective assignments at one scope with effective definition versions
+    expanded in the same request. This avoids one REST call per assignment on
+    Az.Resources versions whose cmdlet cannot expand list results.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Scope
+    )
+
+    if (Get-Command Invoke-AzRestMethod -ErrorAction SilentlyContinue) {
+        try {
+            $normalisedScope = $Scope.TrimEnd('/')
+            if ([string]::IsNullOrWhiteSpace($normalisedScope)) {
+                $normalisedScope = ''
+            }
+            $requestTarget = (
+                $normalisedScope +
+                '/providers/Microsoft.Authorization/policyAssignments' +
+                '?api-version=2025-03-01' +
+                '&$filter=atScope()' +
+                '&$expand=EffectiveDefinitionVersion'
+            )
+            $results = New-Object System.Collections.Generic.List[object]
+            while ($requestTarget) {
+                $invokeParameters = @{
+                    Method = 'GET'
+                    ErrorAction = 'Stop'
+                }
+                if ($requestTarget -match '^https?://') {
+                    $invokeParameters.Uri = $requestTarget
+                }
+                else {
+                    $invokeParameters.Path = $requestTarget
+                }
+                $content = (
+                    Invoke-AzRestMethod @invokeParameters
+                ).Content | ConvertFrom-Json
+                foreach ($assignment in @($content.value)) {
+                    [void]$results.Add($assignment)
+                }
+                $requestTarget = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $content `
+                        -Name 'NextLink'
+                )
+            }
+            return $results.ToArray()
+        }
+        catch {
+            Write-Verbose (
+                "Expanded REST policy assignment list failed at ${Scope}: " +
+                $_.Exception.Message +
+                '. Falling back to Get-AzPolicyAssignment.'
+            )
+        }
+    }
+
+    return @(
+        Get-AzPolicyAssignment `
+            -Scope $Scope `
+            -ErrorAction Stop `
+            -WarningAction SilentlyContinue
+    )
+}
+
 function Get-RadarPolicyInventory {
     param(
         [Parameter(Mandatory = $true)]
@@ -4608,16 +4675,36 @@ function Get-RadarPolicyInventory {
             [StringComparer]::OrdinalIgnoreCase
         )
 
+    $scopeIndex = 0
+    $nextProgress = 5
+    $scopeTotal = @($Scopes).Count
     foreach ($scope in $Scopes) {
+        $scopeIndex++
+        if ($scopeTotal -gt 0) {
+            $progressPercent = [math]::Floor(
+                ($scopeIndex / $scopeTotal) * 100
+            )
+            Write-Progress `
+                -Activity 'RADAR policy and exemption discovery' `
+                -Status "$progressPercent% - $($scope.Id)" `
+                -PercentComplete $progressPercent
+            if ($progressPercent -ge $nextProgress) {
+                Write-Host (
+                    '  Policy discovery progress: {0}% ({1}/{2} scopes)' -f
+                    $progressPercent,
+                    $scopeIndex,
+                    $scopeTotal
+                )
+                while ($nextProgress -le $progressPercent) {
+                    $nextProgress += 5
+                }
+            }
+        }
         $scopeKey = $scope.Id.TrimEnd('/').ToLowerInvariant()
         try {
-            $assignmentParameters = @{
-                Scope = $scope.Id
-                ErrorAction = 'Stop'
-                WarningAction = 'SilentlyContinue'
-            }
             $assignments = @(
-                Get-AzPolicyAssignment @assignmentParameters
+                Get-RadarPolicyAssignmentAtScope `
+                    -Scope $scope.Id
             )
         }
         catch {
@@ -4732,6 +4819,9 @@ function Get-RadarPolicyInventory {
             )
         }
     }
+    Write-Progress `
+        -Activity 'RADAR policy and exemption discovery' `
+        -Completed
 
     $uniqueRuleKeys = New-Object System.Collections.Generic.HashSet[string] (
         [StringComparer]::OrdinalIgnoreCase

@@ -219,6 +219,9 @@ Describe 'Get-RadarBaselineRole' {
             }
         }
     }
+    Mock Get-AzPolicyAssignment {
+        throw 'Fallback must not run for a valid final REST page.'
+    }
 
     It 'auto-selects every substantial Owner, Contributor, and Baseline role' {
         $roles = @(
@@ -932,6 +935,7 @@ Describe 'Get-RadarPolicyBoundaryScope' {
 
     It 'keeps exact-scope exemption evaluation separate from boundary discovery' {
         Mock Get-AzPolicyAssignment { @() }
+        Mock Get-RadarPolicyAssignmentAtScope { @() }
         Mock Get-AzPolicyExemption { @() }
 
         $null = Get-RadarPolicyInventory -Scopes @(
@@ -1224,6 +1228,46 @@ Describe 'Resolve-RadarPolicyAssignmentVersion' {
 
         $expanded.EffectiveDefinitionVersion |
             Should -Be '1.2.3'
+    }
+}
+
+Describe 'Get-RadarPolicyAssignmentAtScope' {
+    It 'lists assignments with effective versions expanded in one request' {
+        Set-StrictMode -Version Latest
+        Mock Invoke-AzRestMethod {
+            [pscustomobject]@{
+                Content = @'
+{
+  "value": [
+    {
+      "id": "/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/versioned",
+      "properties": {
+        "definitionVersion": "1.*.*",
+        "effectiveDefinitionVersion": "1.2.3"
+      }
+    }
+  ]
+}
+'@
+            }
+        }
+        Mock Get-AzPolicyAssignment {
+            throw 'Fallback must not run for a valid final REST page.'
+        }
+
+        $assignments = @(
+            Get-RadarPolicyAssignmentAtScope `
+                -Scope '/subscriptions/sub-1'
+        )
+
+        $assignments.Count | Should -Be 1
+        $assignments[0].properties.effectiveDefinitionVersion |
+            Should -Be '1.2.3'
+        Should -Invoke Invoke-AzRestMethod -Times 1 -ParameterFilter {
+            $Path -match '\$filter=atScope\(\)' -and
+            $Path -match '\$expand=EffectiveDefinitionVersion'
+        }
+        Should -Invoke Get-AzPolicyAssignment -Times 0
     }
 }
 
@@ -2289,6 +2333,7 @@ Describe 'Invoke-Radar end-to-end empty result' {
             }
         }
         Mock Get-AzPolicyExemption { @() }
+        Mock Get-AzPolicyAssignment { @() }
     }
 
     It 'writes valid empty CSV and HTML reports without a binding error' {
@@ -2331,7 +2376,7 @@ Describe 'Invoke-Radar end-to-end empty result' {
                 'Microsoft.Resources/subscriptions/read'
             )
 
-        Mock Get-AzPolicyAssignment {
+        Mock Get-RadarPolicyAssignmentAtScope {
             @(
                 [pscustomobject]@{
                     Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/deny-reader'
@@ -2446,6 +2491,7 @@ Describe 'Invoke-Radar scoped baseline gap model' {
         Mock Get-AzAccessToken {
             [pscustomobject]@{ Token = 'test' }
         }
+        Mock Get-AzPolicyAssignment { @() }
         Mock Get-AzRoleDefinition {
             @(
                 [pscustomobject]@{
@@ -2510,7 +2556,7 @@ Describe 'Invoke-Radar scoped baseline gap model' {
                 SkipToken = $null
             }
         }
-        Mock Get-AzPolicyAssignment {
+        Mock Get-RadarPolicyAssignmentAtScope {
             if ($Scope -ieq '/subscriptions/sub-1') {
                 return @(
                     [pscustomobject]@{
