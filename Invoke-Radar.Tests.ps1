@@ -1279,6 +1279,103 @@ Describe 'Test-RadarPolicyRuleForRole' {
                 -Role $ownerRole
         ).State | Should -Be 'Unknown'
     }
+
+    It 'rules out a value expression for an unrelated resource alias' {
+        $rule = @{
+                if = @{
+                    value =
+                        "[string(field('Microsoft.Consumption/budgets/notifications'))]"
+                    contains = '.com'
+                }
+                then = @{ effect = 'deny' }
+        }
+
+        (
+                Test-RadarPolicyRuleForRole `
+                    -PolicyRule $rule `
+                    -Role $ownerRole
+        ).State | Should -Be 'NotBlocked'
+    }
+
+    It 'treats an alias for another assignment path as absent' {
+        $rule = @{
+                if = @{
+                    field =
+                        'Microsoft.Authorization/roleAssignmentScheduleRequests/principalType'
+                    equals = 'ServicePrincipal'
+                }
+                then = @{ effect = 'deny' }
+        }
+
+        (
+                Test-RadarPolicyRuleForRole `
+                    -PolicyRule $rule `
+                    -Role $ownerRole `
+                    -AssignmentResourceType (
+                        'Microsoft.Authorization/roleAssignments'
+                    )
+        ).State | Should -Be 'NotBlocked'
+    }
+
+    It 'evaluates the assignment scope alias when scope is known' {
+        $rule = @{
+                if = @{
+                    field =
+                        'Microsoft.Authorization/roleAssignments/scope'
+                    equals = '/subscriptions/sub-1'
+                }
+                then = @{ effect = 'deny' }
+        }
+
+        (
+                Test-RadarPolicyRuleForRole `
+                    -PolicyRule $rule `
+                    -Role $ownerRole `
+                    -AssignmentScope '/subscriptions/sub-1'
+        ).State | Should -Be 'Blocked'
+    }
+
+    It 'rules out unrelated name and alias branches' {
+        $rule = @{
+            if = @{
+                allOf = @(
+                    @{
+                        field = 'id'
+                        contains = '/privateDnsZones/example/'
+                    },
+                    @{
+                        anyOf = @(
+                            @{
+                                field = 'type'
+                                equals =
+                                    'Microsoft.Network/privateDnsZones/A'
+                            },
+                            @{
+                                allOf = @(
+                                    @{
+                                        field = 'name'
+                                        equals = 'gitlab.tooling'
+                                    },
+                                    @{
+                                        field =
+                                            'Microsoft.Network/privateDnsZones/A/aRecords[*].ipv4Address'
+                                        notEquals = '10.0.0.1'
+                                    }
+                                )
+                            }
+                        )
+                    }
+                )
+            }
+            then = @{ effect = 'deny' }
+        }
+
+        (
+            Test-RadarPolicyRuleForRole `
+                -PolicyRule $rule `
+                -Role $ownerRole
+        ).State | Should -Be 'NotBlocked'
+    }
 }
 
 Describe 'Test-RadarPolicyTypeApplicability' {
@@ -1769,6 +1866,23 @@ Describe 'Resolve-RadarPolicyAssignment' {
                     }
                 }
             }
+            if ($Id -like '*/unrelated-value-target') {
+                return [pscustomobject]@{
+                    Id = $Id
+                    Name = 'unrelated-value-target'
+                    DisplayName = 'Budget notification deny'
+                    Mode = 'All'
+                    Parameter = [pscustomobject]@{}
+                    PolicyRule = @{
+                        if = @{
+                            value =
+                                "[string(field('Microsoft.Consumption/budgets/notifications'))]"
+                            contains = '.com'
+                        }
+                        then = @{ effect = 'Deny' }
+                    }
+                }
+            }
             [pscustomobject]@{
                 Id = $Id
                 Name = 'deny-roles'
@@ -1933,6 +2047,26 @@ Describe 'Resolve-RadarPolicyAssignment' {
                 -PolicyRule $resolved.Rules[0].PolicyRule `
                 -Role $ownerRole
         ).State | Should -Be 'Blocked'
+    }
+
+    It 'drops policies whose value aliases are unrelated to assignments' {
+        $assignment = [pscustomobject]@{
+            Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/unrelated-value-target'
+            Name = 'unrelated-value-target'
+            Scope = '/subscriptions/sub-1'
+            PolicyDefinitionId =
+                '/providers/Microsoft.Authorization/policyDefinitions/unrelated-value-target'
+            Parameter = [pscustomobject]@{}
+            NotScope = @()
+        }
+
+        $resolved = Resolve-RadarPolicyAssignment `
+            -Assignment $assignment `
+            -DefinitionCache @{} `
+            -PolicySetCache @{}
+
+        $resolved.Rules | Should -BeNullOrEmpty
+        $resolved.Warnings | Should -BeNullOrEmpty
     }
 
     It 'ignores Indexed policies that cannot evaluate role assignments' {

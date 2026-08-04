@@ -3648,13 +3648,99 @@ function Compare-RadarPolicyValue {
     }
 }
 
+function Resolve-RadarPolicyAliasValue {
+    param(
+        [string]$Field,
+        [object]$Role,
+        [string]$AssignmentResourceType,
+        [string]$AssignmentScope,
+        [switch]$StringValue
+    )
+
+    $supportedResourceTypes = @(
+        'Microsoft.Authorization/roleAssignments',
+        'Microsoft.Authorization/roleAssignmentScheduleRequests',
+        'Microsoft.Authorization/roleEligibilityScheduleRequests'
+    )
+    $aliasResourceType = @(
+        $supportedResourceTypes |
+            Where-Object {
+                $Field.StartsWith(
+                    "$_/",
+                    [System.StringComparison]::OrdinalIgnoreCase
+                )
+            }
+    ) | Select-Object -First 1
+
+    if (-not $aliasResourceType) {
+        if ($Field -match '^[^/]+/[^/]+/') {
+            return [pscustomobject]@{
+                IsResolved = $true
+                Value = if ($StringValue) { '' } else { $null }
+                IsRoleDefinitionId = $false
+                Reason = $null
+            }
+        }
+        return [pscustomobject]@{
+            IsResolved = $false
+            Value = $null
+            IsRoleDefinitionId = $false
+            Reason = "Unsupported policy field '$Field'."
+        }
+    }
+
+    if (
+        -not [string]::Equals(
+            $aliasResourceType,
+            $AssignmentResourceType,
+            [System.StringComparison]::OrdinalIgnoreCase
+        )
+    ) {
+        return [pscustomobject]@{
+            IsResolved = $true
+            Value = if ($StringValue) { '' } else { $null }
+            IsRoleDefinitionId = $false
+            Reason = $null
+        }
+    }
+
+    $propertyName = $Field.Substring($aliasResourceType.Length + 1)
+    if ($propertyName -ieq 'roleDefinitionId') {
+        return [pscustomobject]@{
+            IsResolved = $true
+            Value = Get-RadarPropertyValue -InputObject $Role -Name 'Id'
+            IsRoleDefinitionId = $true
+            Reason = $null
+        }
+    }
+    if (
+        $propertyName -ieq 'scope' -and
+        -not [string]::IsNullOrWhiteSpace($AssignmentScope)
+    ) {
+        return [pscustomobject]@{
+            IsResolved = $true
+            Value = $AssignmentScope
+            IsRoleDefinitionId = $false
+            Reason = $null
+        }
+    }
+
+    return [pscustomobject]@{
+        IsResolved = $false
+        Value = $null
+        IsRoleDefinitionId = $false
+        Reason = "Policy field '$Field' depends on assignment request data that RADAR does not know."
+    }
+}
+
 function Test-RadarPolicyCondition {
     param(
         [object]$Condition,
         [object]$Role,
         [hashtable]$Parameters = @{},
         [string]$AssignmentResourceType =
-            'Microsoft.Authorization/roleAssignments'
+            'Microsoft.Authorization/roleAssignments',
+        [string]$AssignmentScope
     )
 
     $Condition = ConvertFrom-RadarJsonObject -InputObject $Condition
@@ -3671,7 +3757,8 @@ function Test-RadarPolicyCondition {
                 -Condition $child `
                 -Role $Role `
                 -Parameters $Parameters `
-                -AssignmentResourceType $AssignmentResourceType
+                -AssignmentResourceType $AssignmentResourceType `
+                -AssignmentScope $AssignmentScope
             if ($result.State -eq 'False') { return $result }
             if ($result.State -eq 'Unknown') {
                 $sawUnknown = $true
@@ -3698,7 +3785,8 @@ function Test-RadarPolicyCondition {
                 -Condition $child `
                 -Role $Role `
                 -Parameters $Parameters `
-                -AssignmentResourceType $AssignmentResourceType
+                -AssignmentResourceType $AssignmentResourceType `
+                -AssignmentScope $AssignmentScope
             if ($result.State -eq 'True') { return $result }
             if ($result.State -eq 'Unknown') {
                 $sawUnknown = $true
@@ -3720,7 +3808,8 @@ function Test-RadarPolicyCondition {
             ) `
             -Role $Role `
             -Parameters $Parameters `
-            -AssignmentResourceType $AssignmentResourceType
+            -AssignmentResourceType $AssignmentResourceType `
+            -AssignmentScope $AssignmentScope
         if ($innerResult.State -eq 'Unknown') { return $innerResult }
         return New-RadarPolicyEvaluation `
             -State $(if ($innerResult.State -eq 'True') { 'False' } else { 'True' })
@@ -3734,28 +3823,34 @@ function Test-RadarPolicyCondition {
         if ($field -ieq 'type') {
             $actual = $AssignmentResourceType
         }
-        elseif ($field -match '(?i)/roleDefinitionId$') {
-            $aliasResourceType = $field -replace (
-                '(?i)/roleDefinitionId$'
-            ), ''
-            if (
-                -not [string]::Equals(
-                    $aliasResourceType,
-                    $AssignmentResourceType,
-                    [System.StringComparison]::OrdinalIgnoreCase
-                )
-            ) {
-                return New-RadarPolicyEvaluation `
-                    -State 'False' `
-                    -Reason "Alias '$field' does not apply to assignment resource type '$AssignmentResourceType'."
-            }
-            $actual = Get-RadarPropertyValue -InputObject $Role -Name 'Id'
-            $isRoleDefinitionField = $true
+        elseif ($field -ieq 'name' -or $field -ieq 'fullName') {
+            $actual = '00000000-0000-0000-0000-000000000000'
+        }
+        elseif (
+            $field -ieq 'id' -and
+            -not [string]::IsNullOrWhiteSpace($AssignmentScope)
+        ) {
+            $actual = (
+                $AssignmentScope.TrimEnd('/') +
+                '/providers/' +
+                $AssignmentResourceType +
+                '/00000000-0000-0000-0000-000000000000'
+            )
         }
         else {
-            return New-RadarPolicyEvaluation `
-                -State 'Unknown' `
-                -Reason "Unsupported policy field '$field'."
+            $aliasValue = Resolve-RadarPolicyAliasValue `
+                -Field $field `
+                -Role $Role `
+                -AssignmentResourceType $AssignmentResourceType `
+                -AssignmentScope $AssignmentScope
+            if (-not $aliasValue.IsResolved) {
+                return New-RadarPolicyEvaluation `
+                    -State 'Unknown' `
+                    -Reason $aliasValue.Reason
+            }
+            $actual = $aliasValue.Value
+            $isRoleDefinitionField =
+                $aliasValue.IsRoleDefinitionId
         }
     }
     elseif (Test-RadarHasProperty -InputObject $Condition -Name 'Value') {
@@ -3797,15 +3892,49 @@ function Test-RadarPolicyCondition {
             $isRoleDefinitionField = $true
         }
         else {
-            $leftResolution = Resolve-RadarPolicyValue `
-                -Value $valueExpression `
-                -Parameters $Parameters
-            if (-not $leftResolution.IsResolved) {
-                return New-RadarPolicyEvaluation `
-                    -State 'Unknown' `
-                    -Reason $leftResolution.Reason
+            $stringFieldMatch = [regex]::Match(
+                [string]$valueExpression,
+                "^\[\s*string\(\s*field\(\s*['`"](?<field>[^'`"]+)['`"]\s*\)\s*\)\s*\]$",
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+            $fieldValueMatch = [regex]::Match(
+                [string]$valueExpression,
+                "^\[\s*field\(\s*['`"](?<field>[^'`"]+)['`"]\s*\)\s*\]$",
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+            )
+            if ($stringFieldMatch.Success -or $fieldValueMatch.Success) {
+                $matchedField = if ($stringFieldMatch.Success) {
+                    $stringFieldMatch.Groups['field'].Value
+                }
+                else {
+                    $fieldValueMatch.Groups['field'].Value
+                }
+                $aliasValue = Resolve-RadarPolicyAliasValue `
+                    -Field $matchedField `
+                    -Role $Role `
+                    -AssignmentResourceType $AssignmentResourceType `
+                    -AssignmentScope $AssignmentScope `
+                    -StringValue:$stringFieldMatch.Success
+                if (-not $aliasValue.IsResolved) {
+                    return New-RadarPolicyEvaluation `
+                        -State 'Unknown' `
+                        -Reason $aliasValue.Reason
+                }
+                $actual = $aliasValue.Value
+                $isRoleDefinitionField =
+                    $aliasValue.IsRoleDefinitionId
             }
-            $actual = $leftResolution.Value
+            else {
+                $leftResolution = Resolve-RadarPolicyValue `
+                    -Value $valueExpression `
+                    -Parameters $Parameters
+                if (-not $leftResolution.IsResolved) {
+                    return New-RadarPolicyEvaluation `
+                        -State 'Unknown' `
+                        -Reason $leftResolution.Reason
+                }
+                $actual = $leftResolution.Value
+            }
         }
     }
     else {
@@ -4053,7 +4182,8 @@ function Test-RadarPolicyRuleForRole {
         [object]$Role,
         [hashtable]$Parameters = @{},
         [string]$AssignmentResourceType =
-            'Microsoft.Authorization/roleAssignments'
+            'Microsoft.Authorization/roleAssignments',
+        [string]$AssignmentScope
     )
 
     $PolicyRule = ConvertFrom-RadarJsonObject -InputObject $PolicyRule
@@ -4092,7 +4222,8 @@ function Test-RadarPolicyRuleForRole {
         ) `
         -Role $Role `
         -Parameters $Parameters `
-        -AssignmentResourceType $AssignmentResourceType
+        -AssignmentResourceType $AssignmentResourceType `
+        -AssignmentScope $AssignmentScope
     switch ($conditionResult.State) {
         'True' {
             return [pscustomobject]@{
@@ -4890,6 +5021,11 @@ function Resolve-RadarPolicyAssignment {
             Rule = $policyRule
             Parameters = $Parameters
         } | ConvertTo-Json -Depth 100 -Compress
+        $scopeSensitive = $targetEvidence -match (
+            '(?i)Microsoft\.Authorization/' +
+            '(roleAssignments|roleAssignmentScheduleRequests|' +
+            'roleEligibilityScheduleRequests)/scope'
+        )
         $classificationWarning = $null
         if ($typeApplicability -eq 'Unknown') {
             $classificationWarning =
@@ -4964,6 +5100,7 @@ function Resolve-RadarPolicyAssignment {
             ReferenceId = $ReferenceId
             PolicyRule = $policyRule
             Parameters = $Parameters
+            ScopeSensitive = $scopeSensitive
             UnsupportedReason = $unsupportedReasons -join ' '
         })
     }
@@ -5705,10 +5842,23 @@ function Get-RadarRoleDenyCoverage {
                     [string]$rule.ReferenceId,
                     [string]$rule.DefinitionName
                 ) -join [char]30
+                $scopeCacheKey = if (
+                    [bool](
+                        Get-RadarPropertyValue `
+                            -InputObject $rule `
+                            -Name 'ScopeSensitive'
+                    )
+                ) {
+                    $roleScope.ToLowerInvariant()
+                }
+                else {
+                    ''
+                }
                 $evaluationKey = @(
                     $roleKey,
                     $ruleKey,
-                    [string]$assignmentPath.ResourceType
+                    [string]$assignmentPath.ResourceType,
+                    $scopeCacheKey
                 ) -join [char]31
                 if (
                     -not $PolicyEvaluationCache.ContainsKey(
@@ -5722,7 +5872,8 @@ function Get-RadarRoleDenyCoverage {
                             -Parameters $rule.Parameters `
                             -AssignmentResourceType (
                                 $assignmentPath.ResourceType
-                            )
+                            ) `
+                            -AssignmentScope $roleScope
                 }
                 $evaluation =
                     $PolicyEvaluationCache[$evaluationKey]
