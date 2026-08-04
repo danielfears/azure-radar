@@ -1883,6 +1883,46 @@ Describe 'Resolve-RadarPolicyAssignment' {
                     }
                 }
             }
+            if ($Id -like '*/ambiguous-generic-target') {
+                return [pscustomobject]@{
+                    Id = $Id
+                    Name = 'ambiguous-generic-target'
+                    DisplayName = 'Allowed locations from provided scopes'
+                    Mode = 'All'
+                    Parameter = [pscustomobject]@{
+                        includedScopes = [pscustomobject]@{
+                            defaultValue = @()
+                        }
+                        allowedLocations = [pscustomobject]@{
+                            defaultValue = @()
+                        }
+                    }
+                    PolicyRule = @{
+                        if = @{
+                            allOf = @(
+                                @{
+                                    count = @{
+                                        name = 'scope'
+                                        value =
+                                            "[parameters('includedScopes')]"
+                                        where = @{
+                                            field = 'id'
+                                            like = "[current('scope')]"
+                                        }
+                                    }
+                                    greater = 0
+                                },
+                                @{
+                                    field = 'location'
+                                    notIn =
+                                        "[parameters('allowedLocations')]"
+                                }
+                            )
+                        }
+                        then = @{ effect = 'Deny' }
+                    }
+                }
+            }
             [pscustomobject]@{
                 Id = $Id
                 Name = 'deny-roles'
@@ -2057,6 +2097,33 @@ Describe 'Resolve-RadarPolicyAssignment' {
             PolicyDefinitionId =
                 '/providers/Microsoft.Authorization/policyDefinitions/unrelated-value-target'
             Parameter = [pscustomobject]@{}
+            NotScope = @()
+        }
+
+        $resolved = Resolve-RadarPolicyAssignment `
+            -Assignment $assignment `
+            -DefinitionCache @{} `
+            -PolicySetCache @{}
+
+        $resolved.Rules | Should -BeNullOrEmpty
+        $resolved.Warnings | Should -BeNullOrEmpty
+    }
+
+    It 'drops ambiguous generic policies that cannot prove a block' {
+        $assignment = [pscustomobject]@{
+            Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/ambiguous-generic-target'
+            Name = 'ambiguous-generic-target'
+            Scope = '/subscriptions/sub-1'
+            PolicyDefinitionId =
+                '/providers/Microsoft.Authorization/policyDefinitions/ambiguous-generic-target'
+            Parameter = [pscustomobject]@{
+                includedScopes = [pscustomobject]@{
+                    value = @('/subscriptions/sub-1')
+                }
+                allowedLocations = [pscustomobject]@{
+                    value = @('uksouth')
+                }
+            }
             NotScope = @()
         }
 

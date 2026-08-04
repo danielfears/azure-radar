@@ -5047,14 +5047,13 @@ function Resolve-RadarPolicyAssignment {
                         -AssignmentResourceType $assignmentResourceType
                 }
             )
-            if (
-                @(
-                    $probeResults |
-                        Where-Object {
-                            $_.State -ne 'NotBlocked'
-                        }
-                ).Count -eq 0
-            ) {
+            $blockedProbeCount = @(
+                $probeResults |
+                    Where-Object {
+                        $_.State -eq 'Blocked'
+                    }
+            ).Count
+            if ($blockedProbeCount -eq 0) {
                 return
             }
             if (

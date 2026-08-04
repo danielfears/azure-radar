@@ -349,6 +349,9 @@ required.
   confirm descendant policy and exemption boundary scopes.
 - Effective policy-definition versions are resolved through Az.Resources 10
   expansion or directly through ARM when an older Az.Resources module is used.
+- Policies without explicit or parameter-resolved assignment-resource evidence
+  are counted as blockers only when the conservative probe can prove they deny
+  a supported assignment path; inconclusive generic policies fail open.
 - Conditional role-definition permissions are treated as potentially
   obtainable because request attributes are unknown.
 - Unsupported policy logic remains `Unknown`.
