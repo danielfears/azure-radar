@@ -585,6 +585,31 @@ Describe 'Scoped baseline contexts' {
         $relationship.State | Should -Be 'Unknown'
     }
 
+    It 'proves separately mapped fallback roots are not nested' {
+        $firstRoot =
+            '/providers/Microsoft.Management/managementGroups/first'
+        $secondRoot =
+            '/providers/Microsoft.Management/managementGroups/second'
+        $hierarchy = [pscustomobject]@{
+            AncestorsByScope = @{
+                $firstRoot.ToLowerInvariant() = @()
+                $secondRoot.ToLowerInvariant() = @()
+                '/subscriptions/sub-2' = @($secondRoot)
+            }
+            UnresolvedAncestorRoots = @(
+                $firstRoot,
+                $secondRoot
+            )
+        }
+
+        $relationship = Test-RadarScopeDescendsFrom `
+            -Scope '/subscriptions/sub-2' `
+            -RootScope $firstRoot `
+            -Hierarchy $hierarchy
+
+        $relationship.State | Should -Be 'False'
+    }
+
     It 'builds descendants from an accessible customer root without tenant-root read' {
         Mock Get-AzManagementGroup {
             if ($GroupName -eq 'tenant-root') {
@@ -623,6 +648,48 @@ Describe 'Scoped baseline contexts' {
 
         $insideCustomer.State | Should -Be 'True'
         $aboveCustomer.State | Should -Be 'Unknown'
+    }
+
+    It 'fills an unplaced subscription ancestry from Resource Graph' {
+        Mock Get-AzManagementGroup {
+            if ($GroupName -eq 'tenant-root') {
+                throw 'tenant root forbidden'
+            }
+            [pscustomobject]@{
+                Id = '/providers/Microsoft.Management/managementGroups/customer-root'
+                Name = 'customer-root'
+                DisplayName = 'Customer root'
+                ParentId = '/providers/Microsoft.Management/managementGroups/tenant-root'
+                Children = @()
+            }
+        }
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                SubscriptionId = 'sub-unplaced'
+                ManagementGroupAncestorsChain = @(
+                    [pscustomobject]@{
+                        Name = 'tenant-root'
+                    }
+                )
+            }
+        }
+        $knownScopes = @(
+            (New-RadarScope `
+                -Id '/providers/Microsoft.Management/managementGroups/customer-root'),
+            (New-RadarScope -Id '/subscriptions/sub-unplaced')
+        )
+
+        $hierarchy = Get-RadarScopeHierarchy `
+            -KnownScopes $knownScopes `
+            -RequiredScopes $knownScopes
+
+        $hierarchy.IsComplete | Should -BeTrue
+        $hierarchy.AncestorsByScope[
+            '/subscriptions/sub-unplaced'
+        ] | Should -Contain (
+            '/providers/Microsoft.Management/managementGroups/tenant-root'
+        )
+        Should -Invoke Search-AzGraph -Times 1
     }
 
     It 'does not let an observed external role scope poison required hierarchy completeness' {
@@ -699,6 +766,32 @@ Describe 'Get-RadarScanScope' {
         )
         $result.Scopes.Id | Should -Contain '/subscriptions/sub-current'
         $result.Scopes.Id | Should -Not -Contain '/subscriptions/sub-disabled'
+    }
+
+    It 'omits the Tenant Root Group from automatic estate scopes' {
+        Mock Get-AzManagementGroup {
+            @(
+                [pscustomobject]@{
+                    Id = '/providers/Microsoft.Management/managementGroups/tenant-1'
+                    Name = 'tenant-1'
+                    DisplayName = 'Tenant Root Group'
+                },
+                [pscustomobject]@{
+                    Id = '/providers/Microsoft.Management/managementGroups/customer-root'
+                    Name = 'customer-root'
+                    DisplayName = 'Customer root'
+                }
+            )
+        }
+
+        $result = Get-RadarScanScope
+
+        $result.Scopes.Id | Should -Not -Contain (
+            '/providers/Microsoft.Management/managementGroups/tenant-1'
+        )
+        $result.Scopes.Id | Should -Contain (
+            '/providers/Microsoft.Management/managementGroups/customer-root'
+        )
     }
 
     It 'uses explicit scope IDs without estate discovery' {
@@ -970,6 +1063,46 @@ Describe 'Get-RadarPolicyBoundaryScope' {
             $IncludeDescendent -and
             $Scope -eq '/subscriptions/sub-1'
         }
+    }
+
+    It 'omits the Tenant Root Group as an estate boundary' {
+        Mock Get-AzContext {
+            [pscustomobject]@{
+                Tenant = [pscustomobject]@{ Id = 'tenant-1' }
+            }
+        }
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        Id = '/providers/Microsoft.Management/managementGroups/tenant-1/providers/Microsoft.Authorization/policyAssignments/root-deny'
+                        Type =
+                            'microsoft.authorization/policyassignments'
+                        Scope =
+                            '/providers/Microsoft.Management/managementGroups/tenant-1'
+                        NotScopes = @(
+                            '/subscriptions/sub-1/resourceGroups/excluded'
+                        )
+                    }
+                )
+                SkipToken = $null
+            }
+        }
+        Mock Get-AzPolicyAssignment { @() }
+        Mock Get-AzPolicyExemption { @() }
+
+        $result = Get-RadarPolicyBoundaryScope `
+            -Scopes @(
+                (New-RadarScope -Id '/subscriptions/sub-1')
+            ) `
+            -UseTenantDiscovery
+
+        $result.Scopes.Id | Should -Not -Contain (
+            '/providers/Microsoft.Management/managementGroups/tenant-1'
+        )
+        $result.Scopes.Id | Should -Contain (
+            '/subscriptions/sub-1/resourceGroups/excluded'
+        )
     }
 
     It 'keeps exact-scope exemption evaluation separate from boundary discovery' {

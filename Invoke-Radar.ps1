@@ -403,6 +403,11 @@ function Get-RadarScanScope {
         )
     }
     else {
+        $tenantId = [string](
+            Get-RadarPropertyValue `
+                -InputObject $context.Tenant `
+                -Name 'Id'
+        )
         try {
             foreach ($group in @(Get-AzManagementGroup -ErrorAction Stop)) {
                 $groupId = Get-RadarPropertyValue `
@@ -411,6 +416,23 @@ function Get-RadarScanScope {
                 $groupName = Get-RadarPropertyValue `
                     -InputObject $group `
                     -Name 'Name'
+                if (
+                    -not [string]::IsNullOrWhiteSpace($tenantId) -and
+                    (
+                        [string]::Equals(
+                            [string]$groupName,
+                            $tenantId,
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        ) -or
+                        [string]::Equals(
+                            ([string]$groupId).TrimEnd('/'),
+                            "/providers/Microsoft.Management/managementGroups/$tenantId",
+                            [System.StringComparison]::OrdinalIgnoreCase
+                        )
+                    )
+                ) {
+                    continue
+                }
                 if ([string]::IsNullOrWhiteSpace([string]$groupId)) {
                     $groupId =
                         "/providers/Microsoft.Management/managementGroups/$groupName"
@@ -435,9 +457,6 @@ function Get-RadarScanScope {
         }
 
         try {
-            $tenantId = Get-RadarPropertyValue `
-                -InputObject $context.Tenant `
-                -Name 'Id'
             foreach (
                 $subscription in @(
                     Get-AzSubscription -TenantId $tenantId -ErrorAction Stop
@@ -654,6 +673,151 @@ function Get-RadarScopeHierarchy {
         else {
             @($KnownScopes)
         }
+        $missingRequiredSubscriptions = @(
+            $requiredHierarchyScopes |
+                Where-Object {
+                    $scopeId = $_.Id.TrimEnd('/').ToLowerInvariant()
+                    $_.Type -eq 'Subscription' -and
+                    -not $ancestorsByScope.ContainsKey($scopeId)
+                }
+        )
+        if (
+            $missingRequiredSubscriptions.Count -gt 0 -and
+            (Get-Command Search-AzGraph -ErrorAction SilentlyContinue)
+        ) {
+            try {
+                $subscriptionIds = @(
+                    $missingRequiredSubscriptions |
+                        ForEach-Object { ($_.Id -split '/')[2] } |
+                        Sort-Object -Unique
+                )
+                $quotedSubscriptionIds = @(
+                    $subscriptionIds |
+                        ForEach-Object { "'$_'" }
+                ) -join ', '
+                $query = @"
+resourcecontainers
+| where type =~ 'microsoft.resources/subscriptions'
+| where subscriptionId in~ ($quotedSubscriptionIds)
+| project
+    subscriptionId,
+    managementGroupAncestorsChain =
+        properties.managementGroupAncestorsChain
+"@
+                $pageSize = 1000
+                $skip = 0
+                $skipToken = $null
+                do {
+                    $parameters = @{
+                        Query = $query
+                        First = $pageSize
+                        UseTenantScope = $true
+                        ErrorAction = 'Stop'
+                    }
+                    if ($skipToken) {
+                        $parameters.SkipToken = $skipToken
+                    }
+                    elseif ($skip -gt 0) {
+                        $parameters.Skip = $skip
+                    }
+                    $response = Search-AzGraph @parameters
+                    $wrapped = Test-RadarHasProperty `
+                        -InputObject $response `
+                        -Name 'Data'
+                    if ($wrapped) {
+                        $rows = @(
+                            Get-RadarPropertyValue `
+                                -InputObject $response `
+                                -Name 'Data' |
+                                Where-Object { $null -ne $_ }
+                        )
+                        $skipToken = [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $response `
+                                -Name 'SkipToken'
+                        )
+                    }
+                    else {
+                        $rows = @(
+                            $response |
+                                Where-Object { $null -ne $_ }
+                        )
+                        $skip += $rows.Count
+                        $skipToken = $null
+                    }
+
+                    foreach ($row in $rows) {
+                        $subscriptionId = [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $row `
+                                -Name 'SubscriptionId'
+                        )
+                        if (
+                            [string]::IsNullOrWhiteSpace(
+                                $subscriptionId
+                            )
+                        ) {
+                            continue
+                        }
+                        $chain = Get-RadarPropertyValue `
+                            -InputObject $row `
+                            -Name 'ManagementGroupAncestorsChain'
+                        if ($chain -is [string]) {
+                            $chain = $chain | ConvertFrom-Json
+                        }
+                        $ancestorIds = @(
+                            foreach ($ancestor in @($chain)) {
+                                $ancestorName = [string](
+                                    Get-RadarPropertyValue `
+                                        -InputObject $ancestor `
+                                        -Name 'Name'
+                                )
+                                if (
+                                    -not [string]::IsNullOrWhiteSpace(
+                                        $ancestorName
+                                    )
+                                ) {
+                                    "/providers/Microsoft.Management/managementGroups/$ancestorName"
+                                }
+                            }
+                        )
+                        $subscriptionScope =
+                            "/subscriptions/$subscriptionId"
+                        $subscriptionKey =
+                            $subscriptionScope.ToLowerInvariant()
+                        $ancestorsByScope[$subscriptionKey] =
+                            $ancestorIds
+                        if (-not $scopeById.ContainsKey($subscriptionKey)) {
+                            $knownSubscription = @(
+                                $missingRequiredSubscriptions |
+                                    Where-Object {
+                                        $_.Id -ieq $subscriptionScope
+                                    }
+                            ) | Select-Object -First 1
+                            $scopeById[$subscriptionKey] = if (
+                                $knownSubscription
+                            ) {
+                                $knownSubscription
+                            }
+                            else {
+                                New-RadarScope `
+                                    -Id $subscriptionScope `
+                                    -Name $subscriptionId
+                            }
+                        }
+                    }
+                } while (
+                    $skipToken -or
+                    (-not $wrapped -and $rows.Count -eq $pageSize)
+                )
+            }
+            catch {
+                [void]$hierarchyErrors.Add(
+                    "Subscription hierarchy discovery through Azure Resource Graph failed: $($_.Exception.Message)"
+                )
+            }
+        }
+
         $unresolvedHierarchyScopes = @(
             $requiredHierarchyScopes |
                 Where-Object {
@@ -794,6 +958,13 @@ function Test-RadarScopeDescendsFrom {
                 }
         ).Count -gt 0
         if (-not $isDescendant) {
+            $rootKey = $normalisedRoot.ToLowerInvariant()
+            if ($Hierarchy.AncestorsByScope.ContainsKey($rootKey)) {
+                return [pscustomobject]@{
+                    State = 'False'
+                    Reason = $null
+                }
+            }
             $scopeOrAncestors = @($scopeKey) + @(
                 $scopeAncestors |
                     ForEach-Object {
@@ -1349,12 +1520,33 @@ function Get-RadarPolicyBoundaryScope {
         New-Object System.Collections.Generic.HashSet[string] (
             [StringComparer]::OrdinalIgnoreCase
         )
+    $tenantRootScopeKey = $null
+    if ($UseTenantDiscovery) {
+        $context = Get-AzContext -ErrorAction Stop
+        $tenantId = [string](
+            Get-RadarPropertyValue `
+                -InputObject $context.Tenant `
+                -Name 'Id'
+        )
+        if (-not [string]::IsNullOrWhiteSpace($tenantId)) {
+            $tenantRootScopeKey = (
+                "/providers/Microsoft.Management/managementGroups/$tenantId"
+            ).ToLowerInvariant()
+        }
+    }
     $addBoundary = {
         param([string]$ScopeId)
         if ([string]::IsNullOrWhiteSpace($ScopeId)) { return }
         $normalised = $ScopeId.TrimEnd('/')
         if ([string]::IsNullOrWhiteSpace($normalised)) { return }
-        $scopeById[$normalised.ToLowerInvariant()] =
+        $scopeKey = $normalised.ToLowerInvariant()
+        if (
+            $tenantRootScopeKey -and
+            $scopeKey -eq $tenantRootScopeKey
+        ) {
+            return
+        }
+        $scopeById[$scopeKey] =
             New-RadarScope -Id $normalised
     }
     $addAssignmentBoundaries = {
@@ -6080,7 +6272,6 @@ Write-Host "Evaluating $($roles.Count) role(s)..."
 $baseDiscoveryComplete =
     $scopeDiscovery.IsComplete -and
     $scopeLimitComplete -and
-    $scopeHierarchy.IsComplete -and
     $roleInventory.IsComplete
 $matchCache = @{}
 $coverageCache = @{}
