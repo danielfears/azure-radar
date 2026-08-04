@@ -216,9 +216,26 @@ function Test-RadarAzSession {
     $context = Get-AzContext -ErrorAction SilentlyContinue
     if (-not $context -or -not $context.Account) { return $false }
     try {
-        $null = Get-AzAccessToken `
+        $accessToken = Get-AzAccessToken `
             -ErrorAction Stop `
             -WarningAction SilentlyContinue
+        $expiresOnProperty =
+            $accessToken.PSObject.Properties['ExpiresOn']
+        if ($expiresOnProperty -and $expiresOnProperty.Value) {
+            try {
+                $expiresOn =
+                    [DateTimeOffset]$expiresOnProperty.Value
+            }
+            catch {
+                return $false
+            }
+            if (
+                $expiresOn -le
+                [DateTimeOffset]::UtcNow.AddMinutes(2)
+            ) {
+                return $false
+            }
+        }
         return $true
     }
     catch {

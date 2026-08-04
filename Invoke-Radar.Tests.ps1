@@ -55,6 +55,22 @@ Describe 'Test-RadarAzSession' {
 
         Test-RadarAzSession | Should -BeFalse
     }
+
+    It 'rejects an expired token returned without an error' {
+        Mock Get-AzContext {
+            [pscustomobject]@{
+                Account = [pscustomobject]@{ Id = 'test@example.invalid' }
+            }
+        }
+        Mock Get-AzAccessToken {
+            [pscustomobject]@{
+                Token = 'test'
+                ExpiresOn = [DateTimeOffset]::UtcNow.AddMinutes(-5)
+            }
+        }
+
+        Test-RadarAzSession | Should -BeFalse
+    }
 }
 
 Describe 'Get-ActionMatch' {
