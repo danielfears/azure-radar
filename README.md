@@ -318,6 +318,10 @@ the potentially large detail fields:
 Normalising coverage prevents the same scope and warning lists being repeated
 for every matched action while preserving a complete audit trail.
 
+If every baseline/role pair is `Unknown` or `NotEvaluated`, RADAR emits a
+prominent report-health warning. The files remain available for diagnosis but
+must not be treated as an operational remediation report.
+
 The HTML report includes:
 
 - role, policy, exemption, scope, and baseline-context counts;
@@ -350,8 +354,8 @@ required.
 - Effective policy-definition versions are resolved through Az.Resources 10
   expansion or directly through ARM when an older Az.Resources module is used.
 - Policies without explicit or parameter-resolved assignment-resource evidence
-  are counted as blockers only when the conservative probe can prove they deny
-  a supported assignment path; inconclusive generic policies fail open.
+  are probed against every supported assignment path. Inconclusive probes remain
+  `Unknown` and can never establish `Full` coverage.
 - Conditional role-definition permissions are treated as potentially
   obtainable because request attributes are unknown.
 - Unsupported policy logic remains `Unknown`.

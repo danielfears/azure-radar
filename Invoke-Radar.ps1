@@ -5025,7 +5025,10 @@ function Resolve-RadarPolicyAssignment {
             '(?i)Microsoft\.Authorization/' +
             '(roleAssignments|roleAssignmentScheduleRequests|' +
             'roleEligibilityScheduleRequests)/scope'
-        )
+        ) -or $targetEvidence -match '(?i)"field"\s*:\s*"id"' -or
+            $targetEvidence -match (
+                "(?i)field\(\s*['`"]id['`"]\s*\)"
+            )
         $classificationWarning = $null
         if ($typeApplicability -eq 'Unknown') {
             $classificationWarning =
@@ -5047,13 +5050,13 @@ function Resolve-RadarPolicyAssignment {
                         -AssignmentResourceType $assignmentResourceType
                 }
             )
-            $blockedProbeCount = @(
+            $nonNotBlockedProbeCount = @(
                 $probeResults |
                     Where-Object {
-                        $_.State -eq 'Blocked'
+                        $_.State -ne 'NotBlocked'
                     }
             ).Count
-            if ($blockedProbeCount -eq 0) {
+            if ($nonNotBlockedProbeCount -eq 0) {
                 return
             }
             if (
@@ -5350,6 +5353,7 @@ function Get-RadarPolicyInventory {
             }
         }
         $scopeKey = $scope.Id.TrimEnd('/').ToLowerInvariant()
+        $assignmentKeysByScope[$scopeKey] = @()
         try {
             $assignments = @(
                 Get-RadarPolicyAssignmentAtScope `
@@ -6412,6 +6416,39 @@ function Remove-RadarCsvReportSet {
     }
 }
 
+function Get-RadarReportHealthWarning {
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Results
+    )
+
+    $targets = @(
+        $Results |
+            Group-Object {
+                "$($_.AnalysisMode)$([char]31)$($_.BaselineRoleId)$([char]31)$($_.BaselineScope)$([char]31)$($_.RoleId)"
+            } |
+            ForEach-Object { $_.Group[0] }
+    )
+    if ($targets.Count -eq 0) { return $null }
+
+    $uncertainCount = @(
+        $targets |
+            Where-Object {
+                $_.DenyCoverage -in @('Unknown', 'NotEvaluated')
+            }
+    ).Count
+    if ($uncertainCount -eq $targets.Count) {
+        return (
+            'Every baseline/role pair has uncertain policy coverage. ' +
+            'The files are structurally valid but the report is not ' +
+            'operationally actionable; review discovery and coverage ' +
+            'warnings before using it for remediation.'
+        )
+    }
+
+    return $null
+}
+
 # --- Main ---------------------------------------------------------------
 
 Connect-RadarAzAccount
@@ -7220,6 +7257,11 @@ if ($csvActions.Count -gt 0) {
                 Select-Object -ExpandProperty RoleId -Unique
         ).Count
     })
+}
+$reportHealthWarning = Get-RadarReportHealthWarning `
+    -Results $sortedResults
+if ($reportHealthWarning) {
+    [void]$runtimeWarnings.Add($reportHealthWarning)
 }
 $discoveryWarnings = @(
     @($scopeDiscovery.Warnings) +

@@ -1376,6 +1376,117 @@ Describe 'Test-RadarPolicyRuleForRole' {
                 -Role $ownerRole
         ).State | Should -Be 'NotBlocked'
     }
+
+    It 'keeps direct and PIM branches isolated in a customer-shaped deny rule' {
+        $rule = @{
+            if = @{
+                anyOf = @(
+                    @{
+                        allOf = @(
+                            @{
+                                field = 'type'
+                                equals =
+                                    'Microsoft.Authorization/roleAssignments'
+                            },
+                            @{
+                                field =
+                                    'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                                in = "[parameters('roleDefinitionIds')]"
+                            },
+                            @{
+                                not = @{
+                                    field =
+                                        'Microsoft.Authorization/roleAssignments/principalId'
+                                    in =
+                                        "[parameters('allowedPrincipalIds')]"
+                                }
+                            }
+                        )
+                    },
+                    @{
+                        anyOf = @(
+                            @{
+                                allOf = @(
+                                    @{
+                                        field = 'type'
+                                        equals =
+                                            'Microsoft.Authorization/roleAssignmentScheduleRequests'
+                                    },
+                                    @{
+                                        field =
+                                            'Microsoft.Authorization/roleAssignmentScheduleRequests/roleDefinitionId'
+                                        in =
+                                            "[parameters('roleDefinitionIds')]"
+                                    },
+                                    @{
+                                        not = @{
+                                            field =
+                                                'Microsoft.Authorization/roleAssignmentScheduleRequests/principalId'
+                                            in =
+                                                "[parameters('allowedPrincipalIds')]"
+                                        }
+                                    }
+                                )
+                            },
+                            @{
+                                allOf = @(
+                                    @{
+                                        field =
+                                            'Microsoft.Authorization/roleAssignmentScheduleRequests/principalType'
+                                        equals = 'ServicePrincipal'
+                                    },
+                                    @{
+                                        value =
+                                            "[last(split(field('Microsoft.Authorization/roleAssignmentScheduleRequests/roleDefinitionId'),'/'))]"
+                                        in =
+                                            "[parameters('roleDefinitionIds')]"
+                                    }
+                                )
+                            }
+                        )
+                    }
+                )
+            }
+            then = @{ effect = 'deny' }
+        }
+        $parameters = @{
+            roleDefinitionIds = @(
+                Get-RadarRoleDefinitionGuid -RoleOrId $ownerRole
+            )
+            allowedPrincipalIds = @()
+        }
+
+        foreach ($resourceType in @(
+            'Microsoft.Authorization/roleAssignments',
+            'Microsoft.Authorization/roleAssignmentScheduleRequests'
+        )) {
+            (
+                Test-RadarPolicyRuleForRole `
+                    -PolicyRule $rule `
+                    -Role $readerRole `
+                    -Parameters $parameters `
+                    -AssignmentResourceType $resourceType
+            ).State | Should -Be 'NotBlocked'
+        }
+        (
+            Test-RadarPolicyRuleForRole `
+                -PolicyRule $rule `
+                -Role $ownerRole `
+                -Parameters $parameters `
+                -AssignmentResourceType (
+                    'Microsoft.Authorization/roleAssignments'
+                )
+        ).State | Should -Be 'Unknown'
+        (
+            Test-RadarPolicyRuleForRole `
+                -PolicyRule $rule `
+                -Role $ownerRole `
+                -Parameters $parameters `
+                -AssignmentResourceType (
+                    'Microsoft.Authorization/roleAssignmentScheduleRequests'
+                )
+        ).State | Should -Be 'Unknown'
+    }
 }
 
 Describe 'Test-RadarPolicyTypeApplicability' {
@@ -1811,6 +1922,115 @@ Describe 'Import-RadarPolicyDefinitionGraphCache' {
     }
 }
 
+Describe 'Get-RadarPolicyInventory large-estate path' {
+    It 'bulk-loads one exact definition before resolving many scopes' {
+        $definitionId =
+            '/providers/Microsoft.Authorization/policyDefinitions/deny-role'
+        $roleId =
+            '/providers/Microsoft.Authorization/roleDefinitions/8e3af657-a8ff-443c-a75c-2fe8c4bcb635'
+        $assignment = [pscustomobject]@{
+            Id = '/subscriptions/root/providers/Microsoft.Authorization/policyAssignments/deny-role'
+            Name = 'deny-role'
+            DisplayName = 'Deny role'
+            Scope = '/subscriptions/root'
+            PolicyDefinitionId = $definitionId
+            EffectiveDefinitionVersion = '1.0.0'
+            Parameter = [pscustomobject]@{
+                roleIds = [pscustomobject]@{
+                    value = @($roleId)
+                }
+            }
+            NotScope = @()
+        }
+        Mock Get-RadarPolicyAssignmentAtScope {
+            @($assignment)
+        }
+        Mock Get-AzPolicyExemption { @() }
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        Id = "$definitionId/versions/1.0.0"
+                        Name = '1.0.0'
+                        Type =
+                            'microsoft.authorization/policydefinitions/versions'
+                        Properties = [pscustomobject]@{
+                            DisplayName = 'Deny role'
+                            Mode = 'All'
+                            Parameters = [pscustomobject]@{
+                                roleIds = [pscustomobject]@{
+                                    defaultValue = @()
+                                }
+                            }
+                            PolicyRule = [pscustomobject]@{
+                                if = [pscustomobject]@{
+                                    field =
+                                        'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                                    in = "[parameters('roleIds')]"
+                                }
+                                then = [pscustomobject]@{
+                                    effect = 'deny'
+                                }
+                            }
+                        }
+                    }
+                )
+            }
+        }
+        Mock Get-AzPolicyDefinition {
+            throw 'Per-definition ARM fallback should not run.'
+        }
+        Mock Invoke-AzRestMethod {
+            throw 'Per-definition REST fallback should not run.'
+        }
+        $scopes = @(
+            1..20 |
+                ForEach-Object {
+                    New-RadarScope -Id "/subscriptions/sub-$_"
+                }
+        )
+
+        $inventory = Get-RadarPolicyInventory -Scopes $scopes
+
+        $inventory.IsComplete | Should -BeTrue
+        $inventory.AssignmentCount | Should -Be 1
+        $inventory.RelevantRuleCount | Should -Be 1
+        foreach ($scope in $scopes) {
+            @(
+                $inventory.RulesByScope[
+                    $scope.Id.ToLowerInvariant()
+                ]
+            ).Count | Should -Be 1
+        }
+        Should -Invoke Search-AzGraph -Times 1
+        Should -Invoke Get-AzPolicyDefinition -Times 0
+        Should -Invoke Invoke-AzRestMethod -Times 0
+    }
+
+    It 'keeps a failed assignment scope as an empty uncertain scope' {
+        Mock Get-RadarPolicyAssignmentAtScope {
+            if ($Scope -eq '/subscriptions/sub-2') {
+                throw 'assignment read denied'
+            }
+            @()
+        }
+        Mock Get-AzPolicyExemption { @() }
+        $scopes = @(
+            (New-RadarScope -Id '/subscriptions/sub-1'),
+            (New-RadarScope -Id '/subscriptions/sub-2')
+        )
+
+        $inventory = Get-RadarPolicyInventory -Scopes $scopes
+
+        $inventory.IsComplete | Should -BeFalse
+        $inventory.UncertainScopes |
+            Should -Contain '/subscriptions/sub-2'
+        @(
+            $inventory.RulesByScope['/subscriptions/sub-2']
+        ).Count | Should -Be 0
+    }
+}
+
 Describe 'Resolve-RadarPolicyAssignment' {
     BeforeEach {
         Mock Get-AzPolicyDefinition {
@@ -2109,7 +2329,7 @@ Describe 'Resolve-RadarPolicyAssignment' {
         $resolved.Warnings | Should -BeNullOrEmpty
     }
 
-    It 'drops ambiguous generic policies that cannot prove a block' {
+    It 'keeps ambiguous generic policies uncertain' {
         $assignment = [pscustomobject]@{
             Id = '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/ambiguous-generic-target'
             Name = 'ambiguous-generic-target'
@@ -2132,7 +2352,10 @@ Describe 'Resolve-RadarPolicyAssignment' {
             -DefinitionCache @{} `
             -PolicySetCache @{}
 
-        $resolved.Rules | Should -BeNullOrEmpty
+        $resolved.Rules.Count | Should -Be 1
+        $resolved.Rules[0].UnsupportedReason |
+            Should -Match 'targeting could not be ruled out'
+        $resolved.Rules[0].ScopeSensitive | Should -BeTrue
         $resolved.Warnings | Should -BeNullOrEmpty
     }
 
@@ -2759,6 +2982,102 @@ Describe 'Get-RadarRoleDenyCoverage' {
 
         $coverage.Status | Should -Be 'Full'
         Should -Invoke Test-RadarPolicyRuleForRole -Times 3
+    }
+
+    It 'does not reuse an id-sensitive verdict across scopes' {
+        $rule = [pscustomobject]@{
+            AssignmentId = '/providers/Microsoft.Authorization/policyAssignments/id-scoped'
+            AssignmentName = 'ID-scoped deny'
+            AssignmentScope = '/'
+            NotScopes = @()
+            DefinitionName = 'ID-scoped deny'
+            ReferenceId = $null
+            PolicyRule = @{
+                if = @{
+                    field = 'id'
+                    like = '/subscriptions/sub-1/*'
+                }
+                then = @{ effect = 'deny' }
+            }
+            Parameters = @{}
+            ScopeSensitive = $true
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($rule)
+                '/subscriptions/sub-2' = @($rule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+                '/subscriptions/sub-2' = @()
+            }
+        }
+        $evaluationCache = @{}
+
+        $first = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-1') `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath `
+            -PolicyEvaluationCache $evaluationCache
+        $second = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-2') `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath `
+            -PolicyEvaluationCache $evaluationCache
+
+        $first.Status | Should -Be 'Full'
+        $second.Status | Should -Be 'None'
+    }
+}
+
+Describe 'Get-RadarReportHealthWarning' {
+    It 'flags a report whose every pair is uncertain' {
+        $results = @(
+            [pscustomobject]@{
+                AnalysisMode = 'BaselineNotActions'
+                BaselineRoleId = 'baseline-1'
+                BaselineScope = '/subscriptions/sub-1'
+                RoleId = 'role-1'
+                DenyCoverage = 'Unknown'
+            },
+            [pscustomobject]@{
+                AnalysisMode = 'BaselineNotActions'
+                BaselineRoleId = 'baseline-1'
+                BaselineScope = '/subscriptions/sub-1'
+                RoleId = 'role-2'
+                DenyCoverage = 'NotEvaluated'
+            }
+        )
+
+        Get-RadarReportHealthWarning -Results $results |
+            Should -Match 'not operationally actionable'
+    }
+
+    It 'accepts a report with at least one conclusive pair' {
+        $results = @(
+            [pscustomobject]@{
+                AnalysisMode = 'BaselineNotActions'
+                BaselineRoleId = 'baseline-1'
+                BaselineScope = '/subscriptions/sub-1'
+                RoleId = 'role-1'
+                DenyCoverage = 'Unknown'
+            },
+            [pscustomobject]@{
+                AnalysisMode = 'BaselineNotActions'
+                BaselineRoleId = 'baseline-1'
+                BaselineScope = '/subscriptions/sub-1'
+                RoleId = 'role-2'
+                DenyCoverage = 'None'
+            }
+        )
+
+        Get-RadarReportHealthWarning -Results $results |
+            Should -BeNullOrEmpty
     }
 }
 
