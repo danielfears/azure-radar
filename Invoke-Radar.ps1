@@ -5842,41 +5842,73 @@ function Get-RadarRoleDenyCoverage {
                     [string]$rule.ReferenceId,
                     [string]$rule.DefinitionName
                 ) -join [char]30
-                $scopeCacheKey = if (
-                    [bool](
-                        Get-RadarPropertyValue `
-                            -InputObject $rule `
-                            -Name 'ScopeSensitive'
-                    )
-                ) {
-                    $roleScope.ToLowerInvariant()
+                $scopeSensitive = [bool](
+                    Get-RadarPropertyValue `
+                        -InputObject $rule `
+                        -Name 'ScopeSensitive'
+                )
+                $evaluation = $null
+                if ($scopeSensitive) {
+                    $probeKey = @(
+                        $roleKey,
+                        $ruleKey,
+                        [string]$assignmentPath.ResourceType,
+                        'scope-probe'
+                    ) -join [char]31
+                    if (
+                        -not $PolicyEvaluationCache.ContainsKey(
+                            $probeKey
+                        )
+                    ) {
+                        $PolicyEvaluationCache[$probeKey] =
+                            Test-RadarPolicyRuleForRole `
+                                -PolicyRule $rule.PolicyRule `
+                                -Role $Role `
+                                -Parameters $rule.Parameters `
+                                -AssignmentResourceType (
+                                    $assignmentPath.ResourceType
+                                )
+                    }
+                    $probeEvaluation =
+                        $PolicyEvaluationCache[$probeKey]
+                    if ($probeEvaluation.State -ne 'Unknown') {
+                        $evaluation = $probeEvaluation
+                    }
                 }
-                else {
-                    ''
+
+                if ($null -eq $evaluation) {
+                    $scopeCacheKey = if (
+                        $scopeSensitive
+                    ) {
+                        $roleScope.ToLowerInvariant()
+                    }
+                    else {
+                        ''
+                    }
+                    $evaluationKey = @(
+                        $roleKey,
+                        $ruleKey,
+                        [string]$assignmentPath.ResourceType,
+                        $scopeCacheKey
+                    ) -join [char]31
+                    if (
+                        -not $PolicyEvaluationCache.ContainsKey(
+                            $evaluationKey
+                        )
+                    ) {
+                        $PolicyEvaluationCache[$evaluationKey] =
+                            Test-RadarPolicyRuleForRole `
+                                -PolicyRule $rule.PolicyRule `
+                                -Role $Role `
+                                -Parameters $rule.Parameters `
+                                -AssignmentResourceType (
+                                    $assignmentPath.ResourceType
+                                ) `
+                                -AssignmentScope $roleScope
+                    }
+                    $evaluation =
+                        $PolicyEvaluationCache[$evaluationKey]
                 }
-                $evaluationKey = @(
-                    $roleKey,
-                    $ruleKey,
-                    [string]$assignmentPath.ResourceType,
-                    $scopeCacheKey
-                ) -join [char]31
-                if (
-                    -not $PolicyEvaluationCache.ContainsKey(
-                        $evaluationKey
-                    )
-                ) {
-                    $PolicyEvaluationCache[$evaluationKey] =
-                        Test-RadarPolicyRuleForRole `
-                            -PolicyRule $rule.PolicyRule `
-                            -Role $Role `
-                            -Parameters $rule.Parameters `
-                            -AssignmentResourceType (
-                                $assignmentPath.ResourceType
-                            ) `
-                            -AssignmentScope $roleScope
-                }
-                $evaluation =
-                    $PolicyEvaluationCache[$evaluationKey]
                 if ($evaluation.State -eq 'Blocked') {
                     $pathBlocked = $true
                     [void]$blockingPolicies.Add(

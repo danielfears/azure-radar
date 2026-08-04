@@ -2596,6 +2596,103 @@ Describe 'Get-RadarRoleDenyCoverage' {
 
         Should -Invoke Test-RadarPolicyRuleForRole -Times 1
     }
+
+    It 'reuses a conclusive probe for scope-sensitive policies' {
+        $rule = [pscustomobject]@{
+            AssignmentId = '/providers/Microsoft.Authorization/policyAssignments/scoped'
+            AssignmentName = 'Scoped deny'
+            AssignmentScope = '/'
+            NotScopes = @()
+            DefinitionName = 'Scoped deny'
+            ReferenceId = $null
+            PolicyRule = $denyRule
+            Parameters = @{}
+            ScopeSensitive = $true
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($rule)
+                '/subscriptions/sub-2' = @($rule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+                '/subscriptions/sub-2' = @()
+            }
+        }
+        Mock Test-RadarPolicyRuleForRole {
+            [pscustomobject]@{
+                State = 'NotBlocked'
+                Reason = $null
+            }
+        }
+
+        $coverage = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @(
+                '/subscriptions/sub-1',
+                '/subscriptions/sub-2'
+            ) `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath `
+            -PolicyEvaluationCache @{}
+
+        $coverage.Status | Should -Be 'None'
+        Should -Invoke Test-RadarPolicyRuleForRole -Times 1
+    }
+
+    It 'evaluates each scope when the scope probe is inconclusive' {
+        $rule = [pscustomobject]@{
+            AssignmentId = '/providers/Microsoft.Authorization/policyAssignments/scoped'
+            AssignmentName = 'Scoped deny'
+            AssignmentScope = '/'
+            NotScopes = @()
+            DefinitionName = 'Scoped deny'
+            ReferenceId = $null
+            PolicyRule = $denyRule
+            Parameters = @{}
+            ScopeSensitive = $true
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($rule)
+                '/subscriptions/sub-2' = @($rule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+                '/subscriptions/sub-2' = @()
+            }
+        }
+        Mock Test-RadarPolicyRuleForRole {
+            [pscustomobject]@{
+                State = if ($AssignmentScope) {
+                    'Blocked'
+                }
+                else {
+                    'Unknown'
+                }
+                Reason = $null
+            }
+        }
+
+        $coverage = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @(
+                '/subscriptions/sub-1',
+                '/subscriptions/sub-2'
+            ) `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath `
+            -PolicyEvaluationCache @{}
+
+        $coverage.Status | Should -Be 'Full'
+        Should -Invoke Test-RadarPolicyRuleForRole -Times 3
+    }
 }
 
 Describe 'ConvertTo-RadarHtmlReport' {
