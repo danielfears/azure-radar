@@ -1444,6 +1444,44 @@ Describe 'Get-RadarPolicyAssignmentAtScope' {
 }
 
 Describe 'Get-RadarPolicyDefinitionCached' {
+    It 'handles omitted optional REST properties under strict mode' {
+        Mock Get-AzPolicyDefinition { $null }
+        Mock Invoke-AzRestMethod {
+            [pscustomobject]@{
+                Content = @'
+{
+  "name": "1.0.0",
+  "properties": {
+    "displayName": "Audit unrelated resources",
+    "policyRule": {
+      "if": {
+        "field": "type",
+        "equals": "Microsoft.Storage/storageAccounts"
+      },
+      "then": {
+        "effect": "audit"
+      }
+    }
+  }
+}
+'@
+            }
+        }
+
+        $definition = & {
+            Set-StrictMode -Version Latest
+            Get-RadarPolicyDefinitionCached `
+                -Id '/providers/Microsoft.Authorization/policyDefinitions/audit-storage' `
+                -DefinitionCache @{} `
+                -PolicySetCache @{} `
+                -Version '1.0.0'
+        }
+
+        $definition.Mode | Should -BeNullOrEmpty
+        $definition.Parameter | Should -BeNullOrEmpty
+        $definition.PolicyRule.then.effect | Should -Be 'audit'
+    }
+
     It 'falls back to REST when versioned Az.Resources output has no rule' {
         Mock Get-AzPolicyDefinition { $null }
         Mock Invoke-AzRestMethod {

@@ -4267,20 +4267,45 @@ function Get-RadarPolicyDefinitionVersionViaRest {
             -Method GET `
             -ErrorAction Stop
     ).Content | ConvertFrom-Json
-    $properties = $raw.properties
+    $properties = Get-RadarPropertyValue `
+        -InputObject $raw `
+        -Name 'Properties'
+    if ($null -eq $properties) {
+        throw 'The ARM policy definition response contained no properties.'
+    }
 
     $converted = [pscustomobject]@{
         Id = $Id
-        Name = $raw.name
-        DisplayName = $properties.displayName
-        Description = $properties.description
-        PolicyType = $properties.policyType
-        Mode = $properties.mode
-        Metadata = $properties.metadata
-        Parameter = $properties.parameters
-        PolicyRule = $properties.policyRule
+        Name = Get-RadarPropertyValue `
+            -InputObject $raw `
+            -Name 'Name'
+        DisplayName = Get-RadarPropertyValue `
+            -InputObject $properties `
+            -Name 'DisplayName'
+        Description = Get-RadarPropertyValue `
+            -InputObject $properties `
+            -Name 'Description'
+        PolicyType = Get-RadarPropertyValue `
+            -InputObject $properties `
+            -Name 'PolicyType'
+        Mode = Get-RadarPropertyValue `
+            -InputObject $properties `
+            -Name 'Mode'
+        Metadata = Get-RadarPropertyValue `
+            -InputObject $properties `
+            -Name 'Metadata'
+        Parameter = Get-RadarPropertyValue `
+            -InputObject $properties `
+            -Name 'Parameters'
+        PolicyRule = Get-RadarPropertyValue `
+            -InputObject $properties `
+            -Name 'PolicyRule'
         PolicyDefinition = if ($PolicySet) {
-            @($properties.policyDefinitions)
+            @(
+                Get-RadarPropertyValue `
+                    -InputObject $properties `
+                    -Name 'PolicyDefinitions'
+            )
         }
         else {
             @()
