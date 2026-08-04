@@ -2699,16 +2699,42 @@ function Get-ActionMatch {
         [string]$Action
     )
 
+    $actionIsConcrete =
+        -not [string]::IsNullOrWhiteSpace($Action) -and
+        -not $Action.Contains('*')
     foreach ($permission in @(Get-RolePermissionBlock -Role $Role)) {
         $notActions = @($permission.NotActions)
-        foreach (
-            $matchedAction in @(
-                @($permission.Actions) |
-                    Where-Object {
-                        Test-PermissionMatch -Pattern $_ -Action $Action
+        foreach ($matchedAction in @($permission.Actions)) {
+            if (
+                -not (
+                    Test-PermissionMatch `
+                        -Pattern $matchedAction `
+                        -Action $Action
+                )
+            ) {
+                continue
+            }
+
+            if ($actionIsConcrete) {
+                $isExcluded = $false
+                foreach ($notAction in $notActions) {
+                    if (
+                        Test-PermissionMatch `
+                            -Pattern $notAction `
+                            -Action $Action
+                    ) {
+                        $isExcluded = $true
+                        break
                     }
-            )
-        ) {
+                }
+                if (-not $isExcluded) {
+                    return [pscustomobject]@{
+                        MatchedPattern = $matchedAction
+                    }
+                }
+                continue
+            }
+
             if (
                 Test-RadarGlobDifferenceExists `
                     -IncludePatterns @($matchedAction, $Action) `
@@ -4991,9 +5017,14 @@ function Get-RadarRoleDenyCoverage {
 
         [object]$ScopeHierarchy,
 
-        [object[]]$AssignmentPaths = @()
+        [object[]]$AssignmentPaths = @(),
+
+        [hashtable]$PolicyEvaluationCache
     )
 
+    if ($null -eq $PolicyEvaluationCache) {
+        $PolicyEvaluationCache = @{}
+    }
     if (@($AssignmentPaths).Count -eq 0) {
         $AssignmentPaths = @(
             [pscustomobject]@{
@@ -5017,6 +5048,7 @@ function Get-RadarRoleDenyCoverage {
     $roleName = [string](
         Get-RadarPropertyValue -InputObject $Role -Name 'Name'
     )
+    $roleKey = Get-RadarRoleKey -Role $Role
     if (
         $DeniedRoleNames -and
         $DeniedRoleNames.Contains($roleName)
@@ -5133,11 +5165,32 @@ function Get-RadarRoleDenyCoverage {
                     continue
                 }
 
-                $evaluation = Test-RadarPolicyRuleForRole `
-                    -PolicyRule $rule.PolicyRule `
-                    -Role $Role `
-                    -Parameters $rule.Parameters `
-                    -AssignmentResourceType $assignmentPath.ResourceType
+                $ruleKey = @(
+                    [string]$rule.AssignmentId,
+                    [string]$rule.ReferenceId,
+                    [string]$rule.DefinitionName
+                ) -join [char]30
+                $evaluationKey = @(
+                    $roleKey,
+                    $ruleKey,
+                    [string]$assignmentPath.ResourceType
+                ) -join [char]31
+                if (
+                    -not $PolicyEvaluationCache.ContainsKey(
+                        $evaluationKey
+                    )
+                ) {
+                    $PolicyEvaluationCache[$evaluationKey] =
+                        Test-RadarPolicyRuleForRole `
+                            -PolicyRule $rule.PolicyRule `
+                            -Role $Role `
+                            -Parameters $rule.Parameters `
+                            -AssignmentResourceType (
+                                $assignmentPath.ResourceType
+                            )
+                }
+                $evaluation =
+                    $PolicyEvaluationCache[$evaluationKey]
                 if ($evaluation.State -eq 'Blocked') {
                     $pathBlocked = $true
                     [void]$blockingPolicies.Add(
@@ -6032,6 +6085,7 @@ $baseDiscoveryComplete =
 $matchCache = @{}
 $coverageCache = @{}
 $availabilityCache = @{}
+$policyEvaluationCache = @{}
 $results = New-Object System.Collections.Generic.List[object]
 $runtimeWarnings = New-Object System.Collections.Generic.List[string]
 $analysisContextCount =
@@ -6120,7 +6174,8 @@ $getCoverage = {
                 $Availability.IsComplete
             ) `
             -ScopeHierarchy $scopeHierarchy `
-            -AssignmentPaths $AssignmentPaths
+            -AssignmentPaths $AssignmentPaths `
+            -PolicyEvaluationCache $policyEvaluationCache
         $coverageCache[$key] = $coverage
     }
     return $coverageCache[$key]

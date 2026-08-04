@@ -112,6 +112,29 @@ Describe 'Get-ActionMatch' {
         $match.MatchedPattern | Should -Be 'Microsoft.Authorization/*'
     }
 
+    It 'uses the direct exclusion path for concrete restricted actions' {
+        $role = [pscustomobject]@{
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Microsoft.Authorization/*')
+                    NotActions = @(
+                        'Microsoft.Authorization/policyAssignments/write'
+                    )
+                }
+            )
+        }
+        Mock Test-RadarGlobDifferenceExists {
+            throw 'The wildcard automaton should not be used.'
+        }
+
+        $match = Get-ActionMatch `
+            -Role $role `
+            -Action 'Microsoft.Authorization/roleAssignments/write'
+
+        $match.MatchedPattern | Should -Be 'Microsoft.Authorization/*'
+        Should -Invoke Test-RadarGlobDifferenceExists -Times 0
+    }
+
     It 'does not let one permission block suppress another block grant' {
         $role = [pscustomobject]@{
             Permissions = @(
@@ -2108,6 +2131,54 @@ Describe 'Get-RadarRoleDenyCoverage' {
 
         $coverage.Status | Should -Be 'Full'
         $coverage.IsAlreadyDenied | Should -BeTrue
+    }
+
+    It 'reuses role-policy evaluation across scopes and coverage calls' {
+        $rule = [pscustomobject]@{
+            AssignmentId = '/providers/Microsoft.Authorization/policyAssignments/deny-owner'
+            AssignmentName = 'Deny Owner'
+            AssignmentScope = '/'
+            NotScopes = @()
+            DefinitionName = 'Deny Owner'
+            ReferenceId = $null
+            PolicyRule = $denyRule
+            Parameters = @{}
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($rule)
+                '/subscriptions/sub-2' = @($rule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+                '/subscriptions/sub-2' = @()
+            }
+        }
+        $evaluationCache = @{}
+        Mock Test-RadarPolicyRuleForRole {
+            [pscustomobject]@{
+                State = 'Blocked'
+                Reason = $null
+            }
+        }
+
+        foreach ($scope in @(
+            '/subscriptions/sub-1',
+            '/subscriptions/sub-2'
+        )) {
+            $coverage = Get-RadarRoleDenyCoverage `
+                -Role $ownerRole `
+                -RoleScopes @($scope) `
+                -PolicyInventory $inventory `
+                -AssignmentPaths $directAssignmentPath `
+                -PolicyEvaluationCache $evaluationCache
+            $coverage.Status | Should -Be 'Full'
+        }
+
+        Should -Invoke Test-RadarPolicyRuleForRole -Times 1
     }
 }
 
