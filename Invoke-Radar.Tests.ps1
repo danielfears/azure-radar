@@ -3592,7 +3592,7 @@ Describe 'Invoke-Radar scoped baseline gap model' {
         Mock Get-AzPolicyExemption { @() }
     }
 
-    It 'keeps customer-style baselines separate and exposes the unblocked scope' {
+    It 'keeps customer baseline contexts separate and exposes the unblocked scope' {
         $outputCsv = Join-Path $TestDrive 'scoped-gaps.csv'
 
         & $scriptPath `
