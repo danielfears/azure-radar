@@ -4240,8 +4240,11 @@ function Get-RadarPolicyDefinitionCached {
     return $DefinitionCache[$key]
 }
 
-function Get-RadarPolicyDefinitionVersionViaRest {
+function ConvertTo-RadarPolicyDefinitionObject {
     param(
+        [Parameter(Mandatory = $true)]
+        [object]$InputObject,
+
         [Parameter(Mandatory = $true)]
         [string]$Id,
 
@@ -4250,34 +4253,17 @@ function Get-RadarPolicyDefinitionVersionViaRest {
         [switch]$PolicySet
     )
 
-    if (-not (Get-Command Invoke-AzRestMethod -ErrorAction SilentlyContinue)) {
-        throw 'Invoke-AzRestMethod is required to retrieve this policy definition version.'
-    }
-    $path = $Id.TrimEnd('/')
-    if ($Version) {
-        $path += "/versions/${Version}"
-    }
-    $path += '?api-version=2023-04-01'
-    if ($PolicySet) {
-        $path += '&$expand=EffectiveDefinitionVersion'
-    }
-    $raw = (
-        Invoke-AzRestMethod `
-            -Path $path `
-            -Method GET `
-            -ErrorAction Stop
-    ).Content | ConvertFrom-Json
     $properties = Get-RadarPropertyValue `
-        -InputObject $raw `
+        -InputObject $InputObject `
         -Name 'Properties'
     if ($null -eq $properties) {
-        throw 'The ARM policy definition response contained no properties.'
+        throw 'The policy definition response contained no properties.'
     }
 
-    $converted = [pscustomobject]@{
+    [pscustomobject]@{
         Id = $Id
         Name = Get-RadarPropertyValue `
-            -InputObject $raw `
+            -InputObject $InputObject `
             -Name 'Name'
         DisplayName = Get-RadarPropertyValue `
             -InputObject $properties `
@@ -4312,6 +4298,40 @@ function Get-RadarPolicyDefinitionVersionViaRest {
         }
         Version = $Version
     }
+}
+
+function Get-RadarPolicyDefinitionVersionViaRest {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Id,
+
+        [string]$Version,
+
+        [switch]$PolicySet
+    )
+
+    if (-not (Get-Command Invoke-AzRestMethod -ErrorAction SilentlyContinue)) {
+        throw 'Invoke-AzRestMethod is required to retrieve this policy definition version.'
+    }
+    $path = $Id.TrimEnd('/')
+    if ($Version) {
+        $path += "/versions/${Version}"
+    }
+    $path += '?api-version=2023-04-01'
+    if ($PolicySet) {
+        $path += '&$expand=EffectiveDefinitionVersion'
+    }
+    $raw = (
+        Invoke-AzRestMethod `
+            -Path $path `
+            -Method GET `
+            -ErrorAction Stop
+    ).Content | ConvertFrom-Json
+    $converted = ConvertTo-RadarPolicyDefinitionObject `
+        -InputObject $raw `
+        -Id $Id `
+        -Version $Version `
+        -PolicySet:$PolicySet
     if ($PolicySet) {
         $unresolved = @(
             foreach ($member in @($converted.PolicyDefinition)) {
@@ -4366,6 +4386,237 @@ function Get-RadarDefinitionVersion {
         Version = $null
         Warning = "Definition version '$requestedVersion' is a range, but Azure did not return its effective version."
     }
+}
+
+function Import-RadarPolicyDefinitionGraphCache {
+    param(
+        [object[]]$Assignments,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$DefinitionCache,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$PolicySetCache
+    )
+
+    if (-not (Get-Command Search-AzGraph -ErrorAction SilentlyContinue)) {
+        return
+    }
+
+    $newTargetMap = {
+        [System.Collections.Generic.Dictionary[string, object]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+    }
+    $addTarget = {
+        param(
+            [System.Collections.Generic.Dictionary[string, object]]$TargetMap,
+            [string]$Id,
+            [string]$Version,
+            [bool]$PolicySet
+        )
+
+        if ([string]::IsNullOrWhiteSpace($Id)) { return }
+        $baseId = $Id.TrimEnd('/')
+        $fullId = if ($Version) {
+            "$baseId/versions/$Version"
+        }
+        else {
+            $baseId
+        }
+        if (-not $TargetMap.ContainsKey($fullId)) {
+            $TargetMap[$fullId] = [pscustomobject]@{
+                BaseId = $baseId
+                FullId = $fullId
+                Version = $Version
+                PolicySet = $PolicySet
+            }
+        }
+    }
+    $loadTargets = {
+        param(
+            [System.Collections.Generic.Dictionary[string, object]]$TargetMap
+        )
+
+        $targets = @($TargetMap.Values)
+        $batchSize = 50
+        for (
+            $offset = 0;
+            $offset -lt $targets.Count;
+            $offset += $batchSize
+        ) {
+            $batch = @(
+                $targets |
+                    Select-Object `
+                        -Skip $offset `
+                        -First $batchSize
+            )
+            $quotedIds = @(
+                $batch |
+                    ForEach-Object {
+                        "'" +
+                        $_.FullId.Replace("'", "''") +
+                        "'"
+                    }
+            ) -join ', '
+            $query = @"
+policyresources
+| where id in~ ($quotedIds)
+| project id, name, type, properties
+"@
+            try {
+                $response = Search-AzGraph `
+                    -Query $query `
+                    -First $batch.Count `
+                    -UseTenantScope `
+                    -ErrorAction Stop
+                $rows = if (
+                    Test-RadarHasProperty `
+                        -InputObject $response `
+                        -Name 'Data'
+                ) {
+                    @(
+                        Get-RadarPropertyValue `
+                            -InputObject $response `
+                            -Name 'Data' |
+                            Where-Object { $null -ne $_ }
+                    )
+                }
+                else {
+                    @(
+                        $response |
+                            Where-Object { $null -ne $_ }
+                    )
+                }
+
+                foreach ($row in $rows) {
+                    $rowId = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $row `
+                            -Name 'Id'
+                    )
+                    if (
+                        [string]::IsNullOrWhiteSpace($rowId) -or
+                        -not $TargetMap.ContainsKey($rowId)
+                    ) {
+                        continue
+                    }
+                    $target = $TargetMap[$rowId]
+                    $converted =
+                        ConvertTo-RadarPolicyDefinitionObject `
+                            -InputObject $row `
+                            -Id $target.BaseId `
+                            -Version $target.Version `
+                            -PolicySet:$target.PolicySet
+                    if ($target.PolicySet) {
+                        $unresolved = @(
+                            foreach (
+                                $member in @(
+                                    $converted.PolicyDefinition
+                                )
+                            ) {
+                                $memberVersion =
+                                    Get-RadarDefinitionVersion `
+                                        -InputObject $member
+                                if ($memberVersion.Warning) {
+                                    $member
+                                }
+                            }
+                        )
+                        if ($unresolved.Count -gt 0) {
+                            continue
+                        }
+                    }
+                    $versionKey = if ($target.Version) {
+                        $target.Version.ToLowerInvariant()
+                    }
+                    else {
+                        ''
+                    }
+                    $cacheKey = (
+                        $target.BaseId.ToLowerInvariant() +
+                        '::' +
+                        $versionKey
+                    )
+                    if ($target.PolicySet) {
+                        $PolicySetCache[$cacheKey] = $converted
+                    }
+                    else {
+                        $DefinitionCache[$cacheKey] = $converted
+                    }
+                }
+            }
+            catch {
+                Write-Verbose (
+                    'Azure Resource Graph policy-definition preload failed ' +
+                    "for one batch: $($_.Exception.Message)"
+                )
+            }
+        }
+    }
+
+    $assignedTargets = & $newTargetMap
+    foreach ($assignment in @($Assignments)) {
+        $definitionId = [string](
+            Get-RadarPolicyProperty `
+                -InputObject $assignment `
+                -Name 'PolicyDefinitionId'
+        )
+        $definitionVersion =
+            Get-RadarDefinitionVersion `
+                -InputObject $assignment
+        if ($definitionVersion.Warning) { continue }
+        & $addTarget `
+            $assignedTargets `
+            $definitionId `
+            $definitionVersion.Version `
+            ($definitionId -match '(?i)/policySetDefinitions/')
+    }
+    & $loadTargets $assignedTargets
+
+    $memberTargets = & $newTargetMap
+    foreach (
+        $target in @(
+            $assignedTargets.Values |
+                Where-Object { $_.PolicySet }
+        )
+    ) {
+        $versionKey = if ($target.Version) {
+            $target.Version.ToLowerInvariant()
+        }
+        else {
+            ''
+        }
+        $cacheKey = (
+            $target.BaseId.ToLowerInvariant() +
+            '::' +
+            $versionKey
+        )
+        if (-not $PolicySetCache.ContainsKey($cacheKey)) {
+            continue
+        }
+        foreach (
+            $member in @(
+                $PolicySetCache[$cacheKey].PolicyDefinition
+            )
+        ) {
+            $memberId = [string](
+                Get-RadarPropertyValue `
+                    -InputObject $member `
+                    -Name 'PolicyDefinitionId'
+            )
+            $memberVersion =
+                Get-RadarDefinitionVersion `
+                    -InputObject $member
+            if ($memberVersion.Warning) { continue }
+            & $addTarget `
+                $memberTargets `
+                $memberId `
+                $memberVersion.Version `
+                $false
+        }
+    }
+    & $loadTargets $memberTargets
 }
 
 function Resolve-RadarPolicyAssignmentVersion {
@@ -4923,6 +5174,8 @@ function Get-RadarPolicyInventory {
     $definitionCache = @{}
     $policySetCache = @{}
     $resolvedAssignmentCache = @{}
+    $assignmentByKey = @{}
+    $assignmentKeysByScope = @{}
     $assignmentIds = New-Object System.Collections.Generic.HashSet[string] (
         [StringComparer]::OrdinalIgnoreCase
     )
@@ -4975,7 +5228,10 @@ function Get-RadarPolicyInventory {
             continue
         }
 
-        $scopeRules = New-Object System.Collections.Generic.List[object]
+        $scopeAssignmentKeys =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
         foreach ($assignment in $assignments) {
             $version = Get-RadarDefinitionVersion -InputObject $assignment
             if ($version.Warning) {
@@ -4995,32 +5251,12 @@ function Get-RadarPolicyInventory {
             $assignmentKey = Get-RadarPolicyAssignmentKey `
                 -Assignment $assignment
             [void]$assignmentIds.Add($assignmentKey)
-            if (-not $resolvedAssignmentCache.ContainsKey($assignmentKey)) {
-                $resolved = Resolve-RadarPolicyAssignment `
-                    -Assignment $assignment `
-                    -DefinitionCache $definitionCache `
-                    -PolicySetCache $policySetCache
-                $resolvedAssignmentCache[$assignmentKey] = $resolved
-            }
-            foreach (
-                $warning in @(
-                    $resolvedAssignmentCache[$assignmentKey].Warnings
-                )
-            ) {
-                [void]$uncertainScopes.Add($scopeKey)
-                [void]$warnings.Add(
-                    "$($scope.Id): $warning"
-                )
-            }
-            foreach (
-                $resolvedRule in @(
-                    $resolvedAssignmentCache[$assignmentKey].Rules
-                )
-            ) {
-                [void]$scopeRules.Add($resolvedRule)
+            [void]$scopeAssignmentKeys.Add($assignmentKey)
+            if (-not $assignmentByKey.ContainsKey($assignmentKey)) {
+                $assignmentByKey[$assignmentKey] = $assignment
             }
         }
-        $rulesByScope[$scope.Id.ToLowerInvariant()] = $scopeRules.ToArray()
+        $assignmentKeysByScope[$scopeKey] = @($scopeAssignmentKeys)
 
         try {
             $activeExemptions = New-Object System.Collections.Generic.List[object]
@@ -5082,6 +5318,88 @@ function Get-RadarPolicyInventory {
     Write-Progress `
         -Activity 'RADAR policy and exemption discovery' `
         -Completed
+
+    if ($Scopes.Count -ge 20 -and $assignmentByKey.Count -gt 0) {
+        Write-Host (
+            '  Preloading exact policy definitions for {0} unique assignment(s)...' -f
+            $assignmentByKey.Count
+        )
+        Import-RadarPolicyDefinitionGraphCache `
+            -Assignments @($assignmentByKey.Values) `
+            -DefinitionCache $definitionCache `
+            -PolicySetCache $policySetCache
+    }
+
+    $assignmentIndex = 0
+    $nextResolutionProgress = 5
+    foreach ($assignmentKey in $assignmentByKey.Keys) {
+        $assignmentIndex++
+        if (-not $resolvedAssignmentCache.ContainsKey($assignmentKey)) {
+            $resolvedAssignmentCache[$assignmentKey] =
+                Resolve-RadarPolicyAssignment `
+                    -Assignment $assignmentByKey[$assignmentKey] `
+                    -DefinitionCache $definitionCache `
+                    -PolicySetCache $policySetCache
+        }
+        if ($assignmentByKey.Count -gt 0) {
+            $resolutionPercent = [math]::Floor(
+                ($assignmentIndex / $assignmentByKey.Count) * 100
+            )
+            Write-Progress `
+                -Activity 'RADAR policy definition resolution' `
+                -Status (
+                    "$resolutionPercent% - $assignmentIndex/" +
+                    $assignmentByKey.Count
+                ) `
+                -PercentComplete $resolutionPercent
+            if ($resolutionPercent -ge $nextResolutionProgress) {
+                Write-Host (
+                    '  Policy resolution progress: {0}% ({1}/{2} assignments)' -f
+                    $resolutionPercent,
+                    $assignmentIndex,
+                    $assignmentByKey.Count
+                )
+                while (
+                    $nextResolutionProgress -le
+                    $resolutionPercent
+                ) {
+                    $nextResolutionProgress += 5
+                }
+            }
+        }
+    }
+    Write-Progress `
+        -Activity 'RADAR policy definition resolution' `
+        -Completed
+
+    foreach ($scope in $Scopes) {
+        $scopeKey = $scope.Id.TrimEnd('/').ToLowerInvariant()
+        $scopeRules = New-Object System.Collections.Generic.List[object]
+        foreach (
+            $assignmentKey in @(
+                $assignmentKeysByScope[$scopeKey]
+            )
+        ) {
+            foreach (
+                $warning in @(
+                    $resolvedAssignmentCache[$assignmentKey].Warnings
+                )
+            ) {
+                [void]$uncertainScopes.Add($scopeKey)
+                [void]$warnings.Add(
+                    "$($scope.Id): $warning"
+                )
+            }
+            foreach (
+                $resolvedRule in @(
+                    $resolvedAssignmentCache[$assignmentKey].Rules
+                )
+            ) {
+                [void]$scopeRules.Add($resolvedRule)
+            }
+        }
+        $rulesByScope[$scopeKey] = $scopeRules.ToArray()
+    }
 
     $uniqueRuleKeys = New-Object System.Collections.Generic.HashSet[string] (
         [StringComparer]::OrdinalIgnoreCase

@@ -125,6 +125,9 @@ and HTML before an ephemeral session ends.
 
 Large estates can take time: policy assignments and exemptions are queried at
 each relevant exact scope to prevent a parent result hiding a descendant gap.
+Exact assigned policy-definition versions and initiative members are then
+preloaded from Azure Resource Graph in bounded batches; missing or stale Graph
+rows fall back to the existing ARM lookup.
 The evaluation phase prints percentage, elapsed time, and estimated remaining
 time every 5%. After each completed baseline context RADAR writes
 `<OutputCsv>.partial` and `<name>-coverage.csv.partial`; an interrupted run

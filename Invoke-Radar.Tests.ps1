@@ -1603,6 +1603,117 @@ Describe 'Get-RadarPolicyDefinitionCached' {
     }
 }
 
+Describe 'Import-RadarPolicyDefinitionGraphCache' {
+    It 'preloads assigned definitions and initiative members by exact version' {
+        $directId =
+            '/providers/Microsoft.Authorization/policyDefinitions/direct'
+        $setId =
+            '/providers/Microsoft.Authorization/policySetDefinitions/set'
+        $memberId =
+            '/providers/Microsoft.Authorization/policyDefinitions/member'
+        $assignments = @(
+            [pscustomobject]@{
+                PolicyDefinitionId = $directId
+                EffectiveDefinitionVersion = '1.2.3'
+            },
+            [pscustomobject]@{
+                PolicyDefinitionId = $setId
+                EffectiveDefinitionVersion = '2.0.0'
+            }
+        )
+        Mock Search-AzGraph {
+            if ($Query -match '/member/versions/1\.4\.2') {
+                return [pscustomobject]@{
+                    Data = @(
+                        [pscustomobject]@{
+                            Id = "$memberId/versions/1.4.2"
+                            Name = '1.4.2'
+                            Type =
+                                'microsoft.authorization/policydefinitions/versions'
+                            Properties = [pscustomobject]@{
+                                DisplayName = 'Member'
+                                Mode = 'All'
+                                Parameters = [pscustomobject]@{}
+                                PolicyRule = [pscustomobject]@{
+                                    if = [pscustomobject]@{
+                                        field = 'type'
+                                        equals =
+                                            'Microsoft.Authorization/roleAssignments'
+                                    }
+                                    then = [pscustomobject]@{
+                                        effect = 'deny'
+                                    }
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        Id = "$directId/versions/1.2.3"
+                        Name = '1.2.3'
+                        Type =
+                            'microsoft.authorization/policydefinitions/versions'
+                        Properties = [pscustomobject]@{
+                            DisplayName = 'Direct'
+                            Mode = 'All'
+                            Parameters = [pscustomobject]@{}
+                            PolicyRule = [pscustomobject]@{
+                                if = [pscustomobject]@{
+                                    field = 'type'
+                                    equals =
+                                        'Microsoft.Authorization/roleAssignments'
+                                }
+                                then = [pscustomobject]@{
+                                    effect = 'deny'
+                                }
+                            }
+                        }
+                    },
+                    [pscustomobject]@{
+                        Id = "$setId/versions/2.0.0"
+                        Name = '2.0.0'
+                        Type =
+                            'microsoft.authorization/policysetdefinitions/versions'
+                        Properties = [pscustomobject]@{
+                            DisplayName = 'Set'
+                            Parameters = [pscustomobject]@{}
+                            PolicyDefinitions = @(
+                                [pscustomobject]@{
+                                    PolicyDefinitionId = $memberId
+                                    DefinitionVersion = '1.*.*'
+                                    EffectiveDefinitionVersion = '1.4.2'
+                                    Parameters = [pscustomobject]@{}
+                                }
+                            )
+                        }
+                    }
+                )
+            }
+        }
+        $definitionCache = @{}
+        $policySetCache = @{}
+
+        Import-RadarPolicyDefinitionGraphCache `
+            -Assignments $assignments `
+            -DefinitionCache $definitionCache `
+            -PolicySetCache $policySetCache
+
+        $definitionCache.ContainsKey(
+            "$($directId.ToLowerInvariant())::1.2.3"
+        ) | Should -BeTrue
+        $policySetCache.ContainsKey(
+            "$($setId.ToLowerInvariant())::2.0.0"
+        ) | Should -BeTrue
+        $definitionCache.ContainsKey(
+            "$($memberId.ToLowerInvariant())::1.4.2"
+        ) | Should -BeTrue
+        Should -Invoke Search-AzGraph -Times 2
+    }
+}
+
 Describe 'Resolve-RadarPolicyAssignment' {
     BeforeEach {
         Mock Get-AzPolicyDefinition {
