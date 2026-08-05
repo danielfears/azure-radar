@@ -1156,6 +1156,1117 @@ Describe 'Get-RadarBaselineRoleAssignmentInventory' {
     }
 }
 
+Describe 'Get-RadarPrincipalDirectoryEvidence' {
+    It 'batches enabled-state and paged transitive-group requests' {
+        Mock Get-AzAccessToken {
+            [pscustomobject]@{ Token = 'test-token' }
+        }
+        $script:directoryBatchSizes = @()
+        $script:directoryAuthorizations = @()
+        Mock Invoke-RestMethod {
+            $payload = $Body | ConvertFrom-Json
+            $script:directoryBatchSizes +=
+                @($payload.requests).Count
+            $script:directoryAuthorizations +=
+                [string]$Headers.Authorization
+            $responses = @(
+                foreach ($request in @($payload.requests)) {
+                    if ($request.url -match 'transitiveMemberOf') {
+                        $principalId = (
+                            $request.url -split '/'
+                        )[2]
+                        $pageTwo =
+                            $request.url -match 'page=2'
+                        $body = [ordered]@{
+                            value = @(
+                                [pscustomobject]@{
+                                    id = if ($pageTwo) {
+                                        "$principalId-group-2"
+                                    }
+                                    else {
+                                        "$principalId-group-1"
+                                    }
+                                }
+                            )
+                        }
+                        if (-not $pageTwo) {
+                            $body['@odata.nextLink'] =
+                                "https://graph.microsoft.com/v1.0/users/$principalId/transitiveMemberOf/microsoft.graph.group?page=2"
+                        }
+                        [pscustomobject]@{
+                            id = $request.id
+                            status = 200
+                            body = [pscustomobject]$body
+                        }
+                    }
+                    else {
+                        [pscustomobject]@{
+                            id = $request.id
+                            status = 200
+                            body = [pscustomobject]@{
+                                id = (
+                                    $request.url -split '/'
+                                )[2]
+                                accountEnabled = $true
+                            }
+                        }
+                    }
+                }
+            )
+            [pscustomobject]@{ responses = $responses }
+        }
+        $assignments = @(
+            foreach ($index in 1..11) {
+                [pscustomobject]@{
+                    PrincipalId =
+                        ('00000000-0000-0000-0000-{0:D12}' -f $index)
+                    PrincipalType = 'User'
+                }
+            }
+        )
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = $assignments
+        }
+
+        $evidence = Get-RadarPrincipalDirectoryEvidence `
+            -BaselineAssignmentInventory $baselineInventory
+
+        $evidence.IsComplete | Should -BeTrue
+        $evidence.EvidenceByPrincipal.Count | Should -Be 11
+        $evidence.GroupIds.Count | Should -Be 22
+        ($script:directoryBatchSizes | Measure-Object -Maximum).
+            Maximum | Should -BeLessOrEqual 20
+        @($script:directoryAuthorizations | Sort-Object -Unique) |
+            Should -Be @('Bearer test-token')
+        Should -Invoke Invoke-RestMethod -Times 3
+    }
+
+    It 'keeps principal IDs out of global Graph warnings' {
+        Mock Get-AzAccessToken {
+            [pscustomobject]@{ Token = 'test-token' }
+        }
+        Mock Invoke-RestMethod {
+            $payload = $Body | ConvertFrom-Json
+            [pscustomobject]@{
+                responses = @(
+                    foreach ($request in @($payload.requests)) {
+                        [pscustomobject]@{
+                            id = $request.id
+                            status = 403
+                            body = [pscustomobject]@{}
+                        }
+                    }
+                )
+            }
+        }
+        $principalId = '33333333-3333-3333-3333-333333333333'
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    PrincipalId = $principalId
+                    PrincipalType = 'User'
+                }
+            )
+        }
+
+        $evidence = Get-RadarPrincipalDirectoryEvidence `
+            -BaselineAssignmentInventory $baselineInventory
+
+        $evidence.IsComplete | Should -BeFalse
+        ($evidence.Warnings -join ' ') | Should -Not -Match $principalId
+        (
+            $evidence.EvidenceByPrincipal[
+                $principalId
+            ].Warnings -join ' '
+        ) | Should -Match 'HTTP 403'
+    }
+
+    It 'fails closed to incomplete evidence when Graph is unavailable' {
+        Mock Get-AzAccessToken { throw 'consent required' }
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    PrincipalId =
+                        '33333333-3333-3333-3333-333333333333'
+                    PrincipalType = 'User'
+                }
+            )
+        }
+
+        $evidence = Get-RadarPrincipalDirectoryEvidence `
+            -BaselineAssignmentInventory $baselineInventory
+
+        $evidence.IsComplete | Should -BeFalse
+        $evidence.Warnings |
+            Should -Match 'unavailable'
+    }
+}
+
+Describe 'Get-RadarPrincipalRoleAssignmentInventory' {
+    It 'uses one tenant-scoped principal-filtered paged query' {
+        Mock Search-AzGraph {
+            $suffix = if ($SkipToken) { '2' } else { '1' }
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        Id = "assignment-$suffix"
+                        AssignmentId = "assignment-$suffix"
+                        AssignmentScope = '/subscriptions/sub-1'
+                        PrincipalId =
+                            '33333333-3333-3333-3333-333333333333'
+                        PrincipalType = 'User'
+                        RoleDefinitionId =
+                            '/providers/Microsoft.Authorization/roleDefinitions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                        RoleDefinitionGuid =
+                            'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+                    }
+                )
+                SkipToken = if ($SkipToken) { $null } else { 'next' }
+            }
+
+        }
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    AssignmentId = 'source-assignment'
+                    AssignmentScope = '/subscriptions/sub-1'
+                    PrincipalId =
+                        '33333333-3333-3333-3333-333333333333'
+                    PrincipalType = 'User'
+                }
+            )
+        }
+
+        $inventory =
+            Get-RadarPrincipalRoleAssignmentInventory `
+                -BaselineAssignmentInventory $baselineInventory
+
+        $inventory.AssignmentCount | Should -Be 2
+        $inventory.AssignmentsByPrincipalAndScope.Count |
+            Should -Be 1
+        Should -Invoke Search-AzGraph -Times 2
+        Should -Invoke Search-AzGraph -Times 1 -ParameterFilter {
+            $SkipToken -eq 'next'
+        }
+        Should -Invoke Search-AzGraph -ParameterFilter {
+            $UseTenantScope -and
+            -not $Subscription -and
+            -not $ManagementGroup -and
+            $Query -match 'PrincipalId in~' -and
+            $Query -match '(?s)\| project\s+id,'
+        }
+    }
+
+    It 'splits large principal and group filters into bounded queries' {
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @()
+                SkipToken = $null
+            }
+        }
+        $assignments = @(
+            foreach ($index in 1..300) {
+                [pscustomobject]@{
+                    PrincipalId =
+                        ('00000000-0000-0000-0000-{0:D12}' -f $index)
+                    PrincipalType = 'User'
+                }
+            }
+        )
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = $assignments
+        }
+        $directoryEvidence = [pscustomobject]@{
+            IsComplete = $true
+            GroupIds = @(
+                '99999999-9999-9999-9999-999999999999'
+            )
+            Warnings = @()
+        }
+
+        $null = Get-RadarPrincipalRoleAssignmentInventory `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence
+
+        Should -Invoke Search-AzGraph -Times 2
+        Should -Invoke Search-AzGraph -ParameterFilter {
+            $UseTenantScope -and
+            $Query.Length -lt 50000
+        }
+    }
+}
+
+Describe 'Get-RadarPrincipalGap' {
+    BeforeAll {
+        $baselineRoleId =
+            '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+        $grantingRoleId =
+            '/providers/Microsoft.Authorization/roleDefinitions/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa'
+        $ownerRoleId =
+            '/providers/Microsoft.Authorization/roleDefinitions/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+        $principalId =
+            '33333333-3333-3333-3333-333333333333'
+        $subscription = '/subscriptions/sub-1'
+        $managementGroup =
+            '/providers/Microsoft.Management/managementGroups/root'
+        $action = 'Dangerous.Provider/write'
+        $baselineRole = [pscustomobject]@{
+            Name = 'Baseline Owner'
+            Id = $baselineRoleId
+            IsCustom = $true
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('*')
+                    NotActions = @($action)
+                }
+            )
+        }
+        $grantingRole = [pscustomobject]@{
+            Name = 'Dangerous Operator'
+            Id = $grantingRoleId
+            IsCustom = $false
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/*')
+                    NotActions = @()
+                }
+            )
+        }
+        $ownerRole = [pscustomobject]@{
+            Name = 'Owner'
+            Id = $ownerRoleId
+            IsCustom = $false
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('*')
+                    NotActions = @()
+                }
+            )
+        }
+        $assignmentPath = [pscustomobject]@{
+            Name = 'Direct role assignment'
+            ResourceType =
+                'Microsoft.Authorization/roleAssignments'
+            Reachability =
+                'Baseline role can create direct role assignments'
+        }
+        $externalPath = [pscustomobject]@{
+            Name = 'Direct role assignment'
+            ResourceType =
+                'Microsoft.Authorization/roleAssignments'
+            Reachability =
+                'Requires another principal or assignment process'
+        }
+        $policyInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            RulesByScope = @{
+                $subscription = @()
+                $managementGroup.ToLowerInvariant() = @()
+            }
+            ExemptionsByScope = @{
+                $subscription = @()
+                $managementGroup.ToLowerInvariant() = @()
+            }
+            UncertainScopes = @()
+        }
+        $hierarchy = [pscustomobject]@{
+            IsComplete = $true
+            AncestorsByScope = @{
+                $managementGroup.ToLowerInvariant() = @()
+                $subscription.ToLowerInvariant() = @(
+                    $managementGroup
+                )
+            }
+            UnresolvedAncestorRoots = @()
+        }
+    }
+
+    BeforeEach {
+        $context = [pscustomobject]@{
+            BaselineRoleName = 'Baseline Owner'
+            BaselineRoleId = $baselineRoleId
+            BaselineScope = $subscription
+            AssignmentPaths = @($assignmentPath)
+        }
+        $result = [pscustomobject]@{
+            AnalysisMode = 'BaselineNotActions'
+            BaselineRoleName = 'Baseline Owner'
+            BaselineRoleId = $baselineRoleId
+            BaselineScope = $subscription
+            RestrictedAction = $action
+            RoleName = 'Dangerous Operator'
+            RoleId = $grantingRoleId
+            ScopeEvaluations = @(
+                [pscustomobject]@{
+                    Scope = $subscription
+                }
+            )
+        }
+        $sourceAssignment = [pscustomobject]@{
+            AssignmentId = 'source-assignment'
+            AssignmentScope = $subscription
+            RoleDefinitionGuid =
+                '11111111-1111-1111-1111-111111111111'
+            PrincipalId = $principalId
+            PrincipalType = 'User'
+            Condition = ''
+        }
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @($sourceAssignment)
+        }
+        $principalInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @($sourceAssignment)
+            AssignmentsByPrincipalAndScope =
+                New-RadarPrincipalScopeAssignmentIndex `
+                    -Assignments @($sourceAssignment)
+        }
+        $directoryEvidenceItem = [pscustomobject]@{
+            PrincipalId = $principalId
+            PrincipalType = 'User'
+            AccountEnabled = $true
+            GroupIds =
+                New-Object System.Collections.Generic.HashSet[string] (
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+            IsComplete = $true
+            Warnings = @()
+        }
+        $directoryEvidence = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            EvidenceByPrincipal = @{
+                $principalId.ToLowerInvariant() =
+                    $directoryEvidenceItem
+            }
+            GroupIds = @()
+            Warnings = @()
+        }
+        $deniedRoles =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+    }
+
+    It 'reports a holder without the action as a net-new gap' {
+        $gaps = @(
+            Get-RadarPrincipalGap `
+                -Results @($result) `
+                -BaselineContexts @($context) `
+                -BaselineAssignmentInventory $baselineInventory `
+                -DirectoryEvidence $directoryEvidence `
+                -PrincipalAssignmentInventory $principalInventory `
+                -Roles @(
+                    $baselineRole,
+                    $grantingRole,
+                    $ownerRole
+                ) `
+                -Hierarchy $hierarchy `
+                -PolicyInventory $policyInventory `
+                -DeniedRoleNames $deniedRoles
+        )
+
+        $gaps.Count | Should -Be 1
+        $gaps[0].ExistingAccessStatus |
+            Should -Be 'NoExistingAction'
+        $gaps[0].AssignmentPolicyStatus |
+            Should -Be 'Permitted'
+        $gaps[0].NetNewGapStatus | Should -Be 'NetNewGap'
+    }
+
+    It 'caches effective existing-access evidence across candidate roles' {
+        $secondGrantingRole = [pscustomobject]@{
+            Name = 'Dangerous Operator Two'
+            Id =
+                '/providers/Microsoft.Authorization/roleDefinitions/eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee'
+            IsCustom = $false
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/write')
+                    NotActions = @()
+                }
+            )
+        }
+        $secondResult = $result.PSObject.Copy()
+        $secondResult.RoleName = $secondGrantingRole.Name
+        $secondResult.RoleId = $secondGrantingRole.Id
+        Mock Get-RadarEffectivePrincipalAssignments {
+            [pscustomobject]@{
+                IsComplete = $true
+                Assignments = @()
+                Warnings = @()
+            }
+        }
+
+        $gaps = @(
+            Get-RadarPrincipalGap `
+                -Results @($result, $secondResult) `
+                -BaselineContexts @($context) `
+                -BaselineAssignmentInventory $baselineInventory `
+                -DirectoryEvidence $directoryEvidence `
+                -PrincipalAssignmentInventory $principalInventory `
+                -Roles @(
+                    $baselineRole,
+                    $grantingRole,
+                    $secondGrantingRole
+                ) `
+                -Hierarchy $hierarchy `
+                -PolicyInventory $policyInventory `
+                -DeniedRoleNames $deniedRoles `
+                -ExistingAccessCache @{}
+        )
+
+        $gaps.Count | Should -Be 2
+        $gaps.NetNewGapStatus |
+            Should -Not -Contain 'Unknown'
+        Should -Invoke `
+            Get-RadarEffectivePrincipalAssignments `
+            -Times 1
+    }
+
+    It 'classifies an inherited existing action as AlreadyHasAction' {
+        $context.BaselineScope = $managementGroup
+        $result.BaselineScope = $managementGroup
+        $sourceAssignment.AssignmentScope = $managementGroup
+        $ownerAssignment = [pscustomobject]@{
+            AssignmentId = 'owner-assignment'
+            AssignmentScope = $managementGroup
+            RoleDefinitionGuid =
+                'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            PrincipalId = $principalId
+            PrincipalType = 'User'
+            Condition = ''
+        }
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            $ownerAssignment
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole, $ownerRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.ExistingAccessStatus |
+            Should -Be 'AlreadyHasAction'
+        $gap.NetNewGapStatus |
+            Should -Be 'AlreadyHasAction'
+    }
+
+    It 'includes inherited assignments from transitive groups' {
+        $groupId =
+            '44444444-4444-4444-4444-444444444444'
+        [void]$directoryEvidenceItem.GroupIds.Add($groupId)
+        $directoryEvidence.GroupIds = @($groupId)
+        $groupOwnerAssignment = [pscustomobject]@{
+            AssignmentId = 'group-owner-assignment'
+            AssignmentScope = $subscription
+            RoleDefinitionGuid =
+                'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            PrincipalId = $groupId
+            PrincipalType = 'Group'
+            Condition = ''
+        }
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            $groupOwnerAssignment
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole, $ownerRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.ExistingAccessStatus |
+            Should -Be 'AlreadyHasAction'
+        $gap.TransitiveGroupCount | Should -Be 1
+        $gap.NetNewGapStatus |
+            Should -Be 'AlreadyHasAction'
+    }
+
+    It 'keeps disabled and incomplete directory principals non-actionable' {
+        $directoryEvidenceItem.AccountEnabled = $false
+        $disabledGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+        $disabledGap.NetNewGapStatus |
+            Should -Be 'PrincipalDisabled'
+
+        $directoryEvidenceItem.AccountEnabled = $true
+        $directoryEvidenceItem.IsComplete = $false
+        $incompleteGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+        $incompleteGap.NetNewGapStatus |
+            Should -Be 'Unknown'
+    }
+
+    It 'keeps a wildcard write residual actionable after an existing read grant' {
+        $storageRestrictedAction =
+            'Microsoft.Storage/storageAccounts/*'
+        $storageGrantingRole = [pscustomobject]@{
+            Name = 'Storage Writer'
+            Id =
+                '/providers/Microsoft.Authorization/roleDefinitions/cccccccc-cccc-cccc-cccc-cccccccccccc'
+            IsCustom = $false
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @(
+                        'Microsoft.Storage/storageAccounts/*'
+                    )
+                    NotActions = @()
+                }
+            )
+        }
+        $storageBaselineRole = [pscustomobject]@{
+            Name = 'Baseline Owner'
+            Id = $baselineRoleId
+            IsCustom = $true
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('*')
+                    NotActions = @($storageRestrictedAction)
+                }
+            )
+        }
+        $storageReaderRole = [pscustomobject]@{
+            Name = 'Storage Reader'
+            Id =
+                '/providers/Microsoft.Authorization/roleDefinitions/dddddddd-dddd-dddd-dddd-dddddddddddd'
+            IsCustom = $false
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @(
+                        'Microsoft.Storage/storageAccounts/read'
+                    )
+                    NotActions = @()
+                }
+            )
+        }
+        $result.RestrictedAction = $storageRestrictedAction
+        $result.RoleName = 'Storage Writer'
+        $result.RoleId = $storageGrantingRole.Id
+        $readAssignment = [pscustomobject]@{
+            AssignmentId = 'storage-read-assignment'
+            AssignmentScope = $subscription
+            RoleDefinitionGuid =
+                'dddddddd-dddd-dddd-dddd-dddddddddddd'
+            PrincipalId = $principalId
+            PrincipalType = 'User'
+            Condition = ''
+        }
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            $readAssignment
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @(
+                $storageBaselineRole,
+                $storageGrantingRole,
+                $storageReaderRole
+            ) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.ExistingAccessStatus |
+            Should -Be 'NetNewDelta'
+        $gap.NetNewGapStatus | Should -Be 'NetNewGap'
+    }
+
+    It 'classifies collective unconditioned coverage as AlreadyHasAction' {
+        $result.RestrictedAction = 'Dangerous.Provider/*'
+        $grantingRole.Permissions = @(
+            [pscustomobject]@{
+                Actions = @(
+                    'Dangerous.Provider/read',
+                    'Dangerous.Provider/write'
+                )
+                NotActions = @()
+            }
+        )
+        $readerRole = [pscustomobject]@{
+            Name = 'Dangerous Reader'
+            Id =
+                '/providers/Microsoft.Authorization/roleDefinitions/cccccccc-cccc-cccc-cccc-cccccccccccc'
+            IsCustom = $false
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/read')
+                    NotActions = @()
+                }
+            )
+        }
+        $writerRole = [pscustomobject]@{
+            Name = 'Dangerous Writer'
+            Id =
+                '/providers/Microsoft.Authorization/roleDefinitions/dddddddd-dddd-dddd-dddd-dddddddddddd'
+            IsCustom = $false
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/write')
+                    NotActions = @()
+                }
+            )
+        }
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            [pscustomobject]@{
+                AssignmentId = 'reader-assignment'
+                AssignmentScope = $subscription
+                RoleDefinitionGuid =
+                    'cccccccc-cccc-cccc-cccc-cccccccccccc'
+                PrincipalId = $principalId
+                PrincipalType = 'User'
+                Condition = ''
+            },
+            [pscustomobject]@{
+                AssignmentId = 'writer-assignment'
+                AssignmentScope = $subscription
+                RoleDefinitionGuid =
+                    'dddddddd-dddd-dddd-dddd-dddddddddddd'
+                PrincipalId = $principalId
+                PrincipalType = 'User'
+                Condition = ''
+            }
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @(
+                $baselineRole,
+                $grantingRole,
+                $readerRole,
+                $writerRole
+            ) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.ExistingAccessStatus |
+            Should -Be 'AlreadyHasAction'
+        $gap.NetNewGapStatus |
+            Should -Be 'AlreadyHasAction'
+    }
+
+    It 'honours NotActions while allowing another block to regrant' {
+        $candidateRole = [pscustomobject]@{
+            Name = 'Candidate wildcard'
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/*')
+                    NotActions = @()
+                }
+            )
+        }
+        $roleWithExclusion = [pscustomobject]@{
+            Name = 'Wildcard except write'
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/*')
+                    NotActions = @('Dangerous.Provider/write')
+                }
+            )
+        }
+        $writeRegrant = [pscustomobject]@{
+            Name = 'Write regrant'
+            Permissions = @(
+                [pscustomobject]@{
+                    Actions = @('Dangerous.Provider/write')
+                    NotActions = @()
+                }
+            )
+        }
+
+        (
+            Get-RadarExistingCapabilityCoverage `
+                -CandidateRole $candidateRole `
+                -RestrictedAction 'Dangerous.Provider/*' `
+                -ExistingRoles @($roleWithExclusion)
+        ).State | Should -Be 'NetNewDelta'
+        (
+            Get-RadarExistingCapabilityCoverage `
+                -CandidateRole $candidateRole `
+                -RestrictedAction 'Dangerous.Provider/*' `
+                -ExistingRoles @(
+                    $roleWithExclusion,
+                    $writeRegrant
+                )
+        ).State | Should -Be 'Full'
+    }
+
+    It 'emits no principal gap when no source-role holder exists' {
+        $baselineInventory.Assignments = @()
+
+        @(
+            Get-RadarPrincipalGap `
+                -Results @($result) `
+                -BaselineContexts @($context) `
+                -BaselineAssignmentInventory $baselineInventory `
+                -DirectoryEvidence $directoryEvidence `
+                -PrincipalAssignmentInventory $principalInventory `
+                -Roles @($baselineRole, $grantingRole) `
+                -Hierarchy $hierarchy `
+                -PolicyInventory $policyInventory `
+                -DeniedRoleNames $deniedRoles
+        ).Count | Should -Be 0
+    }
+
+    It 'keeps group, missing, conditioned and incomplete evidence unknown' {
+        $sourceAssignment.PrincipalType = 'Group'
+        $groupGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+        $groupGap.NetNewGapStatus | Should -Be 'Unknown'
+
+        $sourceAssignment.PrincipalType = ''
+        $missingTypeGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+        $missingTypeGap.NetNewGapStatus | Should -Be 'Unknown'
+
+        $sourceAssignment.PrincipalType = 'User'
+        $sourceAssignment.Condition = '@Resource[example] StringEquals true'
+        $conditionedGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+        $conditionedGap.NetNewGapStatus | Should -Be 'Unknown'
+
+        $sourceAssignment.Condition = ''
+        $principalInventory.IsComplete = $false
+        $incompleteGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+        $incompleteGap.NetNewGapStatus | Should -Be 'Unknown'
+    }
+
+    It 'keeps a conditioned existing grant unknown' {
+        $conditionedAssignment = [pscustomobject]@{
+            AssignmentId = 'conditioned-assignment'
+            AssignmentScope = $subscription
+            RoleDefinitionGuid =
+                'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            PrincipalId = $principalId
+            PrincipalType = 'User'
+            Condition = '@Resource[example] StringEquals true'
+        }
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            $conditionedAssignment
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole, $ownerRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.ExistingAccessStatus | Should -Be 'Unknown'
+        $gap.NetNewGapStatus | Should -Be 'Unknown'
+    }
+
+    It 'keeps unavailable existing role evidence unknown' {
+        $unsupportedAssignment = [pscustomobject]@{
+            AssignmentId = 'unsupported-assignment'
+            AssignmentScope = $subscription
+            RoleDefinitionGuid =
+                'cccccccc-cccc-cccc-cccc-cccccccccccc'
+            PrincipalId = $principalId
+            PrincipalType = 'User'
+            Condition = ''
+        }
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            $unsupportedAssignment
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.ExistingAccessStatus | Should -Be 'Unknown'
+        $gap.Warnings | Should -Match 'unavailable role definition'
+    }
+
+    It 'does not report a gap when assignment policy blocks the role' {
+        [void]$deniedRoles.Add('Dangerous Operator')
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.AssignmentPolicyStatus | Should -Be 'Blocked'
+        $gap.NetNewGapStatus | Should -Be 'PolicyBlocked'
+    }
+
+    It 'keeps exact-scope policy discovery uncertainty non-actionable' {
+        $policyInventory.UncertainScopes = @(
+            $subscription.ToLowerInvariant()
+        )
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.AssignmentPolicyStatus | Should -Be 'Unknown'
+        $gap.NetNewGapStatus | Should -Be 'Unknown'
+        $gap.Warnings |
+            Should -Match 'discovery was incomplete'
+    }
+
+    It 'does not treat an external-only assignment path as actionable' {
+        $context.AssignmentPaths = @($externalPath)
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.AssignmentPolicyStatus |
+            Should -Be 'NoBaselineReachablePath'
+        $gap.NetNewGapStatus |
+            Should -Be 'NoBaselineReachablePath'
+    }
+}
+
+Describe 'Principal-gap reporting' {
+    It 'skips principal correlation and exports only headers when disabled' {
+        $mainSource =
+            Get-Content -LiteralPath $scriptPath -Raw
+        $assignmentStart =
+            $mainSource.IndexOf('$principalGaps = @(')
+        $assignmentEnd =
+            $mainSource.IndexOf(
+                '$exactControlGapMap = @(',
+                $assignmentStart
+            )
+        $assignmentStart | Should -BeGreaterOrEqual 0
+        $assignmentEnd | Should -BeGreaterThan $assignmentStart
+        $principalAssignment = $mainSource.Substring(
+            $assignmentStart,
+            $assignmentEnd - $assignmentStart
+        )
+        Mock Get-RadarPrincipalGap {
+            throw 'Principal correlation should have been skipped.'
+        }
+        $NoPrincipalCorrelation = $true
+
+        . ([ScriptBlock]::Create($principalAssignment))
+
+        @($principalGaps).Count | Should -Be 0
+        Should -Invoke Get-RadarPrincipalGap -Times 0
+        $path = Join-Path $TestDrive 'disabled-principal-gaps.csv'
+        Export-RadarPrincipalGap -Rows $principalGaps -Path $path
+        $content = Get-Content -LiteralPath $path -Raw
+        $content | Should -Match '"PrincipalId"'
+        @($content.Trim() -split "`n").Count | Should -Be 1
+    }
+
+    It 'exports an empty atomic report with headers' {
+        $path = Join-Path $TestDrive 'radar-principal-gaps.csv'
+
+        Export-RadarPrincipalGap -Rows @() -Path $path
+
+        Test-Path -LiteralPath $path | Should -BeTrue
+        (Get-Content -LiteralPath $path -Raw) |
+            Should -Match '"NetNewGapStatus"'
+        @(
+            Get-ChildItem `
+                -LiteralPath $TestDrive `
+                -Filter '*.tmp.*'
+        ).Count | Should -Be 0
+    }
+
+    It 'adds net-new counts and roles to scope-map rows' {
+        $row = [pscustomobject]@{
+            BaselineRoleId = 'baseline-role'
+            BaselineScope = '/subscriptions/sub-1'
+            EvaluationScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            BaselineAssignmentState = 'DirectAssignmentObserved'
+        }
+        $principalGap = [pscustomobject]@{
+            PrincipalId = 'principal-placeholder'
+            PrincipalType = 'User'
+            BaselineRoleId = 'baseline-role'
+            BaselineScope = '/subscriptions/sub-1'
+            EvaluationScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            GrantingRoleName = 'Dangerous Operator'
+            GrantingRoleId = 'granting-role'
+            NetNewGapStatus = 'NetNewGap'
+            Warnings = ''
+        }
+
+        $summary = Add-RadarPrincipalGapSummary `
+            -Rows @($row) `
+            -PrincipalGaps @($principalGap)
+
+        $summary.PrincipalGapStatus | Should -Be 'NetNewGap'
+        $summary.NetNewGapActionCount | Should -Be 1
+        $summary.NetNewGapPrincipalCount | Should -Be 1
+        $summary.NetNewGapPrincipals |
+            Should -Be 'principal-placeholder [User]'
+        $summary.NetNewGapRoleCount | Should -Be 1
+        $summary.NetNewGapRoles |
+            Should -Match 'Dangerous Operator'
+    }
+
+    It 'marks a complete no-holder scope as dormant rather than a gap' {
+        $row = [pscustomobject]@{
+            BaselineRoleId = 'baseline-role'
+            BaselineScope = '/subscriptions/sub-1'
+            EvaluationScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            BaselineAssignmentState = 'NoDirectAssignment'
+        }
+
+        $summary = Add-RadarPrincipalGapSummary `
+            -Rows @($row) `
+            -PrincipalGaps @()
+
+        $summary.PrincipalGapStatus |
+            Should -Be 'NoObservedHolder'
+        $summary.NetNewGapActionCount | Should -Be 0
+        $summary.NetNewGapPrincipalCount | Should -Be 0
+    }
+}
+
 Describe 'Get-RadarBaselineAssignmentEvidenceMap' {
     It 'applies an assignment downwards but never upwards' {
         $root =
@@ -3802,6 +4913,7 @@ Describe 'Control-gap scope map' {
         $map[0].BaselineAssignableRoleCount | Should -Be 0
         $map[0].ExternalAssignmentRoleCount | Should -Be 1
         $map[0].BaselineAccessStatus | Should -Be 'ExternalOnly'
+        $map[0].PolicyControlledRoleCount | Should -Be 1
         $map[0].ExternalAssignmentRoles |
             Should -Match 'Contributor'
     }
@@ -3916,6 +5028,134 @@ Describe 'Control-gap scope map' {
         $map[0].BaselineAssignableRoleCount | Should -Be 1
         $map[0].ExternalAssignmentRoleCount | Should -Be 1
         $map[0].BaselineAccessStatus | Should -Be 'BaselineCapable'
+    }
+}
+
+Describe 'Add-RadarSubtreeControlPosture' {
+    It 'reproduces descendant deny-list posture at each parent scope' {
+        $root =
+            '/providers/Microsoft.Management/managementGroups/customer'
+        $subscription = '/subscriptions/sub-1'
+        $common = @{
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = $root
+            RestrictedAction = 'Dangerous.Provider/write'
+            IntentSource = 'Customer-Platform-Owner NotActions'
+            GapStatus = 'Gap'
+            ConfirmedGapRoles = 'Role A [role-a]; Role B [role-b]'
+            UnknownRoles = ''
+            CoveredRoles = ''
+        }
+        $rows = @(
+            [pscustomobject]($common + @{
+                EvaluationScopeType = 'ManagementGroup'
+                EvaluationScopeName = 'Customer'
+                EvaluationScope = $root
+                ParentScopeName = ''
+                ParentScope = ''
+                AncestorScopes = ''
+                PolicyControlledRoles = ''
+            }),
+            [pscustomobject]($common + @{
+                EvaluationScopeType = 'Subscription'
+                EvaluationScopeName = 'Workload'
+                EvaluationScope = $subscription
+                ParentScopeName = 'Customer'
+                ParentScope = $root
+                AncestorScopes = $root
+                PolicyControlledRoles = 'Role A [role-a]'
+            })
+        )
+
+        $posture = @(
+            Add-RadarSubtreeControlPosture -Rows $rows
+        )
+        $rootRow = $posture |
+            Where-Object { $_.EvaluationScope -eq $root }
+        $subscriptionRow = $posture |
+            Where-Object {
+                $_.EvaluationScope -eq $subscription
+            }
+
+        $rootRow.SubtreeControlStatus | Should -Be 'Gap'
+        $rootRow.SubtreeControlledRoles |
+            Should -Be 'Role A [role-a]'
+        $rootRow.SubtreeGapRoles |
+            Should -Be 'Role B [role-b]'
+        $subscriptionRow.SubtreeControlledRoles |
+            Should -Be 'Role A [role-a]'
+        $subscriptionRow.SubtreeGapRoles |
+            Should -Be 'Role B [role-b]'
+    }
+
+    It 'includes policy controls below a subscription' {
+        $subscription = '/subscriptions/sub-1'
+        $resourceGroup =
+            '/subscriptions/sub-1/resourceGroups/workload'
+        $result = [pscustomobject]@{
+            AnalysisMode = 'BaselineNotActions'
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = $subscription
+            RestrictedAction = 'Dangerous.Provider/write'
+            RoleName = 'Role A'
+            RoleId = 'role-a'
+            ScopeEvaluations = @(
+                [pscustomobject]@{
+                    Scope = $subscription
+                    GapStatus = 'Gap'
+                    BlockingPolicies = @()
+                    BlockedAssignmentPaths = @()
+                    UnblockedAssignmentPaths = @(
+                        'Direct role assignment'
+                    )
+                    BaselineAssignablePaths = @(
+                        'Direct role assignment'
+                    )
+                    ExternalAssignmentPaths = @()
+                    UnknownReasons = @()
+                },
+                [pscustomobject]@{
+                    Scope = $resourceGroup
+                    GapStatus = 'Covered'
+                    BlockingPolicies = @(
+                        'Deny role assignment'
+                    )
+                    BlockedAssignmentPaths = @(
+                        'Direct role assignment'
+                    )
+                    UnblockedAssignmentPaths = @()
+                    BaselineAssignablePaths = @()
+                    ExternalAssignmentPaths = @()
+                    UnknownReasons = @()
+                }
+            )
+        }
+        $hierarchy = [pscustomobject]@{
+            AncestorsByScope = @{
+                $subscription.ToLowerInvariant() = @()
+            }
+        }
+
+        $exactAndEvidence = @(
+            Get-RadarControlGapMap `
+                -Results @($result) `
+                -Hierarchy $hierarchy `
+                -IncludeSubtreeControlEvidence
+        )
+        $posture = @(
+            Add-RadarSubtreeControlPosture `
+                -Rows $exactAndEvidence
+        )
+
+        $posture.Count | Should -Be 1
+        $posture[0].EvaluationScope |
+            Should -Be $subscription
+        $posture[0].SubtreeControlStatus |
+            Should -Be 'Covered'
+        $posture[0].SubtreeControlledRoles |
+            Should -Match 'Role A'
     }
 }
 
@@ -4106,8 +5346,15 @@ Describe 'ConvertTo-RadarHtmlReport' {
                 BaselinePrincipalTypes = 'User'
                 BaselineAssignmentScopes = '/subscriptions/sub-1'
                 AssignmentWarnings = ''
+                PrincipalGapStatus = 'NetNewGap'
+                NetNewGapRoles = 'Owner [role-1]'
+                NetNewGapPrincipals =
+                    'principal-placeholder [User]'
                 BaselineAssignableRoles = 'Owner [role-1]'
                 ExternalAssignmentRoles = 'Owner [role-1]'
+                SubtreeControlStatus = 'Gap'
+                SubtreeGapRoles = 'Owner [role-1]'
+                SubtreeControlledRoles = ''
                 BlockingPolicies = ''
             }
         )
@@ -4121,7 +5368,16 @@ Describe 'ConvertTo-RadarHtmlReport' {
                 ) `
                 -RolesScanned 1 `
                 -IncludeCustomRoles $true `
+                -BaselineContextCount 1 `
                 -ControlGapMap $controlGapMap `
+                -PrincipalGaps @(
+                    [pscustomobject]@{
+                        PrincipalId = 'principal-placeholder'
+                        RestrictedAction =
+                            'Dangerous.Provider/write'
+                        NetNewGapStatus = 'NetNewGap'
+                    }
+                ) `
                 -MapOnly
         }
 
@@ -4132,6 +5388,11 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html | Should -Not -Match 'No matches found'
         $html | Should -Not -Match 'id="filter"'
         $html | Should -Match '1 direct-assigned'
+        $html | Should -Match '1 net-new gaps'
+        $html |
+            Should -Match 'principal-placeholder \[User\]'
+        $html | Should -Match '1 remediation gaps'
+        $html | Should -Match 'roles missing from subtree controls'
         $html |
             Should -Match 'actions with a direct baseline assignment'
         $html | Should -Match 'direct baseline assignment scopes'
@@ -4448,6 +5709,13 @@ Describe 'Invoke-Radar end-to-end empty result' {
             Should -Match 'No matches found'
         Test-Path -LiteralPath "$outputCsv.manifest.json" |
             Should -BeTrue
+        $principalGapPath =
+            Get-RadarPrincipalGapCsvPath `
+                -MatchCsvPath $outputCsv
+        Test-Path -LiteralPath $principalGapPath |
+            Should -BeTrue
+        (Get-Content -LiteralPath $principalGapPath -Raw) |
+            Should -Match '"NetNewGapStatus"'
     }
 
     It 'derives full deny coverage from a live policy assignment' {
