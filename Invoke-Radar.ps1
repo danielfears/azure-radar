@@ -781,6 +781,9 @@ resourcecontainers
                                 }
                             }
                         )
+                        # Resource Graph returns immediate parent first; the
+                        # live hierarchy walker stores root first.
+                        [array]::Reverse($ancestorIds)
                         $subscriptionScope =
                             "/subscriptions/$subscriptionId"
                         $subscriptionKey =
@@ -1943,6 +1946,8 @@ function ConvertTo-RadarHtmlReport {
 
         [object[]]$BaselineSummaries = @(),
 
+        [object[]]$ControlGapMap = @(),
+
         [int]$PolicyAssignmentCount = 0,
 
         [int]$RoleDenyRuleCount = 0,
@@ -1958,6 +1963,7 @@ function ConvertTo-RadarHtmlReport {
     $resultArray = @($Results)
     $discoveryWarningArray = @($DiscoveryWarnings)
     $sourceRoleNameArray = @($SourceRoleNames)
+    $controlGapMapArray = @($ControlGapMap)
     $totalMatches = $resultArray.Count
     $uniqueRolesAffected = (
         $resultArray |
@@ -2143,6 +2149,59 @@ function ConvertTo-RadarHtmlReport {
   }
   .warning ul { margin: 8px 0 0; padding-left: 20px; }
   .warning li { padding: 2px 0; }
+  .scope-map-wrap { overflow-x: auto; margin-top: 12px; }
+  .scope-map-table td {
+    white-space: normal; vertical-align: top; min-width: 110px;
+  }
+  .scope-map-table td.scope-id {
+    min-width: 260px; overflow-wrap: anywhere;
+  }
+  .scope-map-table details summary {
+    cursor: pointer; color: var(--accent); white-space: nowrap;
+  }
+  .scope-map-table .list {
+    margin-top: 6px; max-width: 520px;
+    overflow-wrap: anywhere; line-height: 1.45;
+  }
+  .scope-tree, .scope-tree ul {
+    list-style: none; margin: 0; padding-left: 24px;
+    position: relative;
+  }
+  .scope-tree { padding-left: 0; margin-top: 16px; }
+  .scope-tree ul::before {
+    content: ""; position: absolute; top: 0; bottom: 16px;
+    left: 9px; border-left: 1px solid var(--border);
+  }
+  .scope-node { position: relative; margin: 10px 0; }
+  .scope-tree ul > .scope-node::before {
+    content: ""; position: absolute; top: 18px; left: -15px;
+    width: 15px; border-top: 1px solid var(--border);
+  }
+  .scope-card {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 12px;
+  }
+  .scope-card summary {
+    cursor: pointer; display: flex; gap: 8px;
+    align-items: center; flex-wrap: wrap;
+  }
+  .scope-card .scope-title { font-weight: 600; }
+  .scope-card .scope-type {
+    color: var(--accent); font-size: 11px; text-transform: uppercase;
+  }
+  .scope-card .scope-count {
+    border-radius: 999px; padding: 1px 8px; font-size: 11px;
+  }
+  .scope-card .scope-count.gap {
+    color: var(--danger); border: 1px solid rgba(255,92,122,.45);
+  }
+  .scope-card .scope-count.unknown {
+    color: var(--warn); border: 1px solid rgba(255,184,107,.45);
+  }
+  .scope-card .scope-count.covered {
+    color: var(--ok); border: 1px solid rgba(91,227,177,.4);
+  }
+  .scope-node-content { margin-top: 10px; }
 
   .compliance {
     display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
@@ -2330,6 +2389,436 @@ function ConvertTo-RadarHtmlReport {
             )
         }
         [void]$sb.AppendLine('</ul></details>')
+    }
+
+    if ($controlGapMapArray.Count -gt 0) {
+        $collectDelimitedValues = {
+            param(
+                [object[]]$Rows,
+                [string]$Property
+            )
+            @(
+                $Rows |
+                    ForEach-Object {
+                        [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $_ `
+                                -Name $Property
+                        ) -split '; '
+                    } |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    } |
+                    Sort-Object -Unique
+            )
+        }
+        $scopeMapSummaries = @(
+            $controlGapMapArray |
+                Group-Object {
+                    @(
+                        $_.EvaluationScope,
+                        $_.BaselineRoleId
+                    ) -join [char]31
+                } |
+                ForEach-Object {
+                    $rows = @($_.Group)
+                    $first = $rows[0]
+                    $gapRows = @(
+                        $rows |
+                            Where-Object {
+                                $_.GapStatus -eq 'Gap'
+                            }
+                    )
+                    $unknownRows = @(
+                        $rows |
+                            Where-Object {
+                                $_.GapStatus -eq 'Unknown'
+                            }
+                    )
+                    $coveredRows = @(
+                        $rows |
+                            Where-Object {
+                                $_.GapStatus -eq 'Covered'
+                            }
+                    )
+                    [pscustomobject]@{
+                        EvaluationScopeType =
+                            $first.EvaluationScopeType
+                        EvaluationScopeName =
+                            $first.EvaluationScopeName
+                        EvaluationScope =
+                            $first.EvaluationScope
+                        ParentScopeName = [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $first `
+                                -Name 'ParentScopeName'
+                        )
+                        ParentScope = [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $first `
+                                -Name 'ParentScope'
+                        )
+                        AncestorScopes = [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $first `
+                                -Name 'AncestorScopes'
+                        )
+                        BaselineRoleName =
+                            $first.BaselineRoleName
+                        GapActions = @(
+                            $gapRows.RestrictedAction |
+                                Sort-Object -Unique
+                        )
+                        BaselineAssignableRoles = @(
+                            & $collectDelimitedValues `
+                                $gapRows `
+                                'BaselineAssignableRoles'
+                        )
+                        ExternalAssignmentRoles = @(
+                            & $collectDelimitedValues `
+                                $gapRows `
+                                'ExternalAssignmentRoles'
+                        )
+                        UnknownActions = @(
+                            $unknownRows.RestrictedAction |
+                                Sort-Object -Unique
+                        )
+                        CoveredActions = @(
+                            $coveredRows.RestrictedAction |
+                                Sort-Object -Unique
+                        )
+                        BlockingPolicies = @(
+                            & $collectDelimitedValues `
+                                $rows `
+                                'BlockingPolicies'
+                        )
+                    }
+                } |
+                Sort-Object `
+                    EvaluationScopeType,
+                    EvaluationScopeName,
+                    BaselineRoleName
+        )
+        $scopeCountInMap = @(
+            $controlGapMapArray.EvaluationScope |
+                Sort-Object -Unique
+        ).Count
+        $gapRowCount = @(
+            $controlGapMapArray |
+                Where-Object { $_.GapStatus -eq 'Gap' }
+        ).Count
+        $unknownRowCount = @(
+            $controlGapMapArray |
+                Where-Object { $_.GapStatus -eq 'Unknown' }
+        ).Count
+        $coveredRowCount = @(
+            $controlGapMapArray |
+                Where-Object { $_.GapStatus -eq 'Covered' }
+        ).Count
+        $renderMapList = {
+            param(
+                [object[]]$Values,
+                [string]$Label
+            )
+            if (@($Values).Count -eq 0) { return '0' }
+            return (
+                '<details><summary>' +
+                @($Values).Count +
+                ' ' +
+                (ConvertTo-HtmlSafe $Label) +
+                '</summary><div class="list code">' +
+                (ConvertTo-HtmlSafe (@($Values) -join '; ')) +
+                '</div></details>'
+            )
+        }
+
+        [void]$sb.AppendLine(
+            '<details class="actions-list" open><summary>' +
+            'MG/subscription control-gap map (' +
+            $scopeCountInMap +
+            ' scopes)</summary>'
+        )
+        [void]$sb.AppendLine(
+            '<p class="note">Scope-first view of baseline NotAction intent, ' +
+            'roles that still grant each action, and policy coverage. ' +
+            "$gapRowCount confirmed gap rows, $unknownRowCount unknown rows, " +
+            "$coveredRowCount covered rows. The companion scope-map CSV " +
+            'contains one normalised row per scope, baseline and action.</p>'
+        )
+
+        $rootNodeKey = '__RADAR_ROOT__'
+        $scopeNodeById = @{}
+        foreach ($summary in $scopeMapSummaries) {
+            $nodeKey =
+                $summary.EvaluationScope.TrimEnd('/').
+                    ToLowerInvariant()
+            if (-not $scopeNodeById.ContainsKey($nodeKey)) {
+                $scopeNodeById[$nodeKey] = [pscustomobject]@{
+                    Id = $summary.EvaluationScope
+                    Name = $summary.EvaluationScopeName
+                    Type = $summary.EvaluationScopeType
+                    ParentScope = $summary.ParentScope
+                    AncestorScopes = $summary.AncestorScopes
+                    EffectiveParentScope = ''
+                    Summaries =
+                        New-Object System.Collections.Generic.List[object]
+                }
+            }
+            [void]$scopeNodeById[$nodeKey].Summaries.Add(
+                $summary
+            )
+        }
+        $childrenByParent = @{}
+        foreach ($nodeKey in $scopeNodeById.Keys) {
+            $node = $scopeNodeById[$nodeKey]
+            $ancestorIds = @(
+                [string]$node.AncestorScopes -split '; ' |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    }
+            )
+            if (
+                $ancestorIds.Count -eq 0 -and
+                -not [string]::IsNullOrWhiteSpace(
+                    $node.ParentScope
+                )
+            ) {
+                $ancestorIds = @($node.ParentScope)
+            }
+            $parentKey = $rootNodeKey
+            for (
+                $ancestorIndex = $ancestorIds.Count - 1;
+                $ancestorIndex -ge 0;
+                $ancestorIndex--
+            ) {
+                $candidateParentKey =
+                    $ancestorIds[$ancestorIndex].
+                        TrimEnd('/').
+                        ToLowerInvariant()
+                if (
+                    $candidateParentKey -ne $nodeKey -and
+                    $scopeNodeById.ContainsKey(
+                        $candidateParentKey
+                    )
+                ) {
+                    $parentKey = $candidateParentKey
+                    break
+                }
+            }
+            if ($parentKey -ne $rootNodeKey) {
+                $node.EffectiveParentScope =
+                    $scopeNodeById[$parentKey].Id
+            }
+            if (-not $childrenByParent.ContainsKey($parentKey)) {
+                $childrenByParent[$parentKey] =
+                    New-Object System.Collections.Generic.List[string]
+            }
+            [void]$childrenByParent[$parentKey].Add($nodeKey)
+        }
+
+        $renderScopeNode = {
+            param(
+                [string]$NodeKey,
+                [int]$Depth
+            )
+            $node = $scopeNodeById[$NodeKey]
+            $nodeSummaries = @($node.Summaries.ToArray())
+            $nodeGapActions = @(
+                $nodeSummaries.GapActions |
+                    Sort-Object -Unique
+            )
+            $nodeUnknownActions = @(
+                $nodeSummaries.UnknownActions |
+                    Sort-Object -Unique
+            )
+            $nodeCoveredActions = @(
+                $nodeSummaries.CoveredActions |
+                    Sort-Object -Unique
+            )
+            $openAttribute = if ($Depth -eq 0) {
+                ' open'
+            }
+            else {
+                ''
+            }
+            [void]$sb.AppendLine(
+                '<li class="scope-node" data-scope-id="' +
+                (ConvertTo-HtmlSafe $node.Id) +
+                '" data-parent-scope="' +
+                (ConvertTo-HtmlSafe $node.EffectiveParentScope) +
+                '">'
+            )
+            [void]$sb.AppendLine(
+                '<details class="scope-card"' +
+                $openAttribute +
+                '><summary><span class="scope-title">' +
+                (ConvertTo-HtmlSafe $node.Name) +
+                '</span><span class="scope-type">' +
+                (ConvertTo-HtmlSafe $node.Type) +
+                '</span><span class="scope-count gap">' +
+                $nodeGapActions.Count +
+                ' gap actions</span><span class="scope-count unknown">' +
+                $nodeUnknownActions.Count +
+                ' unknown</span><span class="scope-count covered">' +
+                $nodeCoveredActions.Count +
+                ' covered</span></summary>'
+            )
+            [void]$sb.AppendLine(
+                '<div class="scope-node-content"><div class="code">' +
+                (ConvertTo-HtmlSafe $node.Id) +
+                '</div><div class="scope-map-wrap">' +
+                '<table class="scope-map-table"><thead><tr>' +
+                '<th>Baseline</th><th>Gap actions</th>' +
+                '<th>Baseline-assignable roles</th>' +
+                '<th>External-process roles</th>' +
+                '<th>Unknown actions</th><th>Covered actions</th>' +
+                '<th>Blocking policies</th></tr></thead><tbody>'
+            )
+            foreach (
+                $summary in @(
+                    $nodeSummaries |
+                        Sort-Object BaselineRoleName
+                )
+            ) {
+                [void]$sb.AppendLine('<tr>')
+                [void]$sb.AppendLine(
+                    '<td>' +
+                    (ConvertTo-HtmlSafe $summary.BaselineRoleName) +
+                    '</td><td>' +
+                    (& $renderMapList $summary.GapActions 'actions') +
+                    '</td><td>' +
+                    (& $renderMapList `
+                        $summary.BaselineAssignableRoles `
+                        'roles') +
+                    '</td><td>' +
+                    (& $renderMapList `
+                        $summary.ExternalAssignmentRoles `
+                        'roles') +
+                    '</td><td>' +
+                    (& $renderMapList `
+                        $summary.UnknownActions `
+                        'actions') +
+                    '</td><td>' +
+                    (& $renderMapList `
+                        $summary.CoveredActions `
+                        'actions') +
+                    '</td><td>' +
+                    (& $renderMapList `
+                        $summary.BlockingPolicies `
+                        'policies') +
+                    '</td>'
+                )
+                [void]$sb.AppendLine('</tr>')
+            }
+            [void]$sb.AppendLine(
+                '</tbody></table></div></div></details>'
+            )
+            if ($childrenByParent.ContainsKey($NodeKey)) {
+                [void]$sb.AppendLine('<ul>')
+                foreach (
+                    $childKey in @(
+                        $childrenByParent[$NodeKey] |
+                            Sort-Object {
+                                @(
+                                    $scopeNodeById[$_].Type,
+                                    $scopeNodeById[$_].Name
+                                ) -join [char]31
+                            }
+                    )
+                ) {
+                    & $renderScopeNode $childKey ($Depth + 1)
+                }
+                [void]$sb.AppendLine('</ul>')
+            }
+            [void]$sb.AppendLine('</li>')
+        }
+
+        [void]$sb.AppendLine('<ul class="scope-tree">')
+        foreach (
+            $rootChildKey in @(
+                $childrenByParent[$rootNodeKey] |
+                    Sort-Object {
+                        @(
+                            $scopeNodeById[$_].Type,
+                            $scopeNodeById[$_].Name
+                        ) -join [char]31
+                    }
+            )
+        ) {
+            & $renderScopeNode $rootChildKey 0
+        }
+        [void]$sb.AppendLine('</ul>')
+
+        [void]$sb.AppendLine(
+            '<details><summary>Flat scope summary table</summary>'
+        )
+        [void]$sb.AppendLine(
+            '<div class="scope-map-wrap"><table class="scope-map-table">' +
+            '<thead><tr><th>Scope</th><th>Baseline</th>' +
+            '<th>Gap actions</th><th>Baseline-assignable roles</th>' +
+            '<th>External-process roles</th><th>Unknown actions</th>' +
+            '<th>Covered actions</th><th>Blocking policies</th>' +
+            '</tr></thead><tbody>'
+        )
+        foreach ($summary in $scopeMapSummaries) {
+            $scopeLabel = (
+                "$($summary.EvaluationScopeName) " +
+                "($($summary.EvaluationScopeType))"
+            )
+            [void]$sb.AppendLine('<tr>')
+            [void]$sb.AppendLine(
+                '<td class="scope-id"><strong>' +
+                (ConvertTo-HtmlSafe $scopeLabel) +
+                '</strong><div class="code">' +
+                (ConvertTo-HtmlSafe $summary.EvaluationScope) +
+                '</div></td>'
+            )
+            [void]$sb.AppendLine(
+                '<td>' +
+                (ConvertTo-HtmlSafe $summary.BaselineRoleName) +
+                '</td>'
+            )
+            [void]$sb.AppendLine(
+                '<td>' +
+                (& $renderMapList $summary.GapActions 'actions') +
+                '</td>'
+            )
+            [void]$sb.AppendLine(
+                '<td>' +
+                (& $renderMapList `
+                    $summary.BaselineAssignableRoles `
+                    'roles') +
+                '</td>'
+            )
+            [void]$sb.AppendLine(
+                '<td>' +
+                (& $renderMapList `
+                    $summary.ExternalAssignmentRoles `
+                    'roles') +
+                '</td>'
+            )
+            [void]$sb.AppendLine(
+                '<td>' +
+                (& $renderMapList $summary.UnknownActions 'actions') +
+                '</td>'
+            )
+            [void]$sb.AppendLine(
+                '<td>' +
+                (& $renderMapList $summary.CoveredActions 'actions') +
+                '</td>'
+            )
+            [void]$sb.AppendLine(
+                '<td>' +
+                (& $renderMapList `
+                    $summary.BlockingPolicies `
+                    'policies') +
+                '</td>'
+            )
+            [void]$sb.AppendLine('</tr>')
+        }
+        [void]$sb.AppendLine(
+            '</tbody></table></div></details></details>'
+        )
     }
 
     # Toolbar / filter.
@@ -5724,6 +6213,7 @@ function Get-RadarRoleDenyCoverage {
         Get-RadarPropertyValue -InputObject $Role -Name 'Name'
     )
     $roleKey = Get-RadarRoleKey -Role $Role
+    $uniqueRoleScopes = @($RoleScopes | Sort-Object -Unique)
     if (
         $DeniedRoleNames -and
         $DeniedRoleNames.Contains($roleName)
@@ -5738,6 +6228,25 @@ function Get-RadarRoleDenyCoverage {
             UnblockedScopes = @()
             UnblockedAssignmentPaths = @()
             UnknownReasons = @()
+            ScopeEvaluations = @(
+                foreach ($roleScope in $uniqueRoleScopes) {
+                    [pscustomobject]@{
+                        Scope = $roleScope
+                        GapStatus = 'Covered'
+                        BlockingPolicies = @(
+                            'Denied-roles CSV supplement'
+                        )
+                        BlockedAssignmentPaths = @(
+                            $AssignmentPaths |
+                                ForEach-Object { $_.Name }
+                        )
+                        UnblockedAssignmentPaths = @()
+                        BaselineAssignablePaths = @()
+                        ExternalAssignmentPaths = @()
+                        UnknownReasons = @()
+                    }
+                }
+            )
         }
     }
 
@@ -5758,6 +6267,47 @@ function Get-RadarRoleDenyCoverage {
                 }
             )
             UnknownReasons = @('Live policy discovery was disabled.')
+            ScopeEvaluations = @(
+                foreach ($roleScope in $uniqueRoleScopes) {
+                    [pscustomobject]@{
+                        Scope = $roleScope
+                        GapStatus = 'NotEvaluated'
+                        BlockingPolicies = @()
+                        BlockedAssignmentPaths = @()
+                        UnblockedAssignmentPaths = @(
+                            $AssignmentPaths |
+                                ForEach-Object { $_.Name }
+                        )
+                        BaselineAssignablePaths = @(
+                            $AssignmentPaths |
+                                Where-Object {
+                                    (
+                                        Get-RadarPropertyValue `
+                                            -InputObject $_ `
+                                            -Name 'Reachability'
+                                    ) -like
+                                        'Baseline role can create*'
+                                } |
+                                ForEach-Object { $_.Name }
+                        )
+                        ExternalAssignmentPaths = @(
+                            $AssignmentPaths |
+                                Where-Object {
+                                    (
+                                        Get-RadarPropertyValue `
+                                            -InputObject $_ `
+                                            -Name 'Reachability'
+                                    ) -notlike
+                                        'Baseline role can create*'
+                                } |
+                                ForEach-Object { $_.Name }
+                        )
+                        UnknownReasons = @(
+                            'Live policy discovery was disabled.'
+                        )
+                    }
+                }
+            )
         }
     }
 
@@ -5771,6 +6321,8 @@ function Get-RadarRoleDenyCoverage {
     $unblockedAssignmentPaths =
         New-Object System.Collections.Generic.List[string]
     $unknownReasons = New-Object System.Collections.Generic.List[string]
+    $scopeEvaluations =
+        New-Object System.Collections.Generic.List[object]
     $policyUncertainScopes = @(
         Get-RadarPropertyValue `
             -InputObject $PolicyInventory `
@@ -5778,6 +6330,20 @@ function Get-RadarRoleDenyCoverage {
     )
     foreach ($roleScope in @($RoleScopes | Sort-Object -Unique)) {
         $scopeUnknown = $false
+        $scopeBlockingPolicies =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        $scopeBlockedPaths =
+            New-Object System.Collections.Generic.List[string]
+        $scopeUnblockedPaths =
+            New-Object System.Collections.Generic.List[string]
+        $scopeBaselineAssignablePaths =
+            New-Object System.Collections.Generic.List[string]
+        $scopeExternalAssignmentPaths =
+            New-Object System.Collections.Generic.List[string]
+        $scopeUnknownReasons =
+            New-Object System.Collections.Generic.List[string]
         $normalisedRoleScope = $roleScope.TrimEnd('/')
         if ([string]::IsNullOrWhiteSpace($normalisedRoleScope)) {
             $normalisedRoleScope = '/'
@@ -5787,9 +6353,10 @@ function Get-RadarRoleDenyCoverage {
             $policyUncertainScopes -contains $scopeKey
         ) {
             $scopeUnknown = $true
-            [void]$unknownReasons.Add(
+            $reason =
                 "Policy or exemption discovery was incomplete at '$roleScope'."
-            )
+            [void]$unknownReasons.Add($reason)
+            [void]$scopeUnknownReasons.Add($reason)
         }
         $rules = if ($PolicyInventory.RulesByScope.ContainsKey($scopeKey)) {
             @($PolicyInventory.RulesByScope[$scopeKey])
@@ -5821,9 +6388,10 @@ function Get-RadarRoleDenyCoverage {
                 }
                 if ($rule.UnsupportedReason) {
                     $pathUnknown = $true
-                    [void]$unknownReasons.Add(
+                    $reason =
                         "$($rule.AssignmentName): $($rule.UnsupportedReason)"
-                    )
+                    [void]$unknownReasons.Add($reason)
+                    [void]$scopeUnknownReasons.Add($reason)
                     continue
                 }
 
@@ -5834,9 +6402,10 @@ function Get-RadarRoleDenyCoverage {
                 if ($applicability.State -eq 'Excluded') { continue }
                 if ($applicability.State -eq 'Unknown') {
                     $pathUnknown = $true
-                    [void]$unknownReasons.Add(
+                    $reason =
                         "$($rule.AssignmentName): $($applicability.Reason)"
-                    )
+                    [void]$unknownReasons.Add($reason)
+                    [void]$scopeUnknownReasons.Add($reason)
                     continue
                 }
 
@@ -5914,29 +6483,56 @@ function Get-RadarRoleDenyCoverage {
                 }
                 if ($evaluation.State -eq 'Blocked') {
                     $pathBlocked = $true
-                    [void]$blockingPolicies.Add(
+                    $policyEvidence =
                         "$($rule.AssignmentName) [$($rule.AssignmentScope)] via $($assignmentPath.Name)"
-                    )
+                    [void]$blockingPolicies.Add($policyEvidence)
+                    [void]$scopeBlockingPolicies.Add($policyEvidence)
                 }
                 elseif ($evaluation.State -eq 'Unknown') {
                     $pathUnknown = $true
-                    [void]$unknownReasons.Add(
+                    $reason =
                         "$($rule.AssignmentName) via $($assignmentPath.Name): $($evaluation.Reason)"
-                    )
+                    [void]$unknownReasons.Add($reason)
+                    [void]$scopeUnknownReasons.Add($reason)
                 }
             }
 
             if ($pathBlocked) {
                 $blockedPathCount++
+                [void]$scopeBlockedPaths.Add(
+                    $assignmentPath.Name
+                )
             }
             elseif ($pathUnknown) {
                 $scopeUnknown = $true
-                [void]$unknownReasons.Add(
+                $reason =
                     "$($assignmentPath.Name) coverage at '$roleScope' is uncertain."
-                )
+                [void]$unknownReasons.Add($reason)
+                [void]$scopeUnknownReasons.Add($reason)
             }
             else {
                 $unblockedPathCount++
+                [void]$scopeUnblockedPaths.Add(
+                    $assignmentPath.Name
+                )
+                $reachability = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $assignmentPath `
+                        -Name 'Reachability'
+                )
+                if (
+                    $reachability -like
+                    'Baseline role can create*'
+                ) {
+                    [void]$scopeBaselineAssignablePaths.Add(
+                        $assignmentPath.Name
+                    )
+                }
+                else {
+                    [void]$scopeExternalAssignmentPaths.Add(
+                        $assignmentPath.Name
+                    )
+                }
                 [void]$unblockedAssignmentPaths.Add(
                     "$roleScope :: $($assignmentPath.Name)"
                 )
@@ -5953,14 +6549,56 @@ function Get-RadarRoleDenyCoverage {
         else {
             [void]$unblockedScopes.Add($roleScope)
             if ($scopeUnknown -and $unblockedPathCount -eq 0) {
-                [void]$unknownReasons.Add(
+                $reason =
                     "Deny coverage at '$roleScope' is uncertain."
-                )
+                [void]$unknownReasons.Add($reason)
+                [void]$scopeUnknownReasons.Add($reason)
             }
         }
+
+        $scopeGapStatus = if (
+            $blockedPathCount -eq $AssignmentPaths.Count -and
+            -not $scopeUnknown
+        ) {
+            'Covered'
+        }
+        elseif ($unblockedPathCount -gt 0) {
+            'Gap'
+        }
+        else {
+            'Unknown'
+        }
+        [void]$scopeEvaluations.Add([pscustomobject]@{
+            Scope = $roleScope
+            GapStatus = $scopeGapStatus
+            BlockingPolicies = @(
+                $scopeBlockingPolicies |
+                    Sort-Object
+            )
+            BlockedAssignmentPaths = @(
+                $scopeBlockedPaths |
+                    Sort-Object -Unique
+            )
+            UnblockedAssignmentPaths = @(
+                $scopeUnblockedPaths |
+                    Sort-Object -Unique
+            )
+            BaselineAssignablePaths = @(
+                $scopeBaselineAssignablePaths |
+                    Sort-Object -Unique
+            )
+            ExternalAssignmentPaths = @(
+                $scopeExternalAssignmentPaths |
+                    Sort-Object -Unique
+            )
+            UnknownReasons = @(
+                $scopeUnknownReasons |
+                    Sort-Object -Unique
+            )
+        })
     }
 
-    $scopeCount = @($RoleScopes | Sort-Object -Unique).Count
+    $scopeCount = $uniqueRoleScopes.Count
     $status = if ($scopeCount -eq 0) {
         'Unknown'
     }
@@ -5978,9 +6616,19 @@ function Get-RadarRoleDenyCoverage {
     }
     if ($status -eq 'Full' -and -not $DiscoveryComplete) {
         $status = 'Unknown'
-        [void]$unknownReasons.Add(
+        $reason =
             'Discovery was incomplete, so full deny coverage cannot be proven.'
-        )
+        [void]$unknownReasons.Add($reason)
+        foreach ($scopeEvaluation in $scopeEvaluations) {
+            if ($scopeEvaluation.GapStatus -eq 'Covered') {
+                $scopeEvaluation.GapStatus = 'Unknown'
+                $scopeEvaluation.UnknownReasons = @(
+                    @($scopeEvaluation.UnknownReasons) +
+                    $reason |
+                        Sort-Object -Unique
+                )
+            }
+        }
     }
 
     [pscustomobject]@{
@@ -5996,6 +6644,7 @@ function Get-RadarRoleDenyCoverage {
                 Sort-Object -Unique
         )
         UnknownReasons = @($unknownReasons | Sort-Object -Unique)
+        ScopeEvaluations = $scopeEvaluations.ToArray()
     }
 }
 
@@ -6061,6 +6710,396 @@ function Get-RadarCoverageCsvPath {
         return Join-Path $directory $fileName
     }
     return $fileName
+}
+
+function Get-RadarScopeMapCsvPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MatchCsvPath
+    )
+
+    $directory = Split-Path -Parent $MatchCsvPath
+    $fileName = (
+        [System.IO.Path]::GetFileNameWithoutExtension($MatchCsvPath) +
+        '-scope-map.csv'
+    )
+    if ($directory) {
+        return Join-Path $directory $fileName
+    }
+    return $fileName
+}
+
+function Get-RadarControlGapMap {
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Results,
+
+        [hashtable]$ScopeById = @{},
+
+        [object]$Hierarchy
+    )
+
+    $groups =
+        [System.Collections.Generic.Dictionary[string, object]]::new(
+            [StringComparer]::OrdinalIgnoreCase
+        )
+    $newStringSet = {
+        return ,(
+            [System.Collections.Generic.HashSet[string]]::new(
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        )
+    }
+    $addValues = {
+        param(
+            [System.Collections.Generic.HashSet[string]]$Set,
+            [object[]]$Values
+        )
+        foreach ($value in @($Values)) {
+            if (
+                -not [string]::IsNullOrWhiteSpace(
+                    [string]$value
+                )
+            ) {
+                [void]$Set.Add([string]$value)
+            }
+        }
+    }
+    foreach (
+        $result in @(
+            $Results |
+                Where-Object {
+                    $_.AnalysisMode -eq 'BaselineNotActions'
+                }
+        )
+    ) {
+        foreach (
+            $scopeEvaluation in @(
+                Get-RadarPropertyValue `
+                    -InputObject $result `
+                    -Name 'ScopeEvaluations'
+            )
+        ) {
+            if ($null -eq $scopeEvaluation) { continue }
+            $scopeId = [string](
+                Get-RadarPropertyValue `
+                    -InputObject $scopeEvaluation `
+                    -Name 'Scope'
+            )
+            if ([string]::IsNullOrWhiteSpace($scopeId)) {
+                continue
+            }
+            $scopeKey = $scopeId.TrimEnd('/').ToLowerInvariant()
+            $scopeObject = if (
+                $ScopeById.ContainsKey($scopeKey)
+            ) {
+                $ScopeById[$scopeKey]
+            }
+            else {
+                New-RadarScope -Id $scopeId
+            }
+            if (
+                $scopeObject.Type -notin @(
+                    'ManagementGroup',
+                    'Subscription'
+                )
+            ) {
+                continue
+            }
+            $ancestorScopes = @()
+            if (
+                $null -ne $Hierarchy -and
+                $Hierarchy.AncestorsByScope.ContainsKey(
+                    $scopeKey
+                )
+            ) {
+                $ancestorScopes = @(
+                    $Hierarchy.AncestorsByScope[$scopeKey]
+                )
+            }
+            $parentScope = if ($ancestorScopes.Count -gt 0) {
+                [string]$ancestorScopes[-1]
+            }
+            else {
+                ''
+            }
+            $parentScopeName = ''
+            if (-not [string]::IsNullOrWhiteSpace($parentScope)) {
+                $parentKey =
+                    $parentScope.TrimEnd('/').ToLowerInvariant()
+                $parentObject = if (
+                    $ScopeById.ContainsKey($parentKey)
+                ) {
+                    $ScopeById[$parentKey]
+                }
+                else {
+                    New-RadarScope -Id $parentScope
+                }
+                $parentScopeName = $parentObject.DisplayName
+            }
+            $roleLabel = if ($result.RoleId) {
+                "$($result.RoleName) [$($result.RoleId)]"
+            }
+            else {
+                [string]$result.RoleName
+            }
+            $groupKey = @(
+                $result.BaselineRoleId,
+                $result.BaselineScope,
+                $scopeId,
+                $result.RestrictedAction
+            ) -join [char]31
+            if (-not $groups.ContainsKey($groupKey)) {
+                $groups[$groupKey] = [pscustomobject]@{
+                    EvaluationScopeType =
+                        $scopeObject.Type
+                    EvaluationScopeName =
+                        $scopeObject.DisplayName
+                    EvaluationScope = $scopeId
+                    ParentScopeName = $parentScopeName
+                    ParentScope = $parentScope
+                    AncestorScopes = @($ancestorScopes)
+                    BaselineRoleName =
+                        $result.BaselineRoleName
+                    BaselineRoleId =
+                        $result.BaselineRoleId
+                    BaselineScope =
+                        $result.BaselineScope
+                    RestrictedAction =
+                        $result.RestrictedAction
+                    IntentSource =
+                        "$($result.BaselineRoleName) NotActions"
+                    ConfirmedGapRoles = & $newStringSet
+                    BaselineAssignableRoles = & $newStringSet
+                    ExternalAssignmentRoles = & $newStringSet
+                    UnknownRoles = & $newStringSet
+                    CoveredRoles = & $newStringSet
+                    BlockingPolicies = & $newStringSet
+                    UnblockedAssignmentPaths = & $newStringSet
+                    CoverageWarnings = & $newStringSet
+                }
+            }
+            $group = $groups[$groupKey]
+            $gapStatus = [string](
+                Get-RadarPropertyValue `
+                    -InputObject $scopeEvaluation `
+                    -Name 'GapStatus'
+            )
+            switch ($gapStatus) {
+                'Gap' {
+                    [void]$group.ConfirmedGapRoles.Add(
+                        $roleLabel
+                    )
+                    $canBaselineAssign = @(
+                        Get-RadarPropertyValue `
+                            -InputObject $scopeEvaluation `
+                            -Name 'BaselineAssignablePaths'
+                    ).Count -gt 0
+                    if ($canBaselineAssign) {
+                        [void]$group.BaselineAssignableRoles.Add(
+                            $roleLabel
+                        )
+                    }
+                    $hasExternalPath = @(
+                        Get-RadarPropertyValue `
+                            -InputObject $scopeEvaluation `
+                            -Name 'ExternalAssignmentPaths'
+                    ).Count -gt 0
+                    if ($hasExternalPath) {
+                        [void]$group.ExternalAssignmentRoles.Add(
+                            $roleLabel
+                        )
+                    }
+                }
+                'Covered' {
+                    [void]$group.CoveredRoles.Add($roleLabel)
+                }
+                default {
+                    [void]$group.UnknownRoles.Add($roleLabel)
+                }
+            }
+            & $addValues `
+                $group.BlockingPolicies `
+                @(
+                    Get-RadarPropertyValue `
+                        -InputObject $scopeEvaluation `
+                        -Name 'BlockingPolicies'
+                )
+            & $addValues `
+                $group.UnblockedAssignmentPaths `
+                @(
+                    Get-RadarPropertyValue `
+                        -InputObject $scopeEvaluation `
+                        -Name 'UnblockedAssignmentPaths'
+                )
+            & $addValues `
+                $group.CoverageWarnings `
+                @(
+                    Get-RadarPropertyValue `
+                        -InputObject $scopeEvaluation `
+                        -Name 'UnknownReasons'
+                )
+        }
+    }
+
+    $mapRows = @(
+        $groups.Values |
+            ForEach-Object {
+                $group = $_
+                $gapRoles = @(
+                    $group.ConfirmedGapRoles |
+                        Sort-Object
+                )
+                $selfRoles = @(
+                    $group.BaselineAssignableRoles |
+                        Sort-Object
+                )
+                $externalRoles = @(
+                    $group.ExternalAssignmentRoles |
+                        Sort-Object
+                )
+                $unknownRoles = @(
+                    $group.UnknownRoles |
+                        Sort-Object
+                )
+                $coveredRoles = @(
+                    $group.CoveredRoles |
+                        Sort-Object
+                )
+                $mapStatus = if ($gapRoles.Count -gt 0) {
+                    'Gap'
+                }
+                elseif ($unknownRoles.Count -gt 0) {
+                    'Unknown'
+                }
+                else {
+                    'Covered'
+                }
+
+                [pscustomobject]@{
+                    EvaluationScopeType =
+                        $group.EvaluationScopeType
+                    EvaluationScopeName =
+                        $group.EvaluationScopeName
+                    EvaluationScope =
+                        $group.EvaluationScope
+                    ParentScopeName =
+                        $group.ParentScopeName
+                    ParentScope =
+                        $group.ParentScope
+                    AncestorScopes = @(
+                        $group.AncestorScopes
+                    ) -join '; '
+                    BaselineRoleName =
+                        $group.BaselineRoleName
+                    BaselineRoleId =
+                        $group.BaselineRoleId
+                    BaselineScope =
+                        $group.BaselineScope
+                    RestrictedAction =
+                        $group.RestrictedAction
+                    IntentSource =
+                        $group.IntentSource
+                    GapStatus = $mapStatus
+                    ConfirmedGapRoleCount = $gapRoles.Count
+                    ConfirmedGapRoles = $gapRoles -join '; '
+                    BaselineAssignableRoleCount =
+                        $selfRoles.Count
+                    BaselineAssignableRoles =
+                        $selfRoles -join '; '
+                    ExternalAssignmentRoleCount =
+                        $externalRoles.Count
+                    ExternalAssignmentRoles =
+                        $externalRoles -join '; '
+                    UnknownRoleCount = $unknownRoles.Count
+                    UnknownRoles = $unknownRoles -join '; '
+                    CoveredRoleCount = $coveredRoles.Count
+                    CoveredRoles = $coveredRoles -join '; '
+                    BlockingPolicies = @(
+                        $group.BlockingPolicies |
+                            Sort-Object -Unique
+                    ) -join '; '
+                    UnblockedAssignmentPaths = @(
+                        $group.UnblockedAssignmentPaths |
+                            Sort-Object -Unique
+                    ) -join '; '
+                    CoverageWarnings = @(
+                        $group.CoverageWarnings |
+                            Sort-Object -Unique
+                    ) -join '; '
+                }
+            } |
+            Sort-Object `
+                EvaluationScopeType,
+                AncestorScopes,
+                ParentScope,
+                EvaluationScopeName,
+                BaselineRoleName,
+                RestrictedAction
+    )
+    return $mapRows
+}
+
+function Export-RadarControlGapMap {
+    param(
+        [AllowEmptyCollection()]
+        [object[]]$Rows,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $suffix = ".tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+    $tempPath = "$Path$suffix"
+    try {
+        if (@($Rows).Count -gt 0) {
+            $Rows |
+                Select-Object `
+                    EvaluationScopeType,
+                    EvaluationScopeName,
+                    EvaluationScope,
+                    ParentScopeName,
+                    ParentScope,
+                    AncestorScopes,
+                    BaselineRoleName,
+                    BaselineRoleId,
+                    BaselineScope,
+                    RestrictedAction,
+                    IntentSource,
+                    GapStatus,
+                    ConfirmedGapRoleCount,
+                    ConfirmedGapRoles,
+                    BaselineAssignableRoleCount,
+                    BaselineAssignableRoles,
+                    ExternalAssignmentRoleCount,
+                    ExternalAssignmentRoles,
+                    UnknownRoleCount,
+                    UnknownRoles,
+                    CoveredRoleCount,
+                    CoveredRoles,
+                    BlockingPolicies,
+                    UnblockedAssignmentPaths,
+                    CoverageWarnings |
+                Export-Csv `
+                    -LiteralPath $tempPath `
+                    -NoTypeInformation
+        }
+        else {
+            Set-Content `
+                -LiteralPath $tempPath `
+                -Encoding UTF8 `
+                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","GapStatus","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
+        }
+        Move-Item `
+            -LiteralPath $tempPath `
+            -Destination $Path `
+            -Force
+    }
+    finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force
+        }
+    }
 }
 
 function Resolve-RadarFileSystemPath {
@@ -6154,6 +7193,33 @@ function Get-RadarCoverageKey {
             Replace('-', '').
             Substring(0, 16)
     )
+}
+
+function Get-RadarAssignmentPathCacheKey {
+    param([object[]]$AssignmentPaths = @())
+
+    return @(
+        $AssignmentPaths |
+            ForEach-Object {
+                @(
+                    [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'Name'
+                    ),
+                    [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'ResourceType'
+                    ),
+                    [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'Reachability'
+                    )
+                ) -join [char]30
+            }
+    ) -join [char]29
 }
 
 function Export-RadarCsvReports {
@@ -6863,6 +7929,7 @@ if (
 }
 $partialOutputCsv = "$OutputCsv.partial"
 $coverageOutputCsv = Get-RadarCoverageCsvPath -MatchCsvPath $OutputCsv
+$scopeMapOutputCsv = Get-RadarScopeMapCsvPath -MatchCsvPath $OutputCsv
 $partialCoverageCsv = "$coverageOutputCsv.partial"
 
 $getMatch = {
@@ -6907,10 +7974,8 @@ $getCoverage = {
         [object[]]$AssignmentPaths = @()
     )
     $roleKey = Get-RadarRoleKey -Role $Role
-    $pathKey = @(
-        $AssignmentPaths |
-            ForEach-Object { $_.ResourceType }
-    ) -join ','
+    $pathKey = Get-RadarAssignmentPathCacheKey `
+        -AssignmentPaths $AssignmentPaths
     $key = "$ContextKey$([char]31)$roleKey$([char]31)$pathKey$([char]31)$ContextComplete"
     if (-not $coverageCache.ContainsKey($key)) {
         $coverage = Get-RadarRoleDenyCoverage `
@@ -7010,6 +8075,11 @@ $addResult = {
                 } |
                 Sort-Object -Unique
         ) -join '; '
+        ScopeEvaluations = @(
+            Get-RadarPropertyValue `
+                -InputObject $Coverage `
+                -Name 'ScopeEvaluations'
+        )
     })
 }
 
@@ -7195,6 +8265,12 @@ $sortedResults = @(
             RoleName,
             RestrictedAction
 )
+$controlGapMap = @(
+    Get-RadarControlGapMap `
+        -Results $sortedResults `
+        -ScopeById $knownScopeById `
+        -Hierarchy $scopeHierarchy
+)
 $baselineSummaries =
     New-Object System.Collections.Generic.List[object]
 foreach ($baselineContext in $baselineContextInventory.Contexts) {
@@ -7291,6 +8367,9 @@ Export-RadarCsvReports `
     -Results $sortedResults `
     -MatchCsvPath $OutputCsv `
     -CoverageCsvPath $coverageOutputCsv
+Export-RadarControlGapMap `
+    -Rows $controlGapMap `
+    -Path $scopeMapOutputCsv
 Remove-RadarCsvReportSet `
     -MatchCsvPath $partialOutputCsv `
     -CoverageCsvPath $partialCoverageCsv
@@ -7320,6 +8399,7 @@ if ($OutputHtml) {
         -ScopeCount $policyScopes.Count `
         -BaselineContextCount $baselineContextInventory.Contexts.Count `
         -BaselineSummaries $baselineSummaries.ToArray() `
+        -ControlGapMap $controlGapMap `
         -PolicyAssignmentCount $policyInventory.AssignmentCount `
         -RoleDenyRuleCount $policyInventory.RelevantRuleCount `
         -PolicyExemptionCount $policyInventory.ExemptionCount `
@@ -7400,6 +8480,7 @@ if ($policyInventory.IsEvaluated -or $deniedRoleSet.Count -gt 0) {
 }
 Write-Host "  CSV report:           $OutputCsv"
 Write-Host "  Coverage detail:      $coverageOutputCsv"
+Write-Host "  Scope control map:    $scopeMapOutputCsv"
 if ($OutputHtml) {
     Write-Host "  HTML report:          $OutputHtml"
 }

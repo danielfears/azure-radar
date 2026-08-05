@@ -41,7 +41,7 @@ flowchart LR
 The semantic unit is:
 
 ```text
-baseline role × baseline AssignableScope × restricted action × granting role
+baseline role × exact evaluation scope × restricted action × granting role
 ```
 
 Baseline roles are never unioned. If production and UAT variants have the same
@@ -81,6 +81,9 @@ confirm policy boundary scopes before a result can be considered fully covered.
   and unresolved hierarchy relationships as `Unknown`, never safely denied.
 - Evaluates direct role assignment and any PIM assignment-request paths granted
   by the baseline role.
+- Produces an MG/subscription-first control-gap map showing restriction intent,
+  confirmed gap roles, baseline-assignable roles, externally assigned roles,
+  covered roles, blocking policies, and unknown evidence.
 - Emits a detailed CSV and a self-contained HTML dashboard.
 
 ## Requirements
@@ -318,6 +321,26 @@ the potentially large detail fields:
 Normalising coverage prevents the same scope and warning lists being repeated
 for every matched action while preserving a complete audit trail.
 
+RADAR also writes `<name>-scope-map.csv`, one row per:
+
+```text
+management group or subscription × baseline role × restricted action
+```
+
+Its `GapStatus` is:
+
+| State | Meaning |
+| --- | --- |
+| `Gap` | At least one role available at this exact scope grants the restricted action through a confirmed unblocked assignment path |
+| `Unknown` | No confirmed gap was found, but policy or request-dependent evidence prevents a safe covered conclusion |
+| `Covered` | Every matching role at this exact scope is conclusively blocked on all evaluated assignment paths |
+
+Each row separates roles the baseline can assign directly from roles requiring
+another principal or delivery process. It also lists unknown and covered roles,
+blocking policies, unblocked assignment paths, coverage warnings, and the
+scope's parent and full ancestor chain so management-group/subscription
+hierarchy can be reconstructed even when an intermediate scope has no findings.
+
 If every baseline/role pair is `Unknown` or `NotEvaluated`, RADAR emits a
 prominent report-health warning. The files remain available for diagnosis but
 must not be treated as an operational remediation report.
@@ -325,6 +348,8 @@ must not be treated as an operational remediation report.
 The HTML report includes:
 
 - role, policy, exemption, scope, and baseline-context counts;
+- an expandable visual management-group/subscription tree with per-node gap,
+  unknown and covered actions and roles;
 - per-baseline obtainable-action totals;
 - an explicitly labelled estate-wide union;
 - source baseline and scope on every granting-role section;
@@ -338,6 +363,14 @@ The HTML report includes:
 RADAR is a **latent capability** analysis. A finding means an available role can
 grant an action that a baseline removes and policy does not conclusively block
 throughout the relevant subtree.
+
+The scope map makes the inferred control model explicit:
+
+1. A wildcard baseline role's `NotActions` defines intended restricted actions.
+2. Effective deny policies show which granting roles are blocked at an exact
+   scope.
+3. Any other role available at that scope that grants the same action through
+   an unblocked assignment path is the missed control gap.
 
 RADAR does not claim that a specific person has already exploited that path.
 The `AssignmentPath` field indicates whether the baseline itself can create

@@ -668,6 +668,12 @@ Describe 'Scoped baseline contexts' {
                 SubscriptionId = 'sub-unplaced'
                 ManagementGroupAncestorsChain = @(
                     [pscustomobject]@{
+                        Name = 'leaf'
+                    },
+                    [pscustomobject]@{
+                        Name = 'middle'
+                    },
+                    [pscustomobject]@{
                         Name = 'tenant-root'
                     }
                 )
@@ -686,8 +692,55 @@ Describe 'Scoped baseline contexts' {
         $hierarchy.IsComplete | Should -BeTrue
         $hierarchy.AncestorsByScope[
             '/subscriptions/sub-unplaced'
-        ] | Should -Contain (
-            '/providers/Microsoft.Management/managementGroups/tenant-root'
+        ] | Should -Be @(
+            '/providers/Microsoft.Management/managementGroups/tenant-root',
+            '/providers/Microsoft.Management/managementGroups/middle',
+            '/providers/Microsoft.Management/managementGroups/leaf'
+        )
+        $map = @(
+            Get-RadarControlGapMap `
+                -Results @(
+                    [pscustomobject]@{
+                        AnalysisMode = 'BaselineNotActions'
+                        BaselineRoleName =
+                            'Customer-Platform-Owner'
+                        BaselineRoleId = 'baseline-1'
+                        BaselineScope =
+                            '/providers/Microsoft.Management/managementGroups/leaf'
+                        RestrictedAction =
+                            'Dangerous.Provider/write'
+                        RoleName = 'Contributor'
+                        RoleId = 'role-1'
+                        ScopeEvaluations = @(
+                            [pscustomobject]@{
+                                Scope =
+                                    '/subscriptions/sub-unplaced'
+                                GapStatus = 'Gap'
+                                BlockingPolicies = @()
+                                UnblockedAssignmentPaths = @(
+                                    'Direct role assignment'
+                                )
+                                BaselineAssignablePaths = @(
+                                    'Direct role assignment'
+                                )
+                                ExternalAssignmentPaths = @()
+                                UnknownReasons = @()
+                            }
+                        )
+                    }
+                ) `
+                -ScopeById $hierarchy.ScopeById `
+                -Hierarchy $hierarchy
+        )
+        $map[0].ParentScope | Should -Be (
+            '/providers/Microsoft.Management/managementGroups/leaf'
+        )
+        $map[0].AncestorScopes | Should -Be (
+            @(
+                '/providers/Microsoft.Management/managementGroups/tenant-root',
+                '/providers/Microsoft.Management/managementGroups/middle',
+                '/providers/Microsoft.Management/managementGroups/leaf'
+            ) -join '; '
         )
         Should -Invoke Search-AzGraph -Times 1
     }
@@ -2646,6 +2699,25 @@ Describe 'Get-RadarRoleDenyCoverage' {
         $coverage.IsAlreadyDenied | Should -BeFalse
         $coverage.UnblockedScopes |
             Should -Contain '/subscriptions/sub-2'
+        (
+            $coverage.ScopeEvaluations |
+                Where-Object {
+                    $_.Scope -eq '/subscriptions/sub-1'
+                }
+        ).GapStatus | Should -Be 'Covered'
+        (
+            $coverage.ScopeEvaluations |
+                Where-Object {
+                    $_.Scope -eq '/subscriptions/sub-1'
+                }
+        ).BlockingPolicies |
+            Should -Match 'Deny Owner'
+        (
+            $coverage.ScopeEvaluations |
+                Where-Object {
+                    $_.Scope -eq '/subscriptions/sub-2'
+                }
+        ).GapStatus | Should -Be 'Gap'
     }
 
     It 'honours an active whole-assignment exemption' {
@@ -2803,6 +2875,10 @@ Describe 'Get-RadarRoleDenyCoverage' {
 
         $coverage.Status | Should -Be 'Unknown'
         $coverage.IsAlreadyDenied | Should -BeFalse
+        $coverage.ScopeEvaluations[0].GapStatus |
+            Should -Be 'Unknown'
+        ($coverage.ScopeEvaluations[0].UnknownReasons -join '; ') |
+            Should -Match 'discovery was incomplete'
     }
 
     It 'does not let an unrelated failed policy scope downgrade full coverage' {
@@ -3035,6 +3111,328 @@ Describe 'Get-RadarRoleDenyCoverage' {
     }
 }
 
+Describe 'Control-gap scope map' {
+    It 'groups exact scope intent, gaps, unknowns, and covered roles' {
+        $base = @{
+            AnalysisMode = 'BaselineNotActions'
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope =
+                '/providers/Microsoft.Management/managementGroups/customer'
+            RestrictedAction = 'Dangerous.Provider/write'
+        }
+        $results = @(
+            [pscustomobject]($base + @{
+                RoleName = 'Self-assignable role'
+                RoleId = 'role-1'
+                AssignmentPath =
+                    'Direct role assignment: Baseline role can create direct role assignments'
+                ScopeEvaluations = @(
+                    [pscustomobject]@{
+                        Scope = '/subscriptions/sub-1'
+                        GapStatus = 'Gap'
+                        BlockingPolicies = @()
+                        UnblockedAssignmentPaths = @(
+                            'Direct role assignment'
+                        )
+                        BaselineAssignablePaths = @(
+                            'Direct role assignment'
+                        )
+                        ExternalAssignmentPaths = @()
+                        UnknownReasons = @()
+                    },
+                    [pscustomobject]@{
+                        Scope =
+                            '/subscriptions/sub-1/resourceGroups/workload'
+                        GapStatus = 'Gap'
+                        BlockingPolicies = @()
+                        UnblockedAssignmentPaths = @(
+                            'Direct role assignment'
+                        )
+                        BaselineAssignablePaths = @(
+                            'Direct role assignment'
+                        )
+                        ExternalAssignmentPaths = @()
+                        UnknownReasons = @()
+                    }
+                )
+            }),
+            [pscustomobject]($base + @{
+                RoleName = 'Delivery role'
+                RoleId = 'role-2'
+                AssignmentPath =
+                    'Direct role assignment: Requires another principal or assignment process'
+                ScopeEvaluations = @(
+                    [pscustomobject]@{
+                        Scope = '/subscriptions/sub-1'
+                        GapStatus = 'Gap'
+                        BlockingPolicies = @()
+                        UnblockedAssignmentPaths = @(
+                            'Direct role assignment'
+                        )
+                        BaselineAssignablePaths = @()
+                        ExternalAssignmentPaths = @(
+                            'Direct role assignment'
+                        )
+                        UnknownReasons = @()
+                    }
+                )
+            }),
+            [pscustomobject]($base + @{
+                RoleName = 'Uncertain role'
+                RoleId = 'role-3'
+                AssignmentPath =
+                    'Direct role assignment: Requires another principal or assignment process'
+                ScopeEvaluations = @(
+                    [pscustomobject]@{
+                        Scope = '/subscriptions/sub-1'
+                        GapStatus = 'Unknown'
+                        BlockingPolicies = @()
+                        UnblockedAssignmentPaths = @()
+                        BaselineAssignablePaths = @()
+                        ExternalAssignmentPaths = @()
+                        UnknownReasons = @(
+                            'Principal type is unknown.'
+                        )
+                    }
+                )
+            }),
+            [pscustomobject]($base + @{
+                RoleName = 'Covered role'
+                RoleId = 'role-4'
+                AssignmentPath =
+                    'Direct role assignment: Baseline role can create direct role assignments'
+                ScopeEvaluations = @(
+                    [pscustomobject]@{
+                        Scope = '/subscriptions/sub-1'
+                        GapStatus = 'Covered'
+                        BlockingPolicies = @(
+                            'Deny covered role [/subscriptions/sub-1]'
+                        )
+                        UnblockedAssignmentPaths = @()
+                        BaselineAssignablePaths = @()
+                        ExternalAssignmentPaths = @()
+                        UnknownReasons = @()
+                    }
+                )
+            })
+        )
+        $scopeById = @{
+            '/subscriptions/sub-1' = [pscustomobject]@{
+                Id = '/subscriptions/sub-1'
+                Type = 'Subscription'
+                DisplayName = 'Workload subscription'
+            }
+            '/providers/microsoft.management/managementgroups/customer' =
+                [pscustomobject]@{
+                    Id =
+                        '/providers/Microsoft.Management/managementGroups/customer'
+                    Type = 'ManagementGroup'
+                    DisplayName = 'Customer root'
+                }
+        }
+        $hierarchy = [pscustomobject]@{
+            AncestorsByScope = @{
+                '/subscriptions/sub-1' = @(
+                    '/providers/Microsoft.Management/managementGroups/customer'
+                )
+            }
+        }
+
+        $map = @(
+            Get-RadarControlGapMap `
+                -Results $results `
+                -ScopeById $scopeById `
+                -Hierarchy $hierarchy
+        )
+
+        $map.Count | Should -Be 1
+        $map[0].EvaluationScopeType |
+            Should -Be 'Subscription'
+        $map[0].EvaluationScopeName |
+            Should -Be 'Workload subscription'
+        $map[0].ParentScope |
+            Should -Be (
+                '/providers/Microsoft.Management/managementGroups/customer'
+            )
+        $map[0].AncestorScopes |
+            Should -Be (
+                '/providers/Microsoft.Management/managementGroups/customer'
+            )
+        $map[0].GapStatus | Should -Be 'Gap'
+        $map[0].ConfirmedGapRoleCount | Should -Be 2
+        $map[0].BaselineAssignableRoleCount | Should -Be 1
+        $map[0].ExternalAssignmentRoleCount | Should -Be 1
+        $map[0].UnknownRoleCount | Should -Be 1
+        $map[0].CoveredRoleCount | Should -Be 1
+        $map[0].BlockingPolicies |
+            Should -Match 'Deny covered role'
+        $map[0].CoverageWarnings |
+            Should -Match 'Principal type is unknown'
+    }
+
+    It 'exports a normalised scope map atomically' {
+        $path = Join-Path $TestDrive 'radar-scope-map.csv'
+        $row = [pscustomobject]@{
+            EvaluationScopeType = 'Subscription'
+            EvaluationScopeName = 'Workload'
+            EvaluationScope = '/subscriptions/sub-1'
+            ParentScopeName = ''
+            ParentScope = ''
+            AncestorScopes = ''
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            IntentSource =
+                'Customer-Platform-Owner NotActions'
+            GapStatus = 'Gap'
+            ConfirmedGapRoleCount = 1
+            ConfirmedGapRoles = 'Owner [role-1]'
+            BaselineAssignableRoleCount = 1
+            BaselineAssignableRoles = 'Owner [role-1]'
+            ExternalAssignmentRoleCount = 0
+            ExternalAssignmentRoles = ''
+            UnknownRoleCount = 0
+            UnknownRoles = ''
+            CoveredRoleCount = 0
+            CoveredRoles = ''
+            BlockingPolicies = ''
+            UnblockedAssignmentPaths =
+                'Direct role assignment'
+            CoverageWarnings = ''
+        }
+
+        Export-RadarControlGapMap -Rows @($row) -Path $path
+
+        $exported = Import-Csv -LiteralPath $path
+        $exported.GapStatus | Should -Be 'Gap'
+        $exported.EvaluationScope |
+            Should -Be '/subscriptions/sub-1'
+        @(
+            Get-ChildItem `
+                -LiteralPath $TestDrive `
+                -Filter '*.tmp.*'
+        ).Count | Should -Be 0
+    }
+
+    It 'classifies reachability from the actual unblocked path' {
+        $result = [pscustomobject]@{
+            AnalysisMode = 'BaselineNotActions'
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            RoleName = 'Contributor'
+            RoleId = 'role-1'
+            AssignmentPath = @(
+                'Direct role assignment: Requires another principal or assignment process',
+                'PIM eligible assignment request: Baseline role can create this PIM request'
+            ) -join '; '
+            ScopeEvaluations = @(
+                [pscustomobject]@{
+                    Scope = '/subscriptions/sub-1'
+                    GapStatus = 'Gap'
+                    BlockingPolicies = @(
+                        'Deny PIM via PIM eligible assignment request'
+                    )
+                    BlockedAssignmentPaths = @(
+                        'PIM eligible assignment request'
+                    )
+                    UnblockedAssignmentPaths = @(
+                        'Direct role assignment'
+                    )
+                    BaselineAssignablePaths = @()
+                    ExternalAssignmentPaths = @(
+                        'Direct role assignment'
+                    )
+                    UnknownReasons = @()
+                }
+            )
+        }
+
+        $map = @(
+            Get-RadarControlGapMap -Results @($result)
+        )
+
+        $map[0].BaselineAssignableRoleCount | Should -Be 0
+        $map[0].ExternalAssignmentRoleCount | Should -Be 1
+        $map[0].ExternalAssignmentRoles |
+            Should -Match 'Contributor'
+    }
+
+    It 'lists a role in both reachability groups when both paths are open' {
+        $result = [pscustomobject]@{
+            AnalysisMode = 'BaselineNotActions'
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            RoleName = 'Contributor'
+            RoleId = 'role-1'
+            AssignmentPath = 'Mixed paths'
+            ScopeEvaluations = @(
+                [pscustomobject]@{
+                    Scope = '/subscriptions/sub-1'
+                    GapStatus = 'Gap'
+                    BlockingPolicies = @()
+                    BlockedAssignmentPaths = @()
+                    UnblockedAssignmentPaths = @(
+                        'Direct role assignment',
+                        'PIM eligible assignment request'
+                    )
+                    BaselineAssignablePaths = @(
+                        'PIM eligible assignment request'
+                    )
+                    ExternalAssignmentPaths = @(
+                        'Direct role assignment'
+                    )
+                    UnknownReasons = @()
+                }
+            )
+        }
+
+        $map = @(
+            Get-RadarControlGapMap -Results @($result)
+        )
+
+        $map[0].BaselineAssignableRoleCount | Should -Be 1
+        $map[0].ExternalAssignmentRoleCount | Should -Be 1
+    }
+}
+
+Describe 'Get-RadarAssignmentPathCacheKey' {
+    It 'distinguishes identical resource types with different reachability' {
+        $baselineAssignable = @(
+            [pscustomobject]@{
+                Name = 'Direct role assignment'
+                ResourceType =
+                    'Microsoft.Authorization/roleAssignments'
+                Reachability =
+                    'Baseline role can create direct role assignments'
+            }
+        )
+        $external = @(
+            [pscustomobject]@{
+                Name = 'Direct role assignment'
+                ResourceType =
+                    'Microsoft.Authorization/roleAssignments'
+                Reachability =
+                    'Requires another principal or assignment process'
+            }
+        )
+
+        Get-RadarAssignmentPathCacheKey $baselineAssignable |
+            Should -Not -Be (
+                Get-RadarAssignmentPathCacheKey $external
+            )
+        Get-RadarAssignmentPathCacheKey $baselineAssignable |
+            Should -Be (
+                Get-RadarAssignmentPathCacheKey $baselineAssignable
+            )
+    }
+}
+
 Describe 'Get-RadarReportHealthWarning' {
     It 'flags a report whose every pair is uncertain' {
         $results = @(
@@ -3091,6 +3489,69 @@ Describe 'ConvertTo-RadarHtmlReport' {
 
         $html | Should -Match '<!DOCTYPE html>'
         $html | Should -Match 'No matches found'
+    }
+
+    It 'renders the MG and subscription control-gap map' {
+        $html = ConvertTo-RadarHtmlReport `
+            -Results @() `
+            -RestrictedActions @(
+                'Dangerous.Provider/write'
+            ) `
+            -RolesScanned 1 `
+            -IncludeCustomRoles $true `
+            -ControlGapMap @(
+                [pscustomobject]@{
+                    EvaluationScopeType = 'ManagementGroup'
+                    EvaluationScopeName = 'Customer root'
+                    EvaluationScope =
+                        '/providers/Microsoft.Management/managementGroups/customer'
+                    ParentScopeName = ''
+                    ParentScope = ''
+                    BaselineRoleName =
+                        'Customer-Platform-Owner'
+                    BaselineRoleId = 'baseline-1'
+                    RestrictedAction =
+                        'Dangerous.Provider/write'
+                    GapStatus = 'Unknown'
+                    BaselineAssignableRoles = ''
+                    ExternalAssignmentRoles = ''
+                    BlockingPolicies = ''
+                },
+                [pscustomobject]@{
+                    EvaluationScopeType = 'Subscription'
+                    EvaluationScopeName = 'Workload'
+                    EvaluationScope = '/subscriptions/sub-1'
+                    ParentScopeName = 'Landing zone'
+                    ParentScope =
+                        '/providers/Microsoft.Management/managementGroups/landing-zone'
+                    AncestorScopes = @(
+                        '/providers/Microsoft.Management/managementGroups/customer',
+                        '/providers/Microsoft.Management/managementGroups/landing-zone'
+                    ) -join '; '
+                    BaselineRoleName =
+                        'Customer-Platform-Owner'
+                    BaselineRoleId = 'baseline-1'
+                    RestrictedAction =
+                        'Dangerous.Provider/write'
+                    GapStatus = 'Gap'
+                    BaselineAssignableRoles =
+                        'Owner [role-1]'
+                    ExternalAssignmentRoles = ''
+                    BlockingPolicies = ''
+                }
+            )
+
+        $html | Should -Match 'control-gap map'
+        $html | Should -Match 'scope-tree'
+        $html | Should -Match 'Workload'
+        $html | Should -Match 'Dangerous.Provider/write'
+        $html | Should -Match 'Owner \[role-1\]'
+        $html | Should -Match (
+            'data-scope-id="/subscriptions/sub-1" ' +
+            'data-parent-scope="/providers/Microsoft.Management/managementGroups/customer"'
+        )
+        $html.IndexOf('Customer root') |
+            Should -BeLessThan $html.IndexOf('Workload')
     }
 }
 
@@ -3638,6 +4099,31 @@ Describe 'Invoke-Radar scoped baseline gap model' {
             }
         $coverageResult.UnblockedScopes |
             Should -Be '/subscriptions/sub-2'
+        $scopeMap = Import-Csv -LiteralPath (
+            Get-RadarScopeMapCsvPath -MatchCsvPath $outputCsv
+        )
+        $coveredMapRow = $scopeMap |
+            Where-Object {
+                $_.EvaluationScope -eq '/subscriptions/sub-1' -and
+                $_.BaselineRoleName -eq
+                    'Customer-Platform-Owner' -and
+                $_.RestrictedAction -eq
+                    'Dangerous.Provider/write'
+            }
+        $coveredMapRow.GapStatus | Should -Be 'Covered'
+        $coveredMapRow.CoveredRoles |
+            Should -Match 'Dangerous Built-in'
+        $gapMapRow = $scopeMap |
+            Where-Object {
+                $_.EvaluationScope -eq '/subscriptions/sub-2' -and
+                $_.BaselineRoleName -eq
+                    'Customer-Platform-Owner-UAT' -and
+                $_.RestrictedAction -eq
+                    'Dangerous.Provider/write'
+            }
+        $gapMapRow.GapStatus | Should -Be 'Gap'
+        $gapMapRow.ConfirmedGapRoles |
+            Should -Match 'Dangerous Built-in'
         Test-Path -LiteralPath "$outputCsv.partial" |
             Should -BeFalse
         Test-Path -LiteralPath "$(
