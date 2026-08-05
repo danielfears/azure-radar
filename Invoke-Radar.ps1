@@ -2466,7 +2466,12 @@ function ConvertTo-RadarHtmlReport {
                         BaselineRoleName =
                             $first.BaselineRoleName
                         GapActions = @(
-                            $gapRows.RestrictedAction |
+                            $gapRows |
+                                ForEach-Object {
+                                    Get-RadarPropertyValue `
+                                        -InputObject $_ `
+                                        -Name 'RestrictedAction'
+                                } |
                                 Sort-Object -Unique
                         )
                         BaselineAssignableRoles = @(
@@ -2480,11 +2485,21 @@ function ConvertTo-RadarHtmlReport {
                                 'ExternalAssignmentRoles'
                         )
                         UnknownActions = @(
-                            $unknownRows.RestrictedAction |
+                            $unknownRows |
+                                ForEach-Object {
+                                    Get-RadarPropertyValue `
+                                        -InputObject $_ `
+                                        -Name 'RestrictedAction'
+                                } |
                                 Sort-Object -Unique
                         )
                         CoveredActions = @(
-                            $coveredRows.RestrictedAction |
+                            $coveredRows |
+                                ForEach-Object {
+                                    Get-RadarPropertyValue `
+                                        -InputObject $_ `
+                                        -Name 'RestrictedAction'
+                                } |
                                 Sort-Object -Unique
                         )
                         BlockingPolicies = @(
@@ -2500,7 +2515,12 @@ function ConvertTo-RadarHtmlReport {
                     BaselineRoleName
         )
         $scopeCountInMap = @(
-            $controlGapMapArray.EvaluationScope |
+            $controlGapMapArray |
+                ForEach-Object {
+                    Get-RadarPropertyValue `
+                        -InputObject $_ `
+                        -Name 'EvaluationScope'
+                } |
                 Sort-Object -Unique
         ).Count
         $gapRowCount = @(
@@ -2624,15 +2644,30 @@ function ConvertTo-RadarHtmlReport {
             $node = $scopeNodeById[$NodeKey]
             $nodeSummaries = @($node.Summaries.ToArray())
             $nodeGapActions = @(
-                $nodeSummaries.GapActions |
+                $nodeSummaries |
+                    ForEach-Object {
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'GapActions'
+                    } |
                     Sort-Object -Unique
             )
             $nodeUnknownActions = @(
-                $nodeSummaries.UnknownActions |
+                $nodeSummaries |
+                    ForEach-Object {
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'UnknownActions'
+                    } |
                     Sort-Object -Unique
             )
             $nodeCoveredActions = @(
-                $nodeSummaries.CoveredActions |
+                $nodeSummaries |
+                    ForEach-Object {
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'CoveredActions'
+                    } |
                     Sort-Object -Unique
             )
             $openAttribute = if ($Depth -eq 0) {

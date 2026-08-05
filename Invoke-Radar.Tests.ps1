@@ -3492,14 +3492,7 @@ Describe 'ConvertTo-RadarHtmlReport' {
     }
 
     It 'renders the MG and subscription control-gap map' {
-        $html = ConvertTo-RadarHtmlReport `
-            -Results @() `
-            -RestrictedActions @(
-                'Dangerous.Provider/write'
-            ) `
-            -RolesScanned 1 `
-            -IncludeCustomRoles $true `
-            -ControlGapMap @(
+        $controlGapMap = @(
                 [pscustomobject]@{
                     EvaluationScopeType = 'ManagementGroup'
                     EvaluationScopeName = 'Customer root'
@@ -3540,6 +3533,17 @@ Describe 'ConvertTo-RadarHtmlReport' {
                     BlockingPolicies = ''
                 }
             )
+        $html = & {
+            Set-StrictMode -Version Latest
+            ConvertTo-RadarHtmlReport `
+                -Results @() `
+                -RestrictedActions @(
+                    'Dangerous.Provider/write'
+                ) `
+                -RolesScanned 1 `
+                -IncludeCustomRoles $true `
+                -ControlGapMap $controlGapMap
+        }
 
         $html | Should -Match 'control-gap map'
         $html | Should -Match 'scope-tree'
