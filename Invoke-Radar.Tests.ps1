@@ -1333,6 +1333,53 @@ Describe 'Test-RadarPolicyRuleForRole' {
         ).State | Should -Be 'Unknown'
     }
 
+    It 'evaluates policy conditions for a known assignment subject' {
+        $rule = @{
+            if = @{
+                allOf = @(
+                    @{
+                        field = 'type'
+                        equals =
+                            'Microsoft.Authorization/roleAssignments'
+                    },
+                    @{
+                        field =
+                            'Microsoft.Authorization/roleAssignments/principalType'
+                        equals = 'User'
+                    },
+                    @{
+                        not = @{
+                            field =
+                                'Microsoft.Authorization/roleAssignments/principalId'
+                            in = "[parameters('allowedPrincipalIds')]"
+                        }
+                    }
+                )
+            }
+            then = @{ effect = 'deny' }
+        }
+        $parameters = @{
+            allowedPrincipalIds = @('allowed-principal')
+        }
+
+        (
+            Test-RadarPolicyRuleForRole `
+                -PolicyRule $rule `
+                -Role $ownerRole `
+                -Parameters $parameters `
+                -TargetPrincipalType 'User' `
+                -TargetPrincipalId 'ordinary-principal'
+        ).State | Should -Be 'Blocked'
+        (
+            Test-RadarPolicyRuleForRole `
+                -PolicyRule $rule `
+                -Role $ownerRole `
+                -Parameters $parameters `
+                -TargetPrincipalType 'User' `
+                -TargetPrincipalId 'allowed-principal'
+        ).State | Should -Be 'NotBlocked'
+    }
+
     It 'rules out a value expression for an unrelated resource alias' {
         $rule = @{
                 if = @{
@@ -3109,6 +3156,69 @@ Describe 'Get-RadarRoleDenyCoverage' {
         $first.Status | Should -Be 'Full'
         $second.Status | Should -Be 'None'
     }
+
+    It 'does not reuse policy verdicts across target principals' {
+        $rule = [pscustomobject]@{
+            AssignmentId =
+                '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/principal-aware'
+            AssignmentName = 'Principal-aware deny'
+            AssignmentScope = '/subscriptions/sub-1'
+            NotScopes = @()
+            DefinitionName = 'Principal-aware deny'
+            ReferenceId = $null
+            PolicyRule = @{
+                if = @{
+                    allOf = @(
+                        @{
+                            field =
+                                'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                            in = @($ownerRole.Id)
+                        },
+                        @{
+                            not = @{
+                                field =
+                                    'Microsoft.Authorization/roleAssignments/principalId'
+                                in = @('allowed-principal')
+                            }
+                        }
+                    )
+                }
+                then = @{ effect = 'deny' }
+            }
+            Parameters = @{}
+            ScopeSensitive = $false
+            UnsupportedReason = $null
+        }
+        $inventory = [pscustomobject]@{
+            IsEvaluated = $true
+            UncertainScopes = @()
+            RulesByScope = @{
+                '/subscriptions/sub-1' = @($rule)
+            }
+            ExemptionsByScope = @{
+                '/subscriptions/sub-1' = @()
+            }
+        }
+        $evaluationCache = @{}
+
+        $ordinary = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-1') `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath `
+            -TargetPrincipalId 'ordinary-principal' `
+            -PolicyEvaluationCache $evaluationCache
+        $allowed = Get-RadarRoleDenyCoverage `
+            -Role $ownerRole `
+            -RoleScopes @('/subscriptions/sub-1') `
+            -PolicyInventory $inventory `
+            -AssignmentPaths $directAssignmentPath `
+            -TargetPrincipalId 'allowed-principal' `
+            -PolicyEvaluationCache $evaluationCache
+
+        $ordinary.Status | Should -Be 'Full'
+        $allowed.Status | Should -Be 'None'
+    }
 }
 
 Describe 'Control-gap scope map' {
@@ -3260,6 +3370,7 @@ Describe 'Control-gap scope map' {
                 '/providers/Microsoft.Management/managementGroups/customer'
             )
         $map[0].GapStatus | Should -Be 'Gap'
+        $map[0].BaselineAccessStatus | Should -Be 'Obtainable'
         $map[0].ConfirmedGapRoleCount | Should -Be 2
         $map[0].BaselineAssignableRoleCount | Should -Be 1
         $map[0].ExternalAssignmentRoleCount | Should -Be 1
@@ -3287,6 +3398,7 @@ Describe 'Control-gap scope map' {
             IntentSource =
                 'Customer-Platform-Owner NotActions'
             GapStatus = 'Gap'
+            BaselineAccessStatus = 'Obtainable'
             ConfirmedGapRoleCount = 1
             ConfirmedGapRoles = 'Owner [role-1]'
             BaselineAssignableRoleCount = 1
@@ -3307,6 +3419,8 @@ Describe 'Control-gap scope map' {
 
         $exported = Import-Csv -LiteralPath $path
         $exported.GapStatus | Should -Be 'Gap'
+        $exported.BaselineAccessStatus |
+            Should -Be 'Obtainable'
         $exported.EvaluationScope |
             Should -Be '/subscriptions/sub-1'
         @(
@@ -3357,8 +3471,53 @@ Describe 'Control-gap scope map' {
 
         $map[0].BaselineAssignableRoleCount | Should -Be 0
         $map[0].ExternalAssignmentRoleCount | Should -Be 1
+        $map[0].BaselineAccessStatus | Should -Be 'ExternalOnly'
         $map[0].ExternalAssignmentRoles |
             Should -Match 'Contributor'
+    }
+
+    It 'keeps baseline access unknown when its route is uncertain' {
+        $result = [pscustomobject]@{
+            AnalysisMode = 'BaselineNotActions'
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            RoleName = 'Contributor'
+            RoleId = 'role-1'
+            AssignmentPath = 'Mixed paths'
+            ScopeEvaluations = @(
+                [pscustomobject]@{
+                    Scope = '/subscriptions/sub-1'
+                    GapStatus = 'Gap'
+                    BlockingPolicies = @()
+                    BlockedAssignmentPaths = @()
+                    UnblockedAssignmentPaths = @(
+                        'Direct role assignment'
+                    )
+                    BaselineAssignablePaths = @()
+                    ExternalAssignmentPaths = @(
+                        'Direct role assignment'
+                    )
+                    UnknownBaselineAssignablePaths = @(
+                        'PIM eligible assignment request'
+                    )
+                    UnknownExternalAssignmentPaths = @()
+                    UnknownReasons = @(
+                        'PIM policy outcome is unknown.'
+                    )
+                }
+            )
+        }
+
+        $map = @(
+            Get-RadarControlGapMap -Results @($result)
+        )
+
+        $map[0].GapStatus | Should -Be 'Gap'
+        $map[0].BaselineAccessStatus | Should -Be 'Unknown'
+        $map[0].UnknownBaselineAssignableRoleCount |
+            Should -Be 1
     }
 
     It 'lists a role in both reachability groups when both paths are open' {
@@ -3398,6 +3557,7 @@ Describe 'Control-gap scope map' {
 
         $map[0].BaselineAssignableRoleCount | Should -Be 1
         $map[0].ExternalAssignmentRoleCount | Should -Be 1
+        $map[0].BaselineAccessStatus | Should -Be 'Obtainable'
     }
 }
 
@@ -3547,15 +3707,121 @@ Describe 'ConvertTo-RadarHtmlReport' {
 
         $html | Should -Match 'control-gap map'
         $html | Should -Match 'scope-tree'
+        $html | Should -Not -Match 'Flat scope summary table'
         $html | Should -Match 'Workload'
         $html | Should -Match 'Dangerous.Provider/write'
         $html | Should -Match 'Owner \[role-1\]'
+        $html | Should -Match 'user-obtainable'
+        $html | Should -Match 'external-route'
         $html | Should -Match (
             'data-scope-id="/subscriptions/sub-1" ' +
             'data-parent-scope="/providers/Microsoft.Management/managementGroups/customer"'
         )
         $html.IndexOf('Customer root') |
             Should -BeLessThan $html.IndexOf('Workload')
+        $childStart = $html.IndexOf(
+            'data-scope-id="/subscriptions/sub-1"'
+        )
+        $childStart | Should -BeGreaterThan $html.IndexOf(
+            'data-scope-id="/providers/Microsoft.Management/managementGroups/customer"'
+        )
+        $html | Should -Match 'baseline-metrics'
+    }
+
+    It 'renders a dedicated map without legacy role-report sections' {
+        $controlGapMap = @(
+            [pscustomobject]@{
+                EvaluationScopeType = 'Subscription'
+                EvaluationScopeName = 'Workload'
+                EvaluationScope = '/subscriptions/sub-1'
+                ParentScopeName = ''
+                ParentScope = ''
+                AncestorScopes = ''
+                BaselineRoleName = 'Customer-Platform-Owner'
+                BaselineRoleId = 'baseline-1'
+                BaselineScope = '/subscriptions/sub-1'
+                RestrictedAction = 'Dangerous.Provider/write'
+                GapStatus = 'Gap'
+                BaselineAccessStatus = 'Obtainable'
+                BaselineAssignableRoles = 'Owner [role-1]'
+                ExternalAssignmentRoles = 'Owner [role-1]'
+                BlockingPolicies = ''
+            }
+        )
+
+        $html = & {
+            Set-StrictMode -Version Latest
+            ConvertTo-RadarHtmlReport `
+                -Results @() `
+                -RestrictedActions @(
+                    'Dangerous.Provider/write'
+                ) `
+                -RolesScanned 1 `
+                -IncludeCustomRoles $true `
+                -ControlGapMap $controlGapMap `
+                -MapOnly
+        }
+
+        $html |
+            Should -Match '<title>RADAR Scope Control-Gap Map</title>'
+        $html | Should -Match 'scope-node'
+        $html | Should -Match 'baseline-metrics'
+        $html | Should -Not -Match 'No matches found'
+        $html | Should -Not -Match 'id="filter"'
+        $html |
+            Should -Match (
+                '<strong>0</strong>external-process gap actions'
+            )
+    }
+
+    It 'keeps distinct baseline scopes separate in the map' {
+        $rows = @(
+            foreach ($baselineScope in @(
+                '/subscriptions/sub-1',
+                '/subscriptions/sub-2'
+            )) {
+                [pscustomobject]@{
+                    EvaluationScopeType = 'Subscription'
+                    EvaluationScopeName = 'Workload'
+                    EvaluationScope = '/subscriptions/sub-1'
+                    ParentScopeName = ''
+                    ParentScope = ''
+                    AncestorScopes = ''
+                    BaselineRoleName = 'Customer-Platform-Owner'
+                    BaselineRoleId = 'baseline-1'
+                    BaselineScope = $baselineScope
+                    RestrictedAction = 'Dangerous.Provider/write'
+                    GapStatus = 'Gap'
+                    BaselineAccessStatus = 'Obtainable'
+                    BaselineAssignableRoles = 'Owner [role-1]'
+                    ExternalAssignmentRoles = ''
+                    BlockingPolicies = ''
+                }
+            }
+        )
+
+        $html = ConvertTo-RadarHtmlReport `
+            -Results @() `
+            -RestrictedActions @('Dangerous.Provider/write') `
+            -RolesScanned 1 `
+            -IncludeCustomRoles $true `
+            -ControlGapMap $rows `
+            -MapOnly
+
+        (
+            [regex]::Matches(
+                $html,
+                'class="baseline-summary"'
+            ).Count
+        ) | Should -Be 2
+        $html | Should -Match '@ /subscriptions/sub-1'
+        $html | Should -Match '@ /subscriptions/sub-2'
+    }
+
+    It 'derives the dedicated map path from the requested report path' {
+        Get-RadarScopeMapHtmlPath `
+            -ReportHtmlPath '/tmp/radar-report.html' |
+            Should -Be '/tmp/radar-report-scope-map.html'
     }
 }
 

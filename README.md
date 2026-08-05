@@ -77,6 +77,8 @@ confirm policy boundary scopes before a result can be considered fully covered.
 - Distinguishes role deny-lists from role allow-lists.
 - Applies policy mode, `EnforcementMode`, `notScopes`, and active exemptions at
   each exact evaluation scope.
+- Evaluates principal-aware policy conditions for a selected User, Group, or
+  ServicePrincipal assignment subject.
 - Treats overrides, selectors, unsupported expressions, failed scope queries,
   and unresolved hierarchy relationships as `Unknown`, never safely denied.
 - Evaluates direct role assignment and any PIM assignment-request paths granted
@@ -241,6 +243,21 @@ canonical roles are known.
 | `-CurrentSubscriptionOnly` | Limit discovery to the current subscription |
 | `-BuiltInOnly` | Skip custom roles; incompatible with dynamic baselines |
 
+### Assignment subject
+
+RADAR evaluates deny-policy conditions for a `User` by default. If no object ID
+is supplied, it models an ordinary user that is not explicitly listed in a
+policy exemption parameter.
+
+| Parameter | Behaviour |
+| --- | --- |
+| `-TargetPrincipalType User|Group|ServicePrincipal` | Select the principal type receiving the role |
+| `-TargetPrincipalId <object-id>` | Evaluate principal-specific allow or exemption lists for that exact principal |
+
+The selected scenario is printed during the run and embedded in both HTML
+outputs. Supplying an actual principal ID improves policy precision; RADAR does
+not query that principal's existing assignments or group membership.
+
 Examples:
 
 ```powershell
@@ -279,6 +296,11 @@ For each relevant exact scope, RADAR:
 A role is `Full` only when every relevant scope and every available assignment
 path is definitely blocked. One unblocked or uncertain path keeps the action
 obtainable.
+
+Policy scope is directional: an assignment at a management group applies
+downwards, but an assignment on a descendant subscription does not protect its
+parent management group. RADAR therefore does not union descendant deny lists
+and apply them back to an ancestor.
 
 `-NoPolicyDiscovery` performs role matching without claiming policy coverage.
 
@@ -335,21 +357,32 @@ Its `GapStatus` is:
 | `Unknown` | No confirmed gap was found, but policy or request-dependent evidence prevents a safe covered conclusion |
 | `Covered` | Every matching role at this exact scope is conclusively blocked on all evaluated assignment paths |
 
-Each row separates roles the baseline can assign directly from roles requiring
-another principal or delivery process. It also lists unknown and covered roles,
-blocking policies, unblocked assignment paths, coverage warnings, and the
-scope's parent and full ancestor chain so management-group/subscription
-hierarchy can be reconstructed even when an intermediate scope has no findings.
+`BaselineAccessStatus` gives the actor-specific interpretation:
+
+| State | Meaning |
+| --- | --- |
+| `Obtainable` | The baseline principal itself has a confirmed unblocked route to a granting role |
+| `ExternalOnly` | A policy gap exists, but obtaining the role requires another principal or delivery process |
+| `Unknown` | No user-obtainable route is confirmed and coverage remains uncertain |
+| `Covered` | Every matching role is conclusively blocked |
+
+Each row also lists unknown and covered roles, blocking policies, unblocked
+assignment paths, coverage warnings, and the scope's parent and full ancestor
+chain so the hierarchy can be reconstructed even when an intermediate scope
+has no findings.
 
 If every baseline/role pair is `Unknown` or `NotEvaluated`, RADAR emits a
 prominent report-health warning. The files remain available for diagnosis but
 must not be treated as an operational remediation report.
 
-The HTML report includes:
+When `-OutputHtml` is supplied, RADAR writes both the full dashboard and a
+smaller `<name>-scope-map.html` dedicated to the visual hierarchy.
+
+The HTML outputs include:
 
 - role, policy, exemption, scope, and baseline-context counts;
-- an expandable visual management-group/subscription tree with per-node gap,
-  unknown and covered actions and roles;
+- a responsive visual management-group/subscription hierarchy with separate
+  user-obtainable, external-process, unknown, and covered actions;
 - per-baseline obtainable-action totals;
 - an explicitly labelled estate-wide union;
 - source baseline and scope on every granting-role section;
@@ -373,9 +406,9 @@ The scope map makes the inferred control model explicit:
    an unblocked assignment path is the missed control gap.
 
 RADAR does not claim that a specific person has already exploited that path.
-The `AssignmentPath` field indicates whether the baseline itself can create
-direct/PIM assignments or whether another principal or delivery process is
-required.
+The `BaselineAccessStatus` and `AssignmentPath` fields indicate whether the
+baseline itself can create direct/PIM assignments or whether another principal
+or delivery process is required.
 
 ## Safety and limitations
 
@@ -393,8 +426,9 @@ required.
   obtainable because request attributes are unknown.
 - Unsupported policy logic remains `Unknown`.
 - `DataActions` are not currently analysed.
-- Actual principal/group membership and existing combined role assignments are
-  not correlated; this is capability analysis rather than a principal audit.
+- An exact principal ID can be evaluated against policy parameters, but group
+  membership and existing combined role assignments are not correlated; this
+  remains capability analysis rather than a principal audit.
 
 ## Testing
 
@@ -412,6 +446,7 @@ The offline suite covers:
 - management-group hierarchy and fallback roots;
 - separate production/UAT baseline contexts;
 - direct and PIM assignment paths;
+- user, group, and service-principal policy conditions;
 - direct policies, initiatives, allow-lists, versions, selectors, overrides,
   `notScopes`, and exemptions;
 - scope-local incomplete discovery;
@@ -424,8 +459,9 @@ The offline suite covers:
 - [x] Per-role, per-AssignableScope baseline contexts
 - [x] Scope-specific policy gap analysis
 - [x] Direct and PIM assignment-path coverage
+- [x] Principal-aware policy-condition evaluation
 - [x] Scope-local conservative failure handling
-- [ ] Optional principal/role-assignment correlation
+- [ ] Existing principal/role-assignment correlation
 - [ ] Markdown report format
 - [ ] CI-friendly exit codes
 

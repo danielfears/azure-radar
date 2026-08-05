@@ -50,6 +50,14 @@
 .PARAMETER NoPolicyDiscovery
     Disables live discovery of Azure Policy assignments that deny roles.
 
+.PARAMETER TargetPrincipalType
+    Principal type used when evaluating role-assignment policy conditions.
+    Defaults to User.
+
+.PARAMETER TargetPrincipalId
+    Optional object ID of the principal receiving the role. When omitted,
+    RADAR models an ordinary principal that is not explicitly exempted.
+
 .EXAMPLE
     # Scan the accessible estate and derive deny coverage from Azure Policy.
     ./Invoke-Radar.ps1 -InputCsv ./restricted-actions.csv -OutputCsv ./output/radar-report.csv -OutputHtml ./output/radar-report.html
@@ -87,6 +95,11 @@ param(
 
     [string[]]$BaselineRolePattern = @(),
 
+    [ValidateSet('User', 'Group', 'ServicePrincipal')]
+    [string]$TargetPrincipalType = 'User',
+
+    [string]$TargetPrincipalId,
+
     [switch]$NoPolicyDiscovery
 )
 
@@ -97,6 +110,22 @@ $ErrorActionPreference = 'Stop'
 $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
 $scriptDir = Split-Path -Parent $PSCommandPath
 $defaultInputCsv = Join-Path $scriptDir 'restricted-actions.csv'
+$effectiveTargetPrincipalId = if (
+    [string]::IsNullOrWhiteSpace($TargetPrincipalId)
+) {
+    '__RADAR_NON_EXEMPT_PRINCIPAL__'
+}
+else {
+    $TargetPrincipalId
+}
+$targetPrincipalScenario = if (
+    [string]::IsNullOrWhiteSpace($TargetPrincipalId)
+) {
+    "Non-exempt $TargetPrincipalType"
+}
+else {
+    "$TargetPrincipalType with supplied principal ID"
+}
 
 # Interactive menu when launched with no scoping parameters.
 $invokedWithArgs =
@@ -107,7 +136,9 @@ $invokedWithArgs =
     $ManagementGroup -or
     $CurrentSubscriptionOnly -or
     $BuiltInOnly -or
-    $DynamicRestrictedActions
+    $DynamicRestrictedActions -or
+    $PSBoundParameters.ContainsKey('TargetPrincipalType') -or
+    $PSBoundParameters.ContainsKey('TargetPrincipalId')
 if (-not $invokedWithArgs -and -not $NoMenu) {
     $defaultIn     = $defaultInputCsv
     $defaultCsv    = Join-Path $scriptDir 'output/radar-report.csv'
@@ -1956,7 +1987,11 @@ function ConvertTo-RadarHtmlReport {
 
         [bool]$DiscoveryComplete = $true,
 
-        [string[]]$DiscoveryWarnings = @()
+        [string[]]$DiscoveryWarnings = @(),
+
+        [string]$PrincipalScenario = 'Non-exempt User',
+
+        [switch]$MapOnly
     )
 
     $generated = (Get-Date).ToString('u')
@@ -1989,7 +2024,15 @@ function ConvertTo-RadarHtmlReport {
     [void]$sb.AppendLine('<!DOCTYPE html>')
     [void]$sb.AppendLine('<html lang="en"><head><meta charset="utf-8"/>')
     [void]$sb.AppendLine('<meta name="viewport" content="width=device-width,initial-scale=1"/>')
-    [void]$sb.AppendLine('<title>RADAR Report</title>')
+    $documentTitle = if ($MapOnly) {
+        'RADAR Scope Control-Gap Map'
+    }
+    else {
+        'RADAR Report'
+    }
+    [void]$sb.AppendLine(
+        '<title>' + $documentTitle + '</title>'
+    )
     [void]$sb.AppendLine(@'
 <style>
   :root {
@@ -2153,6 +2196,7 @@ function ConvertTo-RadarHtmlReport {
   .scope-map-table td {
     white-space: normal; vertical-align: top; min-width: 110px;
   }
+  .scope-map-table { table-layout: fixed; }
   .scope-map-table td.scope-id {
     min-width: 260px; overflow-wrap: anywhere;
   }
@@ -2163,20 +2207,17 @@ function ConvertTo-RadarHtmlReport {
     margin-top: 6px; max-width: 520px;
     overflow-wrap: anywhere; line-height: 1.45;
   }
-  .scope-tree, .scope-tree ul {
-    list-style: none; margin: 0; padding-left: 24px;
+  .scope-tree { margin-top: 16px; }
+  .scope-node {
     position: relative;
+    margin: 10px 0 10px var(--scope-indent, 0);
+    width: calc(100% - var(--scope-indent, 0));
   }
-  .scope-tree { padding-left: 0; margin-top: 16px; }
-  .scope-tree ul::before {
-    content: ""; position: absolute; top: 0; bottom: 16px;
-    left: 9px; border-left: 1px solid var(--border);
+  .scope-node::before {
+    content: ""; position: absolute; top: 20px; left: -12px;
+    width: 10px; border-top: 1px solid var(--border);
   }
-  .scope-node { position: relative; margin: 10px 0; }
-  .scope-tree ul > .scope-node::before {
-    content: ""; position: absolute; top: 18px; left: -15px;
-    width: 15px; border-top: 1px solid var(--border);
-  }
+  .scope-node[data-depth="0"]::before { display: none; }
   .scope-card {
     background: var(--panel-2); border: 1px solid var(--border);
     border-radius: 10px; padding: 10px 12px;
@@ -2195,6 +2236,9 @@ function ConvertTo-RadarHtmlReport {
   .scope-card .scope-count.gap {
     color: var(--danger); border: 1px solid rgba(255,92,122,.45);
   }
+  .scope-card .scope-count.external {
+    color: #f59e0b; border: 1px solid rgba(245,158,11,.45);
+  }
   .scope-card .scope-count.unknown {
     color: var(--warn); border: 1px solid rgba(255,184,107,.45);
   }
@@ -2202,6 +2246,45 @@ function ConvertTo-RadarHtmlReport {
     color: var(--ok); border: 1px solid rgba(91,227,177,.4);
   }
   .scope-node-content { margin-top: 10px; }
+  .baseline-summary {
+    margin-top: 12px; padding: 12px;
+    background: rgba(255,255,255,.025);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .baseline-summary:first-child { margin-top: 10px; }
+  .baseline-heading {
+    font-weight: 600; margin-bottom: 10px; overflow-wrap: anywhere;
+  }
+  .baseline-scope {
+    display: block; margin-top: 3px; color: var(--muted);
+    font-size: 11px; font-weight: 400;
+  }
+  .baseline-metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+    gap: 10px;
+  }
+  .map-metric {
+    min-width: 0; padding: 10px 12px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .map-metric summary {
+    display: block; cursor: pointer; color: var(--muted);
+    font-size: 12px; line-height: 1.4;
+  }
+  .map-metric summary strong {
+    display: inline-block; margin-right: 5px;
+    color: var(--text); font-size: 15px;
+  }
+  .map-metric.gap { border-color: rgba(255,92,122,.35); }
+  .map-metric.external { border-color: rgba(245,158,11,.35); }
+  .map-metric.unknown { border-color: rgba(255,184,107,.35); }
+  .map-metric.covered { border-color: rgba(91,227,177,.3); }
+  .map-metric .list {
+    margin-top: 8px; max-height: 220px; overflow: auto;
+    white-space: normal; overflow-wrap: anywhere;
+  }
 
   .compliance {
     display: flex; align-items: center; gap: 28px; flex-wrap: wrap;
@@ -2226,12 +2309,25 @@ function ConvertTo-RadarHtmlReport {
     [void]$sb.AppendLine('</head><body>')
 
     [void]$sb.AppendLine('<header><div class="logo"></div><div>')
-    [void]$sb.AppendLine('<h1>RADAR - Restricted Action Detector for Azure Roles</h1>')
+    [void]$sb.AppendLine(
+        '<h1>' +
+        $documentTitle +
+        '</h1>'
+    )
     $scope = if ($IncludeCustomRoles) { 'built-in &amp; custom roles' } else { 'built-in roles' }
     $scopeNote = if ($IncludeCustomRoles -and $CustomScope) {
         ' &middot; ' + (ConvertTo-HtmlSafe $CustomScope)
     } else { '' }
-    [void]$sb.AppendLine("<div class=`"sub`">Generated $generated &middot; Scope: $scope$scopeNote</div>")
+    [void]$sb.AppendLine(
+        '<div class="sub">Generated ' +
+        $generated +
+        ' &middot; Scope: ' +
+        $scope +
+        $scopeNote +
+        ' &middot; Assignment subject: ' +
+        (ConvertTo-HtmlSafe $PrincipalScenario) +
+        '</div>'
+    )
     [void]$sb.AppendLine('</div></header>')
 
     [void]$sb.AppendLine('<main>')
@@ -2250,6 +2346,7 @@ function ConvertTo-RadarHtmlReport {
         [void]$sb.AppendLine('</section>')
     }
 
+    if (-not $MapOnly) {
     $customMatches  = @(@($Results) | Where-Object { $_.IsCustom }).Count
     $builtInMatches = $totalMatches - $customMatches
 
@@ -2390,6 +2487,7 @@ function ConvertTo-RadarHtmlReport {
         }
         [void]$sb.AppendLine('</ul></details>')
     }
+    }
 
     if ($controlGapMapArray.Count -gt 0) {
         $collectDelimitedValues = {
@@ -2412,36 +2510,116 @@ function ConvertTo-RadarHtmlReport {
                     Sort-Object -Unique
             )
         }
+        $getMapBaselineAccessStatus = {
+            param([object]$Row)
+
+            $status = [string](
+            Get-RadarPropertyValue `
+                -InputObject $Row `
+                -Name 'BaselineAccessStatus'
+            )
+            if (
+            $status -in @(
+                'Obtainable',
+                'ExternalOnly',
+                'Unknown',
+                'Covered'
+            )
+            ) {
+            return $status
+            }
+            if (
+            -not [string]::IsNullOrWhiteSpace(
+                [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $Row `
+                        -Name 'BaselineAssignableRoles'
+                )
+            )
+            ) {
+            return 'Obtainable'
+            }
+            if (
+            [string](
+                Get-RadarPropertyValue `
+                    -InputObject $Row `
+                    -Name 'GapStatus'
+            ) -eq 'Unknown' -or
+            -not [string]::IsNullOrWhiteSpace(
+                [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $Row `
+                        -Name 'UnknownBaselineAssignableRoles'
+                    )
+            ) -or
+            -not [string]::IsNullOrWhiteSpace(
+                [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $Row `
+                        -Name 'CoverageWarnings'
+                )
+            )
+            ) {
+            return 'Unknown'
+            }
+            if (
+            -not [string]::IsNullOrWhiteSpace(
+                [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $Row `
+                        -Name 'ExternalAssignmentRoles'
+                )
+            )
+            ) {
+            return 'ExternalOnly'
+            }
+            return 'Covered'
+        }
         $scopeMapSummaries = @(
             $controlGapMapArray |
-                Group-Object {
-                    @(
-                        $_.EvaluationScope,
-                        $_.BaselineRoleId
-                    ) -join [char]31
-                } |
-                ForEach-Object {
-                    $rows = @($_.Group)
-                    $first = $rows[0]
-                    $gapRows = @(
-                        $rows |
-                            Where-Object {
-                                $_.GapStatus -eq 'Gap'
-                            }
+            Group-Object {
+                @(
+                    $_.EvaluationScope,
+                    $_.BaselineRoleId,
+                    (
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'BaselineScope'
                     )
-                    $unknownRows = @(
-                        $rows |
-                            Where-Object {
-                                $_.GapStatus -eq 'Unknown'
-                            }
-                    )
-                    $coveredRows = @(
-                        $rows |
-                            Where-Object {
-                                $_.GapStatus -eq 'Covered'
-                            }
-                    )
-                    [pscustomobject]@{
+                ) -join [char]31
+            } |
+            ForEach-Object {
+                $rows = @($_.Group)
+                $first = $rows[0]
+                $baselineObtainableRows = @(
+                    $rows |
+                        Where-Object {
+                            (& $getMapBaselineAccessStatus $_) -eq
+                                'Obtainable'
+                        }
+                )
+                $externalGapRows = @(
+                    $rows |
+                        Where-Object {
+                            (& $getMapBaselineAccessStatus $_) -eq
+                                'ExternalOnly'
+                        }
+                )
+                $unknownRows = @(
+                    $rows |
+                        Where-Object {
+                            (& $getMapBaselineAccessStatus $_) -eq
+                                'Unknown'
+                        }
+                )
+                $coveredRows = @(
+                    $rows |
+                        Where-Object {
+                            (& $getMapBaselineAccessStatus $_) -eq
+                                'Covered'
+                        }
+                )
+                [pscustomobject]@{
                         EvaluationScopeType =
                             $first.EvaluationScopeType
                         EvaluationScopeName =
@@ -2465,8 +2643,21 @@ function ConvertTo-RadarHtmlReport {
                         )
                         BaselineRoleName =
                             $first.BaselineRoleName
-                        GapActions = @(
-                            $gapRows |
+                        BaselineScope =
+                            Get-RadarPropertyValue `
+                                -InputObject $first `
+                                -Name 'BaselineScope'
+                        BaselineObtainableActions = @(
+                            $baselineObtainableRows |
+                                ForEach-Object {
+                                    Get-RadarPropertyValue `
+                                        -InputObject $_ `
+                                        -Name 'RestrictedAction'
+                                } |
+                                Sort-Object -Unique
+                        )
+                        ExternalGapActions = @(
+                            $externalGapRows |
                                 ForEach-Object {
                                     Get-RadarPropertyValue `
                                         -InputObject $_ `
@@ -2476,12 +2667,12 @@ function ConvertTo-RadarHtmlReport {
                         )
                         BaselineAssignableRoles = @(
                             & $collectDelimitedValues `
-                                $gapRows `
+                                $baselineObtainableRows `
                                 'BaselineAssignableRoles'
                         )
                         ExternalAssignmentRoles = @(
                             & $collectDelimitedValues `
-                                $gapRows `
+                                $externalGapRows `
                                 'ExternalAssignmentRoles'
                         )
                         UnknownActions = @(
@@ -2512,7 +2703,8 @@ function ConvertTo-RadarHtmlReport {
                 Sort-Object `
                     EvaluationScopeType,
                     EvaluationScopeName,
-                    BaselineRoleName
+                    BaselineRoleName,
+                    BaselineScope
         )
         $scopeCountInMap = @(
             $controlGapMapArray |
@@ -2535,20 +2727,37 @@ function ConvertTo-RadarHtmlReport {
             $controlGapMapArray |
                 Where-Object { $_.GapStatus -eq 'Covered' }
         ).Count
-        $renderMapList = {
+        $renderMapMetric = {
             param(
                 [object[]]$Values,
-                [string]$Label
+                [string]$Label,
+                [string]$ClassName = ''
             )
-            if (@($Values).Count -eq 0) { return '0' }
+            $items = @($Values)
+            $classAttribute = if ($ClassName) {
+                " $ClassName"
+            }
+            else {
+                ''
+            }
+            $content = if ($items.Count -gt 0) {
+                '<div class="list code">' +
+                (ConvertTo-HtmlSafe ($items -join '; ')) +
+                '</div>'
+            }
+            else {
+                ''
+            }
             return (
-                '<details><summary>' +
-                @($Values).Count +
-                ' ' +
+                '<details class="map-metric' +
+                $classAttribute +
+                '"><summary><strong>' +
+                $items.Count +
+                '</strong>' +
                 (ConvertTo-HtmlSafe $Label) +
-                '</summary><div class="list code">' +
-                (ConvertTo-HtmlSafe (@($Values) -join '; ')) +
-                '</div></details>'
+                '</summary>' +
+                $content +
+                '</details>'
             )
         }
 
@@ -2561,6 +2770,9 @@ function ConvertTo-RadarHtmlReport {
         [void]$sb.AppendLine(
             '<p class="note">Scope-first view of baseline NotAction intent, ' +
             'roles that still grant each action, and policy coverage. ' +
+            'User-obtainable means the baseline role itself has an unblocked ' +
+            'assignment route; external-route gaps require another principal ' +
+            'or assignment process. ' +
             "$gapRowCount confirmed gap rows, $unknownRowCount unknown rows, " +
             "$coveredRowCount covered rows. The companion scope-map CSV " +
             'contains one normalised row per scope, baseline and action.</p>'
@@ -2643,12 +2855,21 @@ function ConvertTo-RadarHtmlReport {
             )
             $node = $scopeNodeById[$NodeKey]
             $nodeSummaries = @($node.Summaries.ToArray())
-            $nodeGapActions = @(
+            $nodeBaselineObtainableActions = @(
                 $nodeSummaries |
                     ForEach-Object {
                         Get-RadarPropertyValue `
                             -InputObject $_ `
-                            -Name 'GapActions'
+                            -Name 'BaselineObtainableActions'
+                    } |
+                    Sort-Object -Unique
+            )
+            $nodeExternalGapActions = @(
+                $nodeSummaries |
+                    ForEach-Object {
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'ExternalGapActions'
                     } |
                     Sort-Object -Unique
             )
@@ -2676,8 +2897,13 @@ function ConvertTo-RadarHtmlReport {
             else {
                 ''
             }
+            $indent = [math]::Min($Depth * 22, 132)
             [void]$sb.AppendLine(
-                '<li class="scope-node" data-scope-id="' +
+                '<div class="scope-node" data-depth="' +
+                $Depth +
+                '" style="--scope-indent:' +
+                $indent +
+                'px" data-scope-id="' +
                 (ConvertTo-HtmlSafe $node.Id) +
                 '" data-parent-scope="' +
                 (ConvertTo-HtmlSafe $node.EffectiveParentScope) +
@@ -2691,8 +2917,12 @@ function ConvertTo-RadarHtmlReport {
                 '</span><span class="scope-type">' +
                 (ConvertTo-HtmlSafe $node.Type) +
                 '</span><span class="scope-count gap">' +
-                $nodeGapActions.Count +
-                ' gap actions</span><span class="scope-count unknown">' +
+                $nodeBaselineObtainableActions.Count +
+                ' user-obtainable</span>' +
+                '<span class="scope-count external">' +
+                $nodeExternalGapActions.Count +
+                ' external-route</span>' +
+                '<span class="scope-count unknown">' +
                 $nodeUnknownActions.Count +
                 ' unknown</span><span class="scope-count covered">' +
                 $nodeCoveredActions.Count +
@@ -2701,55 +2931,67 @@ function ConvertTo-RadarHtmlReport {
             [void]$sb.AppendLine(
                 '<div class="scope-node-content"><div class="code">' +
                 (ConvertTo-HtmlSafe $node.Id) +
-                '</div><div class="scope-map-wrap">' +
-                '<table class="scope-map-table"><thead><tr>' +
-                '<th>Baseline</th><th>Gap actions</th>' +
-                '<th>Baseline-assignable roles</th>' +
-                '<th>External-process roles</th>' +
-                '<th>Unknown actions</th><th>Covered actions</th>' +
-                '<th>Blocking policies</th></tr></thead><tbody>'
+                '</div>'
             )
             foreach (
                 $summary in @(
                     $nodeSummaries |
-                        Sort-Object BaselineRoleName
+                        Sort-Object BaselineRoleName, BaselineScope
                 )
             ) {
-                [void]$sb.AppendLine('<tr>')
+                $baselineScopeMarkup = if (
+                    -not [string]::IsNullOrWhiteSpace(
+                        [string]$summary.BaselineScope
+                    )
+                ) {
+                    '<span class="baseline-scope">@ ' +
+                    (ConvertTo-HtmlSafe $summary.BaselineScope) +
+                    '</span>'
+                }
+                else {
+                    ''
+                }
                 [void]$sb.AppendLine(
-                    '<td>' +
+                    '<section class="baseline-summary">' +
+                    '<div class="baseline-heading">' +
                     (ConvertTo-HtmlSafe $summary.BaselineRoleName) +
-                    '</td><td>' +
-                    (& $renderMapList $summary.GapActions 'actions') +
-                    '</td><td>' +
-                    (& $renderMapList `
+                    $baselineScopeMarkup +
+                    '</div><div class="baseline-metrics">' +
+                    (& $renderMapMetric `
+                        $summary.BaselineObtainableActions `
+                        'user-obtainable actions' `
+                        'gap') +
+                    (& $renderMapMetric `
                         $summary.BaselineAssignableRoles `
-                        'roles') +
-                    '</td><td>' +
-                    (& $renderMapList `
+                        'roles this baseline can assign' `
+                        'gap') +
+                    (& $renderMapMetric `
+                        $summary.ExternalGapActions `
+                        'external-process gap actions' `
+                        'external') +
+                    (& $renderMapMetric `
                         $summary.ExternalAssignmentRoles `
-                        'roles') +
-                    '</td><td>' +
-                    (& $renderMapList `
+                        'roles requiring another process' `
+                        'external') +
+                    (& $renderMapMetric `
                         $summary.UnknownActions `
-                        'actions') +
-                    '</td><td>' +
-                    (& $renderMapList `
+                        'unknown actions' `
+                        'unknown') +
+                    (& $renderMapMetric `
                         $summary.CoveredActions `
-                        'actions') +
-                    '</td><td>' +
-                    (& $renderMapList `
+                        'covered actions' `
+                        'covered') +
+                    (& $renderMapMetric `
                         $summary.BlockingPolicies `
-                        'policies') +
-                    '</td>'
+                        'blocking policies' `
+                        'covered') +
+                    '</div></section>'
                 )
-                [void]$sb.AppendLine('</tr>')
             }
             [void]$sb.AppendLine(
-                '</tbody></table></div></div></details>'
+                '</div></details></div>'
             )
             if ($childrenByParent.ContainsKey($NodeKey)) {
-                [void]$sb.AppendLine('<ul>')
                 foreach (
                     $childKey in @(
                         $childrenByParent[$NodeKey] |
@@ -2763,12 +3005,10 @@ function ConvertTo-RadarHtmlReport {
                 ) {
                     & $renderScopeNode $childKey ($Depth + 1)
                 }
-                [void]$sb.AppendLine('</ul>')
             }
-            [void]$sb.AppendLine('</li>')
         }
 
-        [void]$sb.AppendLine('<ul class="scope-tree">')
+        [void]$sb.AppendLine('<div class="scope-tree">')
         foreach (
             $rootChildKey in @(
                 $childrenByParent[$rootNodeKey] |
@@ -2782,80 +3022,11 @@ function ConvertTo-RadarHtmlReport {
         ) {
             & $renderScopeNode $rootChildKey 0
         }
-        [void]$sb.AppendLine('</ul>')
-
-        [void]$sb.AppendLine(
-            '<details><summary>Flat scope summary table</summary>'
-        )
-        [void]$sb.AppendLine(
-            '<div class="scope-map-wrap"><table class="scope-map-table">' +
-            '<thead><tr><th>Scope</th><th>Baseline</th>' +
-            '<th>Gap actions</th><th>Baseline-assignable roles</th>' +
-            '<th>External-process roles</th><th>Unknown actions</th>' +
-            '<th>Covered actions</th><th>Blocking policies</th>' +
-            '</tr></thead><tbody>'
-        )
-        foreach ($summary in $scopeMapSummaries) {
-            $scopeLabel = (
-                "$($summary.EvaluationScopeName) " +
-                "($($summary.EvaluationScopeType))"
-            )
-            [void]$sb.AppendLine('<tr>')
-            [void]$sb.AppendLine(
-                '<td class="scope-id"><strong>' +
-                (ConvertTo-HtmlSafe $scopeLabel) +
-                '</strong><div class="code">' +
-                (ConvertTo-HtmlSafe $summary.EvaluationScope) +
-                '</div></td>'
-            )
-            [void]$sb.AppendLine(
-                '<td>' +
-                (ConvertTo-HtmlSafe $summary.BaselineRoleName) +
-                '</td>'
-            )
-            [void]$sb.AppendLine(
-                '<td>' +
-                (& $renderMapList $summary.GapActions 'actions') +
-                '</td>'
-            )
-            [void]$sb.AppendLine(
-                '<td>' +
-                (& $renderMapList `
-                    $summary.BaselineAssignableRoles `
-                    'roles') +
-                '</td>'
-            )
-            [void]$sb.AppendLine(
-                '<td>' +
-                (& $renderMapList `
-                    $summary.ExternalAssignmentRoles `
-                    'roles') +
-                '</td>'
-            )
-            [void]$sb.AppendLine(
-                '<td>' +
-                (& $renderMapList $summary.UnknownActions 'actions') +
-                '</td>'
-            )
-            [void]$sb.AppendLine(
-                '<td>' +
-                (& $renderMapList $summary.CoveredActions 'actions') +
-                '</td>'
-            )
-            [void]$sb.AppendLine(
-                '<td>' +
-                (& $renderMapList `
-                    $summary.BlockingPolicies `
-                    'policies') +
-                '</td>'
-            )
-            [void]$sb.AppendLine('</tr>')
-        }
-        [void]$sb.AppendLine(
-            '</tbody></table></div></details></details>'
-        )
+        [void]$sb.AppendLine('</div>')
+        [void]$sb.AppendLine('</details>')
     }
 
+    if (-not $MapOnly) {
     # Toolbar / filter.
     [void]$sb.AppendLine('<div class="toolbar"><input id="filter" type="search" placeholder="Filter by role name, action, or matched pattern..." /><button id="toggle-all" type="button">Expand all</button></div>')
 
@@ -2966,9 +3137,16 @@ function ConvertTo-RadarHtmlReport {
             [void]$sb.AppendLine('</tbody></table></div></details>')
         }
     }
+    }
 
     [void]$sb.AppendLine('</main>')
-    [void]$sb.AppendLine('<footer>RADAR report &middot; ' + $generated + '</footer>')
+    [void]$sb.AppendLine(
+        '<footer>' +
+        $documentTitle +
+        ' &middot; ' +
+        $generated +
+        '</footer>'
+    )
 
     # Client-side filter.
     [void]$sb.AppendLine(@'
@@ -4178,6 +4356,8 @@ function Resolve-RadarPolicyAliasValue {
         [object]$Role,
         [string]$AssignmentResourceType,
         [string]$AssignmentScope,
+        [string]$TargetPrincipalType,
+        [string]$TargetPrincipalId,
         [switch]$StringValue
     )
 
@@ -4238,6 +4418,28 @@ function Resolve-RadarPolicyAliasValue {
         }
     }
     if (
+        $propertyName -ieq 'principalType' -and
+        -not [string]::IsNullOrWhiteSpace($TargetPrincipalType)
+    ) {
+        return [pscustomobject]@{
+            IsResolved = $true
+            Value = $TargetPrincipalType
+            IsRoleDefinitionId = $false
+            Reason = $null
+        }
+    }
+    if (
+        $propertyName -ieq 'principalId' -and
+        -not [string]::IsNullOrWhiteSpace($TargetPrincipalId)
+    ) {
+        return [pscustomobject]@{
+            IsResolved = $true
+            Value = $TargetPrincipalId
+            IsRoleDefinitionId = $false
+            Reason = $null
+        }
+    }
+    if (
         $propertyName -ieq 'scope' -and
         -not [string]::IsNullOrWhiteSpace($AssignmentScope)
     ) {
@@ -4264,7 +4466,9 @@ function Test-RadarPolicyCondition {
         [hashtable]$Parameters = @{},
         [string]$AssignmentResourceType =
             'Microsoft.Authorization/roleAssignments',
-        [string]$AssignmentScope
+        [string]$AssignmentScope,
+        [string]$TargetPrincipalType,
+        [string]$TargetPrincipalId
     )
 
     $Condition = ConvertFrom-RadarJsonObject -InputObject $Condition
@@ -4282,7 +4486,9 @@ function Test-RadarPolicyCondition {
                 -Role $Role `
                 -Parameters $Parameters `
                 -AssignmentResourceType $AssignmentResourceType `
-                -AssignmentScope $AssignmentScope
+                -AssignmentScope $AssignmentScope `
+                -TargetPrincipalType $TargetPrincipalType `
+                -TargetPrincipalId $TargetPrincipalId
             if ($result.State -eq 'False') { return $result }
             if ($result.State -eq 'Unknown') {
                 $sawUnknown = $true
@@ -4310,7 +4516,9 @@ function Test-RadarPolicyCondition {
                 -Role $Role `
                 -Parameters $Parameters `
                 -AssignmentResourceType $AssignmentResourceType `
-                -AssignmentScope $AssignmentScope
+                -AssignmentScope $AssignmentScope `
+                -TargetPrincipalType $TargetPrincipalType `
+                -TargetPrincipalId $TargetPrincipalId
             if ($result.State -eq 'True') { return $result }
             if ($result.State -eq 'Unknown') {
                 $sawUnknown = $true
@@ -4333,7 +4541,9 @@ function Test-RadarPolicyCondition {
             -Role $Role `
             -Parameters $Parameters `
             -AssignmentResourceType $AssignmentResourceType `
-            -AssignmentScope $AssignmentScope
+            -AssignmentScope $AssignmentScope `
+            -TargetPrincipalType $TargetPrincipalType `
+            -TargetPrincipalId $TargetPrincipalId
         if ($innerResult.State -eq 'Unknown') { return $innerResult }
         return New-RadarPolicyEvaluation `
             -State $(if ($innerResult.State -eq 'True') { 'False' } else { 'True' })
@@ -4366,7 +4576,9 @@ function Test-RadarPolicyCondition {
                 -Field $field `
                 -Role $Role `
                 -AssignmentResourceType $AssignmentResourceType `
-                -AssignmentScope $AssignmentScope
+                -AssignmentScope $AssignmentScope `
+                -TargetPrincipalType $TargetPrincipalType `
+                -TargetPrincipalId $TargetPrincipalId
             if (-not $aliasValue.IsResolved) {
                 return New-RadarPolicyEvaluation `
                     -State 'Unknown' `
@@ -4438,6 +4650,8 @@ function Test-RadarPolicyCondition {
                     -Role $Role `
                     -AssignmentResourceType $AssignmentResourceType `
                     -AssignmentScope $AssignmentScope `
+                    -TargetPrincipalType $TargetPrincipalType `
+                    -TargetPrincipalId $TargetPrincipalId `
                     -StringValue:$stringFieldMatch.Success
                 if (-not $aliasValue.IsResolved) {
                     return New-RadarPolicyEvaluation `
@@ -4707,7 +4921,9 @@ function Test-RadarPolicyRuleForRole {
         [hashtable]$Parameters = @{},
         [string]$AssignmentResourceType =
             'Microsoft.Authorization/roleAssignments',
-        [string]$AssignmentScope
+        [string]$AssignmentScope,
+        [string]$TargetPrincipalType,
+        [string]$TargetPrincipalId
     )
 
     $PolicyRule = ConvertFrom-RadarJsonObject -InputObject $PolicyRule
@@ -4747,7 +4963,9 @@ function Test-RadarPolicyRuleForRole {
         -Role $Role `
         -Parameters $Parameters `
         -AssignmentResourceType $AssignmentResourceType `
-        -AssignmentScope $AssignmentScope
+        -AssignmentScope $AssignmentScope `
+        -TargetPrincipalType $TargetPrincipalType `
+        -TargetPrincipalId $TargetPrincipalId
     switch ($conditionResult.State) {
         'True' {
             return [pscustomobject]@{
@@ -6218,6 +6436,11 @@ function Get-RadarRoleDenyCoverage {
 
         [object[]]$AssignmentPaths = @(),
 
+        [string]$TargetPrincipalType = 'User',
+
+        [string]$TargetPrincipalId =
+            '__RADAR_NON_EXEMPT_PRINCIPAL__',
+
         [hashtable]$PolicyEvaluationCache
     )
 
@@ -6278,6 +6501,8 @@ function Get-RadarRoleDenyCoverage {
                         UnblockedAssignmentPaths = @()
                         BaselineAssignablePaths = @()
                         ExternalAssignmentPaths = @()
+                        UnknownBaselineAssignablePaths = @()
+                        UnknownExternalAssignmentPaths = @()
                         UnknownReasons = @()
                     }
                 }
@@ -6337,6 +6562,30 @@ function Get-RadarRoleDenyCoverage {
                                 } |
                                 ForEach-Object { $_.Name }
                         )
+                        UnknownBaselineAssignablePaths = @(
+                            $AssignmentPaths |
+                                Where-Object {
+                                    (
+                                        Get-RadarPropertyValue `
+                                            -InputObject $_ `
+                                            -Name 'Reachability'
+                                    ) -like
+                                        'Baseline role can create*'
+                                } |
+                                ForEach-Object { $_.Name }
+                        )
+                        UnknownExternalAssignmentPaths = @(
+                            $AssignmentPaths |
+                                Where-Object {
+                                    (
+                                        Get-RadarPropertyValue `
+                                            -InputObject $_ `
+                                            -Name 'Reachability'
+                                    ) -notlike
+                                        'Baseline role can create*'
+                                } |
+                                ForEach-Object { $_.Name }
+                        )
                         UnknownReasons = @(
                             'Live policy discovery was disabled.'
                         )
@@ -6376,6 +6625,10 @@ function Get-RadarRoleDenyCoverage {
         $scopeBaselineAssignablePaths =
             New-Object System.Collections.Generic.List[string]
         $scopeExternalAssignmentPaths =
+            New-Object System.Collections.Generic.List[string]
+        $scopeUnknownBaselineAssignablePaths =
+            New-Object System.Collections.Generic.List[string]
+        $scopeUnknownExternalAssignmentPaths =
             New-Object System.Collections.Generic.List[string]
         $scopeUnknownReasons =
             New-Object System.Collections.Generic.List[string]
@@ -6460,6 +6713,8 @@ function Get-RadarRoleDenyCoverage {
                         $roleKey,
                         $ruleKey,
                         [string]$assignmentPath.ResourceType,
+                        $TargetPrincipalType,
+                        $TargetPrincipalId,
                         'scope-probe'
                     ) -join [char]31
                     if (
@@ -6474,6 +6729,12 @@ function Get-RadarRoleDenyCoverage {
                                 -Parameters $rule.Parameters `
                                 -AssignmentResourceType (
                                     $assignmentPath.ResourceType
+                                ) `
+                                -TargetPrincipalType (
+                                    $TargetPrincipalType
+                                ) `
+                                -TargetPrincipalId (
+                                    $TargetPrincipalId
                                 )
                     }
                     $probeEvaluation =
@@ -6496,6 +6757,8 @@ function Get-RadarRoleDenyCoverage {
                         $roleKey,
                         $ruleKey,
                         [string]$assignmentPath.ResourceType,
+                        $TargetPrincipalType,
+                        $TargetPrincipalId,
                         $scopeCacheKey
                     ) -join [char]31
                     if (
@@ -6511,7 +6774,13 @@ function Get-RadarRoleDenyCoverage {
                                 -AssignmentResourceType (
                                     $assignmentPath.ResourceType
                                 ) `
-                                -AssignmentScope $roleScope
+                                -AssignmentScope $roleScope `
+                                -TargetPrincipalType (
+                                    $TargetPrincipalType
+                                ) `
+                                -TargetPrincipalId (
+                                    $TargetPrincipalId
+                                )
                     }
                     $evaluation =
                         $PolicyEvaluationCache[$evaluationKey]
@@ -6540,6 +6809,24 @@ function Get-RadarRoleDenyCoverage {
             }
             elseif ($pathUnknown) {
                 $scopeUnknown = $true
+                $reachability = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $assignmentPath `
+                        -Name 'Reachability'
+                )
+                if (
+                    $reachability -like
+                    'Baseline role can create*'
+                ) {
+                    [void]$scopeUnknownBaselineAssignablePaths.Add(
+                        $assignmentPath.Name
+                    )
+                }
+                else {
+                    [void]$scopeUnknownExternalAssignmentPaths.Add(
+                        $assignmentPath.Name
+                    )
+                }
                 $reason =
                     "$($assignmentPath.Name) coverage at '$roleScope' is uncertain."
                 [void]$unknownReasons.Add($reason)
@@ -6624,6 +6911,14 @@ function Get-RadarRoleDenyCoverage {
             )
             ExternalAssignmentPaths = @(
                 $scopeExternalAssignmentPaths |
+                    Sort-Object -Unique
+            )
+            UnknownBaselineAssignablePaths = @(
+                $scopeUnknownBaselineAssignablePaths |
+                    Sort-Object -Unique
+            )
+            UnknownExternalAssignmentPaths = @(
+                $scopeUnknownExternalAssignmentPaths |
                     Sort-Object -Unique
             )
             UnknownReasons = @(
@@ -6757,6 +7052,25 @@ function Get-RadarScopeMapCsvPath {
     $fileName = (
         [System.IO.Path]::GetFileNameWithoutExtension($MatchCsvPath) +
         '-scope-map.csv'
+    )
+    if ($directory) {
+        return Join-Path $directory $fileName
+    }
+    return $fileName
+}
+
+function Get-RadarScopeMapHtmlPath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ReportHtmlPath
+    )
+
+    $directory = Split-Path -Parent $ReportHtmlPath
+    $fileName = (
+        [System.IO.Path]::GetFileNameWithoutExtension(
+            $ReportHtmlPath
+        ) +
+        '-scope-map.html'
     )
     if ($directory) {
         return Join-Path $directory $fileName
@@ -6907,6 +7221,10 @@ function Get-RadarControlGapMap {
                     ConfirmedGapRoles = & $newStringSet
                     BaselineAssignableRoles = & $newStringSet
                     ExternalAssignmentRoles = & $newStringSet
+                    UnknownBaselineAssignableRoles =
+                        & $newStringSet
+                    UnknownExternalAssignmentRoles =
+                        & $newStringSet
                     UnknownRoles = & $newStringSet
                     CoveredRoles = & $newStringSet
                     BlockingPolicies = & $newStringSet
@@ -6953,6 +7271,40 @@ function Get-RadarControlGapMap {
                     [void]$group.UnknownRoles.Add($roleLabel)
                 }
             }
+            $unknownBaselinePaths = @(
+                Get-RadarPropertyValue `
+                    -InputObject $scopeEvaluation `
+                    -Name 'UnknownBaselineAssignablePaths' |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$_
+                        )
+                    }
+            )
+            if (
+                $unknownBaselinePaths.Count -gt 0
+            ) {
+                [void]$group.UnknownBaselineAssignableRoles.Add(
+                    $roleLabel
+                )
+            }
+            $unknownExternalPaths = @(
+                Get-RadarPropertyValue `
+                    -InputObject $scopeEvaluation `
+                    -Name 'UnknownExternalAssignmentPaths' |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$_
+                        )
+                    }
+            )
+            if (
+                $unknownExternalPaths.Count -gt 0
+            ) {
+                [void]$group.UnknownExternalAssignmentRoles.Add(
+                    $roleLabel
+                )
+            }
             & $addValues `
                 $group.BlockingPolicies `
                 @(
@@ -6993,6 +7345,14 @@ function Get-RadarControlGapMap {
                     $group.ExternalAssignmentRoles |
                         Sort-Object
                 )
+                $unknownSelfRoles = @(
+                    $group.UnknownBaselineAssignableRoles |
+                        Sort-Object
+                )
+                $unknownExternalRoles = @(
+                    $group.UnknownExternalAssignmentRoles |
+                        Sort-Object
+                )
                 $unknownRoles = @(
                     $group.UnknownRoles |
                         Sort-Object
@@ -7003,6 +7363,21 @@ function Get-RadarControlGapMap {
                 )
                 $mapStatus = if ($gapRoles.Count -gt 0) {
                     'Gap'
+                }
+                elseif ($unknownRoles.Count -gt 0) {
+                    'Unknown'
+                }
+                else {
+                    'Covered'
+                }
+                $baselineAccessStatus = if ($selfRoles.Count -gt 0) {
+                    'Obtainable'
+                }
+                elseif ($unknownSelfRoles.Count -gt 0) {
+                    'Unknown'
+                }
+                elseif ($externalRoles.Count -gt 0) {
+                    'ExternalOnly'
                 }
                 elseif ($unknownRoles.Count -gt 0) {
                     'Unknown'
@@ -7036,6 +7411,8 @@ function Get-RadarControlGapMap {
                     IntentSource =
                         $group.IntentSource
                     GapStatus = $mapStatus
+                    BaselineAccessStatus =
+                        $baselineAccessStatus
                     ConfirmedGapRoleCount = $gapRoles.Count
                     ConfirmedGapRoles = $gapRoles -join '; '
                     BaselineAssignableRoleCount =
@@ -7046,6 +7423,14 @@ function Get-RadarControlGapMap {
                         $externalRoles.Count
                     ExternalAssignmentRoles =
                         $externalRoles -join '; '
+                    UnknownBaselineAssignableRoleCount =
+                        $unknownSelfRoles.Count
+                    UnknownBaselineAssignableRoles =
+                        $unknownSelfRoles -join '; '
+                    UnknownExternalAssignmentRoleCount =
+                        $unknownExternalRoles.Count
+                    UnknownExternalAssignmentRoles =
+                        $unknownExternalRoles -join '; '
                     UnknownRoleCount = $unknownRoles.Count
                     UnknownRoles = $unknownRoles -join '; '
                     CoveredRoleCount = $coveredRoles.Count
@@ -7102,12 +7487,17 @@ function Export-RadarControlGapMap {
                     RestrictedAction,
                     IntentSource,
                     GapStatus,
+                    BaselineAccessStatus,
                     ConfirmedGapRoleCount,
                     ConfirmedGapRoles,
                     BaselineAssignableRoleCount,
                     BaselineAssignableRoles,
                     ExternalAssignmentRoleCount,
                     ExternalAssignmentRoles,
+                    UnknownBaselineAssignableRoleCount,
+                    UnknownBaselineAssignableRoles,
+                    UnknownExternalAssignmentRoleCount,
+                    UnknownExternalAssignmentRoles,
                     UnknownRoleCount,
                     UnknownRoles,
                     CoveredRoleCount,
@@ -7123,7 +7513,7 @@ function Export-RadarControlGapMap {
             Set-Content `
                 -LiteralPath $tempPath `
                 -Encoding UTF8 `
-                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","GapStatus","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
+                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","GapStatus","BaselineAccessStatus","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownBaselineAssignableRoleCount","UnknownBaselineAssignableRoles","UnknownExternalAssignmentRoleCount","UnknownExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
         }
         Move-Item `
             -LiteralPath $tempPath `
@@ -7931,6 +8321,7 @@ else {
     Write-Host '  Live policy discovery disabled.'
 }
 
+Write-Host "Assignment subject:    $targetPrincipalScenario"
 Write-Host "Evaluating $($roles.Count) role(s)..."
 $baseDiscoveryComplete =
     $scopeDiscovery.IsComplete -and
@@ -8028,6 +8419,8 @@ $getCoverage = {
             ) `
             -ScopeHierarchy $scopeHierarchy `
             -AssignmentPaths $AssignmentPaths `
+            -TargetPrincipalType $TargetPrincipalType `
+            -TargetPrincipalId $effectiveTargetPrincipalId `
             -PolicyEvaluationCache $policyEvaluationCache
         $coverageCache[$key] = $coverage
     }
@@ -8409,6 +8802,7 @@ Remove-RadarCsvReportSet `
     -MatchCsvPath $partialOutputCsv `
     -CoverageCsvPath $partialCoverageCsv
 
+$scopeMapOutputHtml = $null
 if ($OutputHtml) {
 
     $htmlDir = Split-Path -Parent $OutputHtml
@@ -8439,9 +8833,37 @@ if ($OutputHtml) {
         -RoleDenyRuleCount $policyInventory.RelevantRuleCount `
         -PolicyExemptionCount $policyInventory.ExemptionCount `
         -DiscoveryComplete $discoveryComplete `
-        -DiscoveryWarnings $discoveryWarnings
+        -DiscoveryWarnings $discoveryWarnings `
+        -PrincipalScenario $targetPrincipalScenario
 
     Set-Content -LiteralPath $OutputHtml -Value $html -Encoding UTF8
+
+    $scopeMapOutputHtml = Get-RadarScopeMapHtmlPath `
+        -ReportHtmlPath $OutputHtml
+    $scopeMapHtml = ConvertTo-RadarHtmlReport `
+        -Results @() `
+        -RestrictedActions $restrictedActions `
+        -RolesScanned $roles.Count `
+        -BuiltInScanned $builtInRoles.Count `
+        -CustomScanned $customRoles.Count `
+        -IncludeCustomRoles ([bool]$IncludeCustomRoles) `
+        -CustomScope $effectiveScope `
+        -DeniedListProvided ([bool]$denyCoverageEvaluated) `
+        -SourceRoleNames $dynamicSourceRoleNames `
+        -ScopeCount $policyScopes.Count `
+        -BaselineContextCount $baselineContextInventory.Contexts.Count `
+        -ControlGapMap $controlGapMap `
+        -PolicyAssignmentCount $policyInventory.AssignmentCount `
+        -RoleDenyRuleCount $policyInventory.RelevantRuleCount `
+        -PolicyExemptionCount $policyInventory.ExemptionCount `
+        -DiscoveryComplete $discoveryComplete `
+        -DiscoveryWarnings $discoveryWarnings `
+        -PrincipalScenario $targetPrincipalScenario `
+        -MapOnly
+    Set-Content `
+        -LiteralPath $scopeMapOutputHtml `
+        -Value $scopeMapHtml `
+        -Encoding UTF8
 }
 
 $customMatches = @($sortedResults | Where-Object { $_.IsCustom }).Count
@@ -8518,6 +8940,7 @@ Write-Host "  Coverage detail:      $coverageOutputCsv"
 Write-Host "  Scope control map:    $scopeMapOutputCsv"
 if ($OutputHtml) {
     Write-Host "  HTML report:          $OutputHtml"
+    Write-Host "  Visual scope map:     $scopeMapOutputHtml"
 }
 
 foreach ($warningMessage in $discoveryWarnings) {
