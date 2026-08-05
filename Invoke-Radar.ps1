@@ -6,7 +6,8 @@
     Compares restricted Azure RBAC actions against built-in and custom role
     definitions across the accessible Azure estate. It discovers Azure Policy
     assignments that deny role assignments and reports the restricted actions
-    that remain obtainable through roles not denied at every scanned scope.
+    that remain potentially obtainable through roles not denied at every
+    scanned scope.
 
 .PARAMETER InputCsv
     Path to a CSV containing the restricted actions. Must include an "Action" column.
@@ -58,6 +59,10 @@
     Optional object ID of the principal receiving the role. When omitted,
     RADAR models an ordinary principal that is not explicitly exempted.
 
+.PARAMETER NoAssignmentDiscovery
+    Disables live correlation of direct baseline-role assignments. Findings
+    remain capability-only and assignment exposure is reported as unknown.
+
 .EXAMPLE
     # Scan the accessible estate and derive deny coverage from Azure Policy.
     ./Invoke-Radar.ps1 -InputCsv ./restricted-actions.csv -OutputCsv ./output/radar-report.csv -OutputHtml ./output/radar-report.html
@@ -100,6 +105,8 @@ param(
 
     [string]$TargetPrincipalId,
 
+    [switch]$NoAssignmentDiscovery,
+
     [switch]$NoPolicyDiscovery
 )
 
@@ -137,6 +144,7 @@ $invokedWithArgs =
     $CurrentSubscriptionOnly -or
     $BuiltInOnly -or
     $DynamicRestrictedActions -or
+    $NoAssignmentDiscovery -or
     $PSBoundParameters.ContainsKey('TargetPrincipalType') -or
     $PSBoundParameters.ContainsKey('TargetPrincipalId')
 if (-not $invokedWithArgs -and -not $NoMenu) {
@@ -1058,7 +1066,7 @@ function Get-RadarSubtreeScope {
             $scopeById[$scopeId.TrimEnd('/').ToLowerInvariant()] = $scope
         }
         elseif ($relationship.State -eq 'Unknown') {
-            # Fail open so an unresolved branch cannot hide an obtainable role.
+            # Fail open so an unresolved branch cannot hide a potential role.
             $scopeById[$scopeId.TrimEnd('/').ToLowerInvariant()] = $scope
             $isComplete = $false
             [void]$warnings.Add($relationship.Reason)
@@ -1536,6 +1544,547 @@ authorizationresources
     }
 }
 
+function Get-RadarBaselineRoleAssignmentInventory {
+    <#
+    Retrieves direct assignments of the selected baseline roles in one filtered
+    Azure Resource Graph query. This avoids one ARM request per scope and keeps
+    correlation cost proportional to relevant assignments rather than estate
+    size. PIM schedule instances are not exposed by Resource Graph and remain
+    outside this direct-assignment inventory.
+    #>
+    param(
+        [object[]]$BaselineContexts,
+        [switch]$NoAssignmentDiscovery
+    )
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $roleGuids = @(
+        $BaselineContexts |
+            ForEach-Object {
+                Get-RadarRoleDefinitionGuid `
+                    -RoleOrId $_.BaselineRoleId
+            } |
+            Where-Object {
+                $_ -match
+                    '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+            } |
+            ForEach-Object { $_.ToLowerInvariant() } |
+            Sort-Object -Unique
+    )
+    if ($roleGuids.Count -eq 0) {
+        return [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Assignments = @()
+            AssignmentCount = 0
+            Warnings = @()
+            Source = 'Not required'
+        }
+    }
+    if ($NoAssignmentDiscovery) {
+        return [pscustomobject]@{
+            IsEvaluated = $false
+            IsComplete = $false
+            Assignments = @()
+            AssignmentCount = 0
+            Warnings = @(
+                'Live baseline-role assignment discovery was disabled.'
+            )
+            Source = 'Disabled'
+        }
+    }
+    if (-not (Get-Command Search-AzGraph -ErrorAction SilentlyContinue)) {
+        return [pscustomobject]@{
+            IsEvaluated = $false
+            IsComplete = $false
+            Assignments = @()
+            AssignmentCount = 0
+            Warnings = @(
+                'Azure Resource Graph is required to correlate direct baseline-role assignments without per-scope ARM calls.'
+            )
+            Source = 'Unavailable'
+        }
+    }
+
+    $roleFilter = @(
+        $roleGuids |
+            ForEach-Object { "'$_'" }
+    ) -join ', '
+    $query = @"
+authorizationresources
+| where type =~ 'microsoft.authorization/roleassignments'
+| extend
+    RoleDefinitionId = tostring(properties.roleDefinitionId),
+    AssignmentScope = tostring(properties.scope),
+    PrincipalId = tostring(properties.principalId),
+    PrincipalType = tostring(properties.principalType),
+    Condition = tostring(properties.condition),
+    ConditionVersion = tostring(properties.conditionVersion)
+| extend RoleDefinitionGuid = tolower(
+    extract('([^/]+)$', 1, RoleDefinitionId)
+)
+| where RoleDefinitionGuid in~ ($roleFilter)
+| project
+    id,
+    AssignmentId = id,
+    AssignmentScope,
+    PrincipalId,
+    PrincipalType,
+    Condition,
+    ConditionVersion,
+    RoleDefinitionId,
+    RoleDefinitionGuid
+"@
+
+    $graphParameters = @{
+        Query = $query
+        First = 1000
+        ErrorAction = 'Stop'
+        # Tenant scope is intentional: authorization-resource queries scoped to
+        # a subscription or MG omit assignments inherited from ancestors.
+        UseTenantScope = $true
+    }
+
+    $assignments = New-Object System.Collections.Generic.List[object]
+    $assignmentIds =
+        New-Object System.Collections.Generic.HashSet[string] (
+            [StringComparer]::OrdinalIgnoreCase
+        )
+    $skip = 0
+    $skipToken = $null
+    try {
+        do {
+            if ($skipToken) {
+                $graphParameters.SkipToken = $skipToken
+                [void]$graphParameters.Remove('Skip')
+            }
+            elseif ($skip -gt 0) {
+                $graphParameters.Skip = $skip
+                [void]$graphParameters.Remove('SkipToken')
+            }
+            $response = Search-AzGraph @graphParameters
+            $wrappedResponse = Test-RadarHasProperty `
+                -InputObject $response `
+                -Name 'Data'
+            if ($wrappedResponse) {
+                $page = @(
+                    Get-RadarPropertyValue `
+                        -InputObject $response `
+                        -Name 'Data' |
+                        Where-Object { $null -ne $_ }
+                )
+                $skipToken = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $response `
+                        -Name 'SkipToken'
+                )
+            }
+            else {
+                $page = @(
+                    $response |
+                        Where-Object { $null -ne $_ }
+                )
+                $skip += $page.Count
+                $skipToken = $null
+            }
+            foreach ($row in $page) {
+                $assignmentId = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $row `
+                        -Name 'AssignmentId'
+                )
+                if (
+                    [string]::IsNullOrWhiteSpace($assignmentId) -or
+                    -not $assignmentIds.Add($assignmentId)
+                ) {
+                    continue
+                }
+                $assignmentScope = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $row `
+                        -Name 'AssignmentScope'
+                )
+                if ([string]::IsNullOrWhiteSpace($assignmentScope)) {
+                    $marker =
+                        '/providers/Microsoft.Authorization/roleAssignments/'
+                    $markerIndex = $assignmentId.IndexOf(
+                        $marker,
+                        [System.StringComparison]::OrdinalIgnoreCase
+                    )
+                    if ($markerIndex -gt 0) {
+                        $assignmentScope =
+                            $assignmentId.Substring(0, $markerIndex)
+                    }
+                }
+                if ([string]::IsNullOrWhiteSpace($assignmentScope)) {
+                    [void]$warnings.Add(
+                        "Role assignment '$assignmentId' has no readable scope."
+                    )
+                    continue
+                }
+                $roleDefinitionGuid = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $row `
+                        -Name 'RoleDefinitionGuid'
+                )
+                if ([string]::IsNullOrWhiteSpace($roleDefinitionGuid)) {
+                    $roleDefinitionGuid =
+                        Get-RadarRoleDefinitionGuid `
+                            -RoleOrId (
+                                Get-RadarPropertyValue `
+                                    -InputObject $row `
+                                    -Name 'RoleDefinitionId'
+                            )
+                }
+                [void]$assignments.Add([pscustomobject]@{
+                    AssignmentId = $assignmentId
+                    AssignmentScope = $assignmentScope.TrimEnd('/')
+                    RoleDefinitionGuid =
+                        $roleDefinitionGuid.ToLowerInvariant()
+                    PrincipalId = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $row `
+                            -Name 'PrincipalId'
+                    )
+                    PrincipalType = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $row `
+                            -Name 'PrincipalType'
+                    )
+                    Condition = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $row `
+                            -Name 'Condition'
+                    )
+                    ConditionVersion = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $row `
+                            -Name 'ConditionVersion'
+                    )
+                })
+            }
+            if (
+                ($wrappedResponse -and -not $skipToken) -or
+                (-not $wrappedResponse -and $page.Count -lt 1000)
+            ) {
+                break
+            }
+        } while ($true)
+    }
+    catch {
+        return [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $false
+            Assignments = $assignments.ToArray()
+            AssignmentCount = $assignments.Count
+            Warnings = @(
+                @($warnings) +
+                "Direct baseline-role assignment discovery failed: $($_.Exception.Message)"
+            )
+            Source = 'Azure Resource Graph'
+        }
+    }
+
+    [pscustomobject]@{
+        IsEvaluated = $true
+        IsComplete = ($warnings.Count -eq 0)
+        Assignments = $assignments.ToArray()
+        AssignmentCount = $assignments.Count
+        Warnings = $warnings.ToArray()
+        Source = 'Azure Resource Graph'
+    }
+}
+
+function Get-RadarBaselineAssignmentEvidenceKey {
+    param(
+        [string]$BaselineRoleId,
+        [string]$BaselineScope,
+        [string]$EvaluationScope
+    )
+
+    return @(
+        $BaselineRoleId.TrimEnd('/').ToLowerInvariant(),
+        $BaselineScope.TrimEnd('/').ToLowerInvariant(),
+        $EvaluationScope.TrimEnd('/').ToLowerInvariant()
+    ) -join [char]31
+}
+
+function Get-RadarBaselineAssignmentEvidenceMap {
+    param(
+        [object[]]$BaselineContexts,
+        [object]$AssignmentInventory,
+        [object]$Hierarchy
+    )
+
+    $evidenceByKey = @{}
+    $assignmentsByRoleAndScope = @{}
+    foreach ($assignment in @($AssignmentInventory.Assignments)) {
+        $roleGuid = [string](
+            Get-RadarPropertyValue `
+                -InputObject $assignment `
+                -Name 'RoleDefinitionGuid'
+        )
+        if ([string]::IsNullOrWhiteSpace($roleGuid)) {
+            continue
+        }
+        $roleKey = $roleGuid.ToLowerInvariant()
+        if (-not $assignmentsByRoleAndScope.ContainsKey($roleKey)) {
+            $assignmentsByRoleAndScope[$roleKey] = @{}
+        }
+        $assignmentScope = [string](
+            Get-RadarPropertyValue `
+                -InputObject $assignment `
+                -Name 'AssignmentScope'
+        )
+        if ([string]::IsNullOrWhiteSpace($assignmentScope)) {
+            continue
+        }
+        $scopeKey = $assignmentScope.TrimEnd('/').ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($scopeKey)) {
+            $scopeKey = '/'
+        }
+        if (
+            -not $assignmentsByRoleAndScope[$roleKey].
+                ContainsKey($scopeKey)
+        ) {
+            $assignmentsByRoleAndScope[$roleKey][$scopeKey] =
+                New-Object System.Collections.Generic.List[object]
+        }
+        [void]$assignmentsByRoleAndScope[$roleKey][
+            $scopeKey
+        ].Add($assignment)
+    }
+
+    foreach ($context in $BaselineContexts) {
+        $roleGuid = (
+            Get-RadarRoleDefinitionGuid `
+                -RoleOrId $context.BaselineRoleId
+        ).ToLowerInvariant()
+        $assignmentsByScope = if (
+            $assignmentsByRoleAndScope.ContainsKey($roleGuid)
+        ) {
+            $assignmentsByRoleAndScope[$roleGuid]
+        }
+        else {
+            @{}
+        }
+        foreach ($evaluationScope in $context.EvaluationScopes) {
+            if (
+                $evaluationScope.Type -notin @(
+                    'ManagementGroup',
+                    'Subscription'
+                )
+            ) {
+                continue
+            }
+            $effectiveAssignments =
+                New-Object System.Collections.Generic.List[object]
+            $effectiveAssignmentIds =
+                New-Object System.Collections.Generic.HashSet[string] (
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+            $evaluationKey =
+                $evaluationScope.Id.TrimEnd('/').ToLowerInvariant()
+            $candidateScopeKeys =
+                New-Object System.Collections.Generic.HashSet[string] (
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+            [void]$candidateScopeKeys.Add($evaluationKey)
+            [void]$candidateScopeKeys.Add('/')
+            if ($Hierarchy.AncestorsByScope.ContainsKey($evaluationKey)) {
+                foreach (
+                    $ancestor in @(
+                        $Hierarchy.AncestorsByScope[$evaluationKey]
+                    )
+                ) {
+                    $ancestorKey =
+                        ([string]$ancestor).TrimEnd('/').
+                            ToLowerInvariant()
+                    if ([string]::IsNullOrWhiteSpace($ancestorKey)) {
+                        $ancestorKey = '/'
+                    }
+                    [void]$candidateScopeKeys.Add($ancestorKey)
+                }
+            }
+            foreach ($candidateScopeKey in $candidateScopeKeys) {
+                if (
+                    -not $assignmentsByScope.ContainsKey(
+                        $candidateScopeKey
+                    )
+                ) {
+                    continue
+                }
+                foreach (
+                    $assignment in @(
+                        $assignmentsByScope[
+                            $candidateScopeKey
+                        ].ToArray()
+                    )
+                ) {
+                    if (
+                        $effectiveAssignmentIds.Add(
+                            $assignment.AssignmentId
+                        )
+                    ) {
+                        [void]$effectiveAssignments.Add(
+                            $assignment
+                        )
+                    }
+                }
+            }
+            $hierarchyComplete = [bool](
+                Get-RadarPropertyValue `
+                    -InputObject $Hierarchy `
+                    -Name 'IsComplete'
+            )
+            $unresolvedAncestorKeys = @(
+                Get-RadarPropertyValue `
+                    -InputObject $Hierarchy `
+                    -Name 'UnresolvedAncestorRoots' |
+                    ForEach-Object {
+                        ([string]$_).TrimEnd('/').
+                            ToLowerInvariant()
+                    }
+            )
+            $hasUnresolvedAncestry = @(
+                $candidateScopeKeys |
+                    Where-Object {
+                        $unresolvedAncestorKeys -contains
+                            ([string]$_).ToLowerInvariant()
+                    }
+            ).Count -gt 0
+            $relationshipUnknown = $false
+            if (-not $hierarchyComplete -or $hasUnresolvedAncestry) {
+                foreach (
+                    $unplacedScopeKey in @(
+                        $assignmentsByScope.Keys |
+                            Where-Object {
+                                -not $candidateScopeKeys.Contains(
+                                    [string]$_
+                                )
+                            }
+                    )
+                ) {
+                    $relationship = Test-RadarScopeDescendsFrom `
+                        -Scope $evaluationScope.Id `
+                        -RootScope $unplacedScopeKey `
+                        -Hierarchy $Hierarchy
+                    if ($relationship.State -eq 'Unknown') {
+                        $relationshipUnknown = $true
+                    }
+                    elseif ($relationship.State -eq 'True') {
+                        foreach (
+                            $assignment in @(
+                                $assignmentsByScope[
+                                    $unplacedScopeKey
+                                ].ToArray()
+                            )
+                        ) {
+                            if (
+                                $effectiveAssignmentIds.Add(
+                                    $assignment.AssignmentId
+                                )
+                            ) {
+                                [void]$effectiveAssignments.Add(
+                                    $assignment
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            $unconditionedAssignments = @(
+                $effectiveAssignments |
+                    Where-Object {
+                        [string]::IsNullOrWhiteSpace(
+                            [string](
+                                Get-RadarPropertyValue `
+                                    -InputObject $_ `
+                                    -Name 'Condition'
+                            )
+                        )
+                    }
+            )
+            $conditionedAssignmentCount =
+                $effectiveAssignments.Count -
+                $unconditionedAssignments.Count
+            $state = if ($unconditionedAssignments.Count -gt 0) {
+                'DirectAssignmentObserved'
+            }
+            elseif ($conditionedAssignmentCount -gt 0) {
+                'AssignmentUnknown'
+            }
+            elseif (
+                -not $AssignmentInventory.IsComplete -or
+                $relationshipUnknown
+            ) {
+                'AssignmentUnknown'
+            }
+            else {
+                'NoDirectAssignment'
+            }
+            $evidenceKey = Get-RadarBaselineAssignmentEvidenceKey `
+                -BaselineRoleId $context.BaselineRoleId `
+                -BaselineScope $context.BaselineScope `
+                -EvaluationScope $evaluationScope.Id
+            $evidenceByKey[$evidenceKey] = [pscustomobject]@{
+                State = $state
+                EffectiveDirectAssignmentCount =
+                    $effectiveAssignments.Count
+                AssignmentIds = @(
+                    $effectiveAssignments |
+                        ForEach-Object { $_.AssignmentId } |
+                        Sort-Object -Unique
+                )
+                PrincipalTypes = @(
+                    $effectiveAssignments |
+                        ForEach-Object { $_.PrincipalType } |
+                        Where-Object {
+                            -not [string]::IsNullOrWhiteSpace($_)
+                        } |
+                        Sort-Object -Unique
+                )
+                AssignmentScopes = @(
+                    $effectiveAssignments |
+                        ForEach-Object { $_.AssignmentScope } |
+                        Sort-Object -Unique
+                )
+                Warnings = @(
+                    @($AssignmentInventory.Warnings) +
+                    $(if ($conditionedAssignmentCount -gt 0) {
+                        "$conditionedAssignmentCount effective direct baseline-role assignment(s) have Azure RBAC conditions that RADAR does not evaluate."
+                    }) +
+                    $(if ($relationshipUnknown) {
+                        'At least one baseline-role assignment could not be placed safely in the visible hierarchy.'
+                    }) |
+                        Where-Object {
+                            -not [string]::IsNullOrWhiteSpace($_)
+                        } |
+                        Sort-Object -Unique
+                )
+            }
+        }
+    }
+    return $evidenceByKey
+}
+
+function Get-RadarRelevantBaselineAssignmentCount {
+    param([hashtable]$EvidenceByKey = @{})
+
+    return @(
+        $EvidenceByKey.Values |
+            ForEach-Object {
+                Get-RadarPropertyValue `
+                    -InputObject $_ `
+                    -Name 'AssignmentIds'
+            } |
+            Where-Object {
+                -not [string]::IsNullOrWhiteSpace($_)
+            } |
+            Sort-Object -Unique
+    ).Count
+}
+
 function Get-RadarPolicyBoundaryScope {
     <#
     Discovers exact scopes that can change a parent policy result: policy
@@ -1975,6 +2524,8 @@ function ConvertTo-RadarHtmlReport {
 
         [int]$BaselineContextCount = 0,
 
+        [int]$BaselineAssignmentCount = 0,
+
         [object[]]$BaselineSummaries = @(),
 
         [object[]]$ControlGapMap = @(),
@@ -2192,6 +2743,12 @@ function ConvertTo-RadarHtmlReport {
   }
   .warning ul { margin: 8px 0 0; padding-left: 20px; }
   .warning li { padding: 2px 0; }
+  .model-note {
+    background: rgba(110,168,255,0.08);
+    border: 1px solid rgba(110,168,255,0.35);
+    border-radius: 12px; padding: 14px 18px; margin-bottom: 22px;
+    color: var(--accent); font-size: 13px;
+  }
   .scope-map-wrap { overflow-x: auto; margin-top: 12px; }
   .scope-map-table td {
     white-space: normal; vertical-align: top; min-width: 110px;
@@ -2236,6 +2793,9 @@ function ConvertTo-RadarHtmlReport {
   .scope-card .scope-count.gap {
     color: var(--danger); border: 1px solid rgba(255,92,122,.45);
   }
+  .scope-card .scope-count.current {
+    color: var(--accent); border: 1px solid rgba(110,168,255,.45);
+  }
   .scope-card .scope-count.external {
     color: #f59e0b; border: 1px solid rgba(245,158,11,.45);
   }
@@ -2278,6 +2838,7 @@ function ConvertTo-RadarHtmlReport {
     color: var(--text); font-size: 15px;
   }
   .map-metric.gap { border-color: rgba(255,92,122,.35); }
+  .map-metric.current { border-color: rgba(110,168,255,.4); }
   .map-metric.external { border-color: rgba(245,158,11,.35); }
   .map-metric.unknown { border-color: rgba(255,184,107,.35); }
   .map-metric.covered { border-color: rgba(91,227,177,.3); }
@@ -2333,7 +2894,7 @@ function ConvertTo-RadarHtmlReport {
     [void]$sb.AppendLine('<main>')
 
     if (-not $DiscoveryComplete -or $discoveryWarningArray.Count -gt 0) {
-        [void]$sb.AppendLine('<section class="warning"><strong>Discovery warning:</strong> deny coverage may be incomplete. Any role not marked Fully Denied is treated as obtainable.')
+        [void]$sb.AppendLine('<section class="warning"><strong>Discovery warning:</strong> deny coverage may be incomplete. Any role not marked Fully Denied is treated as potentially assignable, not as proven current exposure.')
         if ($discoveryWarningArray.Count -gt 0) {
             [void]$sb.AppendLine('<ul>')
             foreach ($warningMessage in $discoveryWarningArray) {
@@ -2344,6 +2905,15 @@ function ConvertTo-RadarHtmlReport {
             [void]$sb.AppendLine('</ul>')
         }
         [void]$sb.AppendLine('</section>')
+    }
+    if ($BaselineContextCount -gt 0 -or $controlGapMapArray.Count -gt 0) {
+        [void]$sb.AppendLine(
+            '<section class="model-note"><strong>Exposure model:</strong> ' +
+            'direct-assigned findings have an observed effective direct ' +
+            'baseline-role assignment. Baseline-capable findings have no ' +
+            'observed direct assignment and remain latent; PIM-held baseline ' +
+            'roles are not currently inventoried.</section>'
+        )
     }
 
     if (-not $MapOnly) {
@@ -2382,7 +2952,7 @@ function ConvertTo-RadarHtmlReport {
         [void]$sb.AppendLine('</svg>')
         [void]$sb.AppendLine('<div class="compliance-info">')
         [void]$sb.AppendLine('  <h2>Deny-policy coverage</h2>')
-        [void]$sb.AppendLine('  <p>Share of baseline/granting-role pairs blocked throughout the relevant baseline subtree. Partial and unknown coverage remains obtainable and is never counted as safe.</p>')
+        [void]$sb.AppendLine('  <p>Share of baseline/granting-role pairs blocked throughout the relevant baseline subtree. Partial and unknown coverage remains potentially obtainable and is never counted as safe.</p>')
         [void]$sb.AppendLine('  <div class="nums">')
         [void]$sb.AppendLine('    <div class="num"><b>' + $rolesAffected + '</b>baseline/role pairs</div>')
         [void]$sb.AppendLine('    <div class="num ok"><b>' + $rolesAlreadyDenied + '</b>fully denied</div>')
@@ -2406,6 +2976,11 @@ function ConvertTo-RadarHtmlReport {
     if ($BaselineContextCount -gt 0) {
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Baseline Contexts</div><div class=`"value accent`">$BaselineContextCount</div></div>")
     }
+    if ($BaselineContextCount -gt 0) {
+        [void]$sb.AppendLine(
+            "<div class=`"card`"><div class=`"label`">Direct Baseline Assignments</div><div class=`"value accent`">$BaselineAssignmentCount</div></div>"
+        )
+    }
     if ($DeniedListProvided) {
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Policy Assignments</div><div class=`"value`">$PolicyAssignmentCount</div></div>")
         [void]$sb.AppendLine("<div class=`"card`"><div class=`"label`">Role-Deny Rules</div><div class=`"value`">$RoleDenyRuleCount</div></div>")
@@ -2426,8 +3001,9 @@ function ConvertTo-RadarHtmlReport {
     }
     [void]$sb.AppendLine('</ul></details>')
 
-    # Currently obtainable restricted actions: still granted by at least one role
-    # not on the deny list, so a user who can assign roles could regain them.
+    # Potentially obtainable restricted actions: still granted by at least one
+    # role not on the deny list. This does not prove a current principal can
+    # perform the assignment.
     if ($DeniedListProvided) {
         $obtainable = [ordered]@{}
         foreach ($item in $resultArray) {
@@ -2441,7 +3017,7 @@ function ConvertTo-RadarHtmlReport {
         }
         $obtainableActions = @($obtainable.Keys | Sort-Object)
         $obtainClass = if ($obtainableActions.Count -gt 0) { 'actions-list exposed' } else { 'actions-list' }
-        [void]$sb.AppendLine('<details class="' + $obtainClass + '"><summary>Estate-wide union of obtainable restricted actions (' + $obtainableActions.Count + ' of ' + $RestrictedActions.Count + ')</summary>')
+        [void]$sb.AppendLine('<details class="' + $obtainClass + '"><summary>Estate-wide union of potentially obtainable restricted actions (' + $obtainableActions.Count + ' of ' + $RestrictedActions.Count + ')</summary>')
         [void]$sb.AppendLine('<p class="note">Union across every baseline context and the optional CSV audit. Use the per-baseline section below to distinguish a covered production baseline from a gap in another scope.</p>')
         if ($obtainableActions.Count -eq 0) {
             [void]$sb.AppendLine('<p class="note">None - every restricted action is granted only by roles already on the deny list.</p>')
@@ -2460,8 +3036,8 @@ function ConvertTo-RadarHtmlReport {
     }
 
     if (@($BaselineSummaries).Count -gt 0) {
-        [void]$sb.AppendLine('<details class="actions-list" open><summary>Obtainable actions by baseline context (' + @($BaselineSummaries).Count + ')</summary>')
-        [void]$sb.AppendLine('<p class="note">Each baseline role and exact AssignableScope is evaluated independently. A context is exposed when at least one relevant role remains assignable through an unblocked or uncertain path.</p>')
+        [void]$sb.AppendLine('<details class="actions-list" open><summary>Potential actions by baseline context (' + @($BaselineSummaries).Count + ')</summary>')
+        [void]$sb.AppendLine('<p class="note">Each baseline role and exact AssignableScope is evaluated independently. These are latent capabilities of the role definition; current principal assignments are not correlated.</p>')
         [void]$sb.AppendLine('<ul>')
         foreach (
             $baselineSummary in @(
@@ -2480,7 +3056,7 @@ function ConvertTo-RadarHtmlReport {
                 $baselineSummary.ObtainableActionCount +
                 ' of ' +
                 $baselineSummary.RestrictedActionCount +
-                ' obtainable via ' +
+                ' potentially obtainable via ' +
                 $baselineSummary.GapRoleCount +
                 ' role(s))</span></li>'
             )
@@ -2520,13 +3096,18 @@ function ConvertTo-RadarHtmlReport {
             )
             if (
             $status -in @(
-                'Obtainable',
+                'DirectAssignmentObserved',
+                'BaselineCapable',
+                'AssignmentUnknown',
                 'ExternalOnly',
                 'Unknown',
                 'Covered'
             )
             ) {
             return $status
+            }
+            if ($status -eq 'Obtainable') {
+            return 'BaselineCapable'
             }
             if (
             -not [string]::IsNullOrWhiteSpace(
@@ -2537,7 +3118,7 @@ function ConvertTo-RadarHtmlReport {
                 )
             )
             ) {
-            return 'Obtainable'
+            return 'BaselineCapable'
             }
             if (
             [string](
@@ -2591,11 +3172,25 @@ function ConvertTo-RadarHtmlReport {
             ForEach-Object {
                 $rows = @($_.Group)
                 $first = $rows[0]
+                $currentDirectRows = @(
+                    $rows |
+                        Where-Object {
+                            (& $getMapBaselineAccessStatus $_) -eq
+                                'DirectAssignmentObserved'
+                        }
+                )
                 $baselineObtainableRows = @(
                     $rows |
                         Where-Object {
                             (& $getMapBaselineAccessStatus $_) -eq
-                                'Obtainable'
+                                'BaselineCapable'
+                        }
+                )
+                $assignmentUnknownRows = @(
+                    $rows |
+                        Where-Object {
+                            (& $getMapBaselineAccessStatus $_) -eq
+                                'AssignmentUnknown'
                         }
                 )
                 $externalGapRows = @(
@@ -2647,6 +3242,15 @@ function ConvertTo-RadarHtmlReport {
                             Get-RadarPropertyValue `
                                 -InputObject $first `
                                 -Name 'BaselineScope'
+                        DirectAssignedActions = @(
+                            $currentDirectRows |
+                                ForEach-Object {
+                                    Get-RadarPropertyValue `
+                                        -InputObject $_ `
+                                        -Name 'RestrictedAction'
+                                } |
+                                Sort-Object -Unique
+                        )
                         BaselineObtainableActions = @(
                             $baselineObtainableRows |
                                 ForEach-Object {
@@ -2667,8 +3271,41 @@ function ConvertTo-RadarHtmlReport {
                         )
                         BaselineAssignableRoles = @(
                             & $collectDelimitedValues `
-                                $baselineObtainableRows `
+                                @(
+                                    $currentDirectRows +
+                                    $baselineObtainableRows +
+                                    $assignmentUnknownRows
+                                ) `
                                 'BaselineAssignableRoles'
+                        )
+                        AssignmentUnknownActions = @(
+                            $assignmentUnknownRows |
+                                ForEach-Object {
+                                    Get-RadarPropertyValue `
+                                        -InputObject $_ `
+                                        -Name 'RestrictedAction'
+                                } |
+                                Sort-Object -Unique
+                        )
+                        EffectiveDirectAssignmentCount = [int](
+                            Get-RadarPropertyValue `
+                                -InputObject $first `
+                                -Name 'EffectiveDirectAssignmentCount'
+                        )
+                        BaselinePrincipalTypes = @(
+                            & $collectDelimitedValues `
+                                $rows `
+                                'BaselinePrincipalTypes'
+                        )
+                        BaselineAssignmentScopes = @(
+                            & $collectDelimitedValues `
+                                $rows `
+                                'BaselineAssignmentScopes'
+                        )
+                        AssignmentWarnings = @(
+                            & $collectDelimitedValues `
+                                $rows `
+                                'AssignmentWarnings'
                         )
                         ExternalAssignmentRoles = @(
                             & $collectDelimitedValues `
@@ -2770,9 +3407,10 @@ function ConvertTo-RadarHtmlReport {
         [void]$sb.AppendLine(
             '<p class="note">Scope-first view of baseline NotAction intent, ' +
             'roles that still grant each action, and policy coverage. ' +
-            'User-obtainable means the baseline role itself has an unblocked ' +
-            'assignment route; external-route gaps require another principal ' +
-            'or assignment process. ' +
+            'Baseline-capable means the role definition has an unblocked ' +
+            'assignment route if a principal holds it at this scope; it does ' +
+            'not prove a current assignment. External-route gaps require ' +
+            'another principal or assignment process. ' +
             "$gapRowCount confirmed gap rows, $unknownRowCount unknown rows, " +
             "$coveredRowCount covered rows. The companion scope-map CSV " +
             'contains one normalised row per scope, baseline and action.</p>'
@@ -2855,12 +3493,30 @@ function ConvertTo-RadarHtmlReport {
             )
             $node = $scopeNodeById[$NodeKey]
             $nodeSummaries = @($node.Summaries.ToArray())
+            $nodeDirectAssignedActions = @(
+                $nodeSummaries |
+                    ForEach-Object {
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'DirectAssignedActions'
+                    } |
+                    Sort-Object -Unique
+            )
             $nodeBaselineObtainableActions = @(
                 $nodeSummaries |
                     ForEach-Object {
                         Get-RadarPropertyValue `
                             -InputObject $_ `
                             -Name 'BaselineObtainableActions'
+                    } |
+                    Sort-Object -Unique
+            )
+            $nodeAssignmentUnknownActions = @(
+                $nodeSummaries |
+                    ForEach-Object {
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'AssignmentUnknownActions'
                     } |
                     Sort-Object -Unique
             )
@@ -2916,14 +3572,23 @@ function ConvertTo-RadarHtmlReport {
                 (ConvertTo-HtmlSafe $node.Name) +
                 '</span><span class="scope-type">' +
                 (ConvertTo-HtmlSafe $node.Type) +
-                '</span><span class="scope-count gap">' +
+                '</span><span class="scope-count current">' +
+                $nodeDirectAssignedActions.Count +
+                ' direct-assigned</span>' +
+                '<span class="scope-count gap">' +
                 $nodeBaselineObtainableActions.Count +
-                ' user-obtainable</span>' +
+                ' latent-capable</span>' +
                 '<span class="scope-count external">' +
                 $nodeExternalGapActions.Count +
                 ' external-route</span>' +
                 '<span class="scope-count unknown">' +
-                $nodeUnknownActions.Count +
+                (
+                    @(
+                        $nodeAssignmentUnknownActions +
+                        $nodeUnknownActions |
+                            Sort-Object -Unique
+                    ).Count
+                ) +
                 ' unknown</span><span class="scope-count covered">' +
                 $nodeCoveredActions.Count +
                 ' covered</span></summary>'
@@ -2951,6 +3616,20 @@ function ConvertTo-RadarHtmlReport {
                 else {
                     ''
                 }
+                $principalTypeLabel = @(
+                    $summary.BaselinePrincipalTypes
+                ) -join ', '
+                $directAssignmentScopeLabels = @(
+                    $summary.BaselineAssignmentScopes |
+                        ForEach-Object {
+                            if ($principalTypeLabel) {
+                                "$_ [$principalTypeLabel]"
+                            }
+                            else {
+                                [string]$_
+                            }
+                        }
+                )
                 [void]$sb.AppendLine(
                     '<section class="baseline-summary">' +
                     '<div class="baseline-heading">' +
@@ -2958,13 +3637,29 @@ function ConvertTo-RadarHtmlReport {
                     $baselineScopeMarkup +
                     '</div><div class="baseline-metrics">' +
                     (& $renderMapMetric `
+                        $summary.DirectAssignedActions `
+                        'actions with a direct baseline assignment' `
+                        'current') +
+                    (& $renderMapMetric `
+                        $directAssignmentScopeLabels `
+                        'direct baseline assignment scopes' `
+                        'current') +
+                    (& $renderMapMetric `
                         $summary.BaselineObtainableActions `
-                        'user-obtainable actions' `
+                        'latent actions if baseline is assigned' `
                         'gap') +
                     (& $renderMapMetric `
                         $summary.BaselineAssignableRoles `
                         'roles this baseline can assign' `
                         'gap') +
+                    (& $renderMapMetric `
+                        $summary.AssignmentUnknownActions `
+                        'assignment exposure unknown' `
+                        'unknown') +
+                    (& $renderMapMetric `
+                        $summary.AssignmentWarnings `
+                        'assignment discovery warnings' `
+                        'unknown') +
                     (& $renderMapMetric `
                         $summary.ExternalGapActions `
                         'external-process gap actions' `
@@ -3569,7 +4264,7 @@ function Test-RadarGlobDifferenceExists {
                 -StateSets $nextStateSets
             if ($visited.Add($stateKey)) {
                 if ($visited.Count -gt 20000) {
-                    # Fail open: an unproven exclusion must remain obtainable.
+                    # Fail open: an unproven exclusion remains a potential path.
                     $cache[$cacheKey] = $true
                     return $true
                 }
@@ -7085,7 +7780,9 @@ function Get-RadarControlGapMap {
 
         [hashtable]$ScopeById = @{},
 
-        [object]$Hierarchy
+        [object]$Hierarchy,
+
+        [hashtable]$BaselineAssignmentEvidence = @{}
     )
 
     $groups =
@@ -7199,6 +7896,31 @@ function Get-RadarControlGapMap {
                 $result.RestrictedAction
             ) -join [char]31
             if (-not $groups.ContainsKey($groupKey)) {
+                $assignmentEvidenceKey =
+                    Get-RadarBaselineAssignmentEvidenceKey `
+                        -BaselineRoleId $result.BaselineRoleId `
+                        -BaselineScope $result.BaselineScope `
+                        -EvaluationScope $scopeId
+                $assignmentEvidence = if (
+                    $BaselineAssignmentEvidence.ContainsKey(
+                        $assignmentEvidenceKey
+                    )
+                ) {
+                    $BaselineAssignmentEvidence[
+                        $assignmentEvidenceKey
+                    ]
+                }
+                else {
+                    [pscustomobject]@{
+                        State = 'AssignmentUnknown'
+                        EffectiveDirectAssignmentCount = 0
+                        PrincipalTypes = @()
+                        AssignmentScopes = @()
+                        Warnings = @(
+                            'Direct baseline-role assignment evidence is unavailable.'
+                        )
+                    }
+                }
                 $groups[$groupKey] = [pscustomobject]@{
                     EvaluationScopeType =
                         $scopeObject.Type
@@ -7218,6 +7940,19 @@ function Get-RadarControlGapMap {
                         $result.RestrictedAction
                     IntentSource =
                         "$($result.BaselineRoleName) NotActions"
+                    BaselineAssignmentState =
+                        $assignmentEvidence.State
+                    EffectiveDirectAssignmentCount =
+                        $assignmentEvidence.EffectiveDirectAssignmentCount
+                    BaselinePrincipalTypes = @(
+                        $assignmentEvidence.PrincipalTypes
+                    )
+                    BaselineAssignmentScopes = @(
+                        $assignmentEvidence.AssignmentScopes
+                    )
+                    AssignmentWarnings = @(
+                        $assignmentEvidence.Warnings
+                    )
                     ConfirmedGapRoles = & $newStringSet
                     BaselineAssignableRoles = & $newStringSet
                     ExternalAssignmentRoles = & $newStringSet
@@ -7371,7 +8106,15 @@ function Get-RadarControlGapMap {
                     'Covered'
                 }
                 $baselineAccessStatus = if ($selfRoles.Count -gt 0) {
-                    'Obtainable'
+                    switch ($group.BaselineAssignmentState) {
+                        'DirectAssignmentObserved' {
+                            'DirectAssignmentObserved'
+                        }
+                        'NoDirectAssignment' {
+                            'BaselineCapable'
+                        }
+                        default { 'AssignmentUnknown' }
+                    }
                 }
                 elseif ($unknownSelfRoles.Count -gt 0) {
                     'Unknown'
@@ -7413,6 +8156,22 @@ function Get-RadarControlGapMap {
                     GapStatus = $mapStatus
                     BaselineAccessStatus =
                         $baselineAccessStatus
+                    BaselineAssignmentState =
+                        $group.BaselineAssignmentState
+                    EffectiveDirectAssignmentCount =
+                        $group.EffectiveDirectAssignmentCount
+                    BaselinePrincipalTypes = @(
+                        $group.BaselinePrincipalTypes |
+                            Sort-Object -Unique
+                    ) -join '; '
+                    BaselineAssignmentScopes = @(
+                        $group.BaselineAssignmentScopes |
+                            Sort-Object -Unique
+                    ) -join '; '
+                    AssignmentWarnings = @(
+                        $group.AssignmentWarnings |
+                            Sort-Object -Unique
+                    ) -join '; '
                     ConfirmedGapRoleCount = $gapRoles.Count
                     ConfirmedGapRoles = $gapRoles -join '; '
                     BaselineAssignableRoleCount =
@@ -7488,6 +8247,11 @@ function Export-RadarControlGapMap {
                     IntentSource,
                     GapStatus,
                     BaselineAccessStatus,
+                    BaselineAssignmentState,
+                    EffectiveDirectAssignmentCount,
+                    BaselinePrincipalTypes,
+                    BaselineAssignmentScopes,
+                    AssignmentWarnings,
                     ConfirmedGapRoleCount,
                     ConfirmedGapRoles,
                     BaselineAssignableRoleCount,
@@ -7513,7 +8277,7 @@ function Export-RadarControlGapMap {
             Set-Content `
                 -LiteralPath $tempPath `
                 -Encoding UTF8 `
-                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","GapStatus","BaselineAccessStatus","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownBaselineAssignableRoleCount","UnknownBaselineAssignableRoles","UnknownExternalAssignmentRoleCount","UnknownExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
+                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","GapStatus","BaselineAccessStatus","BaselineAssignmentState","EffectiveDirectAssignmentCount","BaselinePrincipalTypes","BaselineAssignmentScopes","AssignmentWarnings","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownBaselineAssignableRoleCount","UnknownBaselineAssignableRoles","UnknownExternalAssignmentRoleCount","UnknownExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
         }
         Move-Item `
             -LiteralPath $tempPath `
@@ -8252,6 +9016,30 @@ if ($DynamicRestrictedActions) {
     }
 }
 
+Write-Host 'Correlating direct baseline-role assignments...'
+$baselineAssignmentInventory =
+    Get-RadarBaselineRoleAssignmentInventory `
+        -BaselineContexts $baselineContextInventory.Contexts `
+        -NoAssignmentDiscovery:$NoAssignmentDiscovery
+$baselineAssignmentEvidence =
+    Get-RadarBaselineAssignmentEvidenceMap `
+        -BaselineContexts $baselineContextInventory.Contexts `
+        -AssignmentInventory $baselineAssignmentInventory `
+        -Hierarchy $scopeHierarchy
+$relevantBaselineAssignmentCount =
+    Get-RadarRelevantBaselineAssignmentCount `
+        -EvidenceByKey $baselineAssignmentEvidence
+Write-Host (
+    '  Relevant direct assignments discovered: ' +
+    $relevantBaselineAssignmentCount +
+    ' (' +
+    $baselineAssignmentInventory.Source +
+    ')'
+)
+foreach ($assignmentWarning in $baselineAssignmentInventory.Warnings) {
+    Write-Warning $assignmentWarning
+}
+
 $restrictedActions = @(
     @($csvActions) + @($dynamicActions) |
         Where-Object {
@@ -8697,7 +9485,8 @@ $controlGapMap = @(
     Get-RadarControlGapMap `
         -Results $sortedResults `
         -ScopeById $knownScopeById `
-        -Hierarchy $scopeHierarchy
+        -Hierarchy $scopeHierarchy `
+        -BaselineAssignmentEvidence $baselineAssignmentEvidence
 )
 $baselineSummaries =
     New-Object System.Collections.Generic.List[object]
@@ -8827,6 +9616,9 @@ if ($OutputHtml) {
         -SourceRoleNames $dynamicSourceRoleNames `
         -ScopeCount $policyScopes.Count `
         -BaselineContextCount $baselineContextInventory.Contexts.Count `
+        -BaselineAssignmentCount (
+            $relevantBaselineAssignmentCount
+        ) `
         -BaselineSummaries $baselineSummaries.ToArray() `
         -ControlGapMap $controlGapMap `
         -PolicyAssignmentCount $policyInventory.AssignmentCount `
@@ -8852,6 +9644,9 @@ if ($OutputHtml) {
         -SourceRoleNames $dynamicSourceRoleNames `
         -ScopeCount $policyScopes.Count `
         -BaselineContextCount $baselineContextInventory.Contexts.Count `
+        -BaselineAssignmentCount (
+            $relevantBaselineAssignmentCount
+        ) `
         -ControlGapMap $controlGapMap `
         -PolicyAssignmentCount $policyInventory.AssignmentCount `
         -RoleDenyRuleCount $policyInventory.RelevantRuleCount `
@@ -8896,6 +9691,28 @@ $obtainableActions = @(
         Where-Object { -not $_.IsAlreadyDenied } |
         Select-Object -ExpandProperty RestrictedAction -Unique
 )
+$directAssignedGapScopes = @(
+    $controlGapMap |
+        Where-Object {
+            $_.BaselineAccessStatus -eq
+                'DirectAssignmentObserved'
+        } |
+        Select-Object -ExpandProperty EvaluationScope -Unique
+)
+$latentCapabilityScopes = @(
+    $controlGapMap |
+        Where-Object {
+            $_.BaselineAccessStatus -eq 'BaselineCapable'
+        } |
+        Select-Object -ExpandProperty EvaluationScope -Unique
+)
+$assignmentUnknownScopes = @(
+    $controlGapMap |
+        Where-Object {
+            $_.BaselineAccessStatus -eq 'AssignmentUnknown'
+        } |
+        Select-Object -ExpandProperty EvaluationScope -Unique
+)
 
 Write-Host ""
 Write-Host "RADAR scan complete."
@@ -8903,11 +9720,17 @@ Write-Host "  Roles scanned:        $($roles.Count) (built-in: $($builtInRoles.C
 Write-Host "  Matches found:        $($sortedResults.Count) (built-in: $builtInMatches, custom: $customMatches)"
 Write-Host "  Roles affected:       $($affectedRoles.Count)"
 Write-Host "  Baseline/role pairs:  $($gapTargets.Count)"
+if ($baselineContextInventory.Contexts.Count -gt 0) {
+    Write-Host "  Direct baseline assignments: $relevantBaselineAssignmentCount"
+    Write-Host "  Direct-assigned gap scopes:   $($directAssignedGapScopes.Count)"
+    Write-Host "  Latent-capability scopes:     $($latentCapabilityScopes.Count)"
+    Write-Host "  Assignment-unknown scopes:    $($assignmentUnknownScopes.Count)"
+}
 if ($policyInventory.IsEvaluated -or $deniedRoleSet.Count -gt 0) {
     Write-Host "  Fully denied pairs:   $($fullyDenied.Count)"
     Write-Host "  Partially denied:     $($partiallyDenied.Count)"
     Write-Host "  Coverage uncertain:   $($unknownCoverage.Count)"
-    Write-Host "  Estate-wide action union: $($obtainableActions.Count) of $($restrictedActions.Count) obtainable"
+    Write-Host "  Estate-wide potential action union: $($obtainableActions.Count) of $($restrictedActions.Count)"
     if ($baselineSummaries.Count -gt 0) {
         Write-Host '  Per-baseline action gaps:'
         foreach (
@@ -8916,7 +9739,7 @@ if ($policyInventory.IsEvaluated -or $deniedRoleSet.Count -gt 0) {
                     Sort-Object BaselineRoleName, BaselineScope
             )
         ) {
-            Write-Host "    - $($baselineSummary.BaselineRoleName) @ $($baselineSummary.BaselineScope): $($baselineSummary.ObtainableActionCount) of $($baselineSummary.RestrictedActionCount) obtainable"
+            Write-Host "    - $($baselineSummary.BaselineRoleName) @ $($baselineSummary.BaselineScope): $($baselineSummary.ObtainableActionCount) of $($baselineSummary.RestrictedActionCount) potentially obtainable"
         }
     }
     $rolesStillObtainable = @(
@@ -8924,7 +9747,7 @@ if ($policyInventory.IsEvaluated -or $deniedRoleSet.Count -gt 0) {
             Where-Object { -not $_.IsAlreadyDenied }
     )
     if ($rolesStillObtainable.Count -gt 0) {
-        Write-Host '  Baseline/role pairs still obtainable:'
+        Write-Host '  Baseline/role pairs with potential assignment paths:'
         foreach (
             $roleResult in @(
                 $rolesStillObtainable |
@@ -8947,5 +9770,5 @@ foreach ($warningMessage in $discoveryWarnings) {
     Write-Warning $warningMessage
 }
 if (-not $discoveryComplete) {
-    Write-Warning 'The scan completed with incomplete discovery. Treat every non-Full deny status as obtainable and review the warnings above.'
+    Write-Warning 'The scan completed with incomplete discovery. Treat every non-Full deny status as a potential path, not proven current exposure, and review the warnings above.'
 }

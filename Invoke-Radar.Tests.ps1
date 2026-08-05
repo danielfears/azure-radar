@@ -569,6 +569,7 @@ Describe 'Scoped baseline contexts' {
 
     It 'keeps ancestry above an accessible fallback root unresolved' {
         $hierarchy = [pscustomobject]@{
+            IsComplete = $true
             AncestorsByScope = @{
                 '/providers/microsoft.management/managementgroups/child' = @()
             }
@@ -1052,6 +1053,316 @@ Describe 'Get-RadarRoleInventory' {
             -not $ManagementGroup -and
             -not $Subscription
         }
+    }
+}
+
+Describe 'Get-RadarBaselineRoleAssignmentInventory' {
+    It 'loads relevant direct assignments in one filtered graph query' {
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        AssignmentId =
+                            '/subscriptions/sub-1/providers/Microsoft.Authorization/roleAssignments/assignment-1'
+                        AssignmentScope = '/subscriptions/sub-1'
+                        PrincipalId = 'principal-1'
+                        PrincipalType = 'User'
+                        RoleDefinitionId =
+                            '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+                        RoleDefinitionGuid =
+                            '11111111-1111-1111-1111-111111111111'
+                    }
+                )
+                SkipToken = $null
+            }
+        }
+        $context = [pscustomobject]@{
+            BaselineRoleId =
+                '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+        }
+
+        $inventory =
+            Get-RadarBaselineRoleAssignmentInventory `
+                -BaselineContexts @($context)
+
+        $inventory.IsComplete | Should -BeTrue
+        $inventory.AssignmentCount | Should -Be 1
+        $inventory.Assignments[0].AssignmentScope |
+            Should -Be '/subscriptions/sub-1'
+        Should -Invoke Search-AzGraph -Times 1 -ParameterFilter {
+            $Query -match
+                'microsoft\.authorization/roleassignments' -and
+            $Query -match
+                '11111111-1111-1111-1111-111111111111' -and
+            $UseTenantScope -and
+            -not $Subscription -and
+            -not $ManagementGroup
+        }
+    }
+
+    It 'retains the id column and follows graph skip tokens' {
+        Mock Search-AzGraph {
+            $suffix = if ($SkipToken) { '2' } else { '1' }
+            [pscustomobject]@{
+                Data = @(
+                    [pscustomobject]@{
+                        Id = "assignment-$suffix"
+                        AssignmentId = "assignment-$suffix"
+                        AssignmentScope = '/subscriptions/sub-1'
+                        PrincipalId = "principal-$suffix"
+                        PrincipalType = 'User'
+                        RoleDefinitionId =
+                            '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+                        RoleDefinitionGuid =
+                            '11111111-1111-1111-1111-111111111111'
+                    }
+                )
+                SkipToken = if ($SkipToken) { $null } else { 'next' }
+            }
+        }
+
+        $inventory =
+            Get-RadarBaselineRoleAssignmentInventory `
+                -BaselineContexts @(
+                    [pscustomobject]@{
+                        BaselineRoleId =
+                            '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+                    }
+                )
+
+        $inventory.AssignmentCount | Should -Be 2
+        Should -Invoke Search-AzGraph -Times 2
+        Should -Invoke Search-AzGraph -Times 1 -ParameterFilter {
+            $SkipToken -eq 'next'
+        }
+        Should -Invoke Search-AzGraph -ParameterFilter {
+            $Query -match '(?s)\| project\s+id,'
+        }
+    }
+
+    It 'reports assignment exposure unknown when graph is disabled' {
+        $inventory =
+            Get-RadarBaselineRoleAssignmentInventory `
+                -BaselineContexts @(
+                    [pscustomobject]@{
+                        BaselineRoleId =
+                            '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+                    }
+                ) `
+                -NoAssignmentDiscovery
+
+        $inventory.IsComplete | Should -BeFalse
+        $inventory.IsEvaluated | Should -BeFalse
+    }
+}
+
+Describe 'Get-RadarBaselineAssignmentEvidenceMap' {
+    It 'applies an assignment downwards but never upwards' {
+        $root =
+            '/providers/Microsoft.Management/managementGroups/customer'
+        $subscription = '/subscriptions/sub-1'
+        $resourceGroup =
+            '/subscriptions/sub-1/resourceGroups/workload'
+        $context = [pscustomobject]@{
+            BaselineRoleId =
+                '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+            BaselineScope = $root
+            EvaluationScopes = @(
+                (New-RadarScope -Id $root),
+                (New-RadarScope -Id $subscription),
+                (New-RadarScope -Id $resourceGroup)
+            )
+        }
+        $inventory = [pscustomobject]@{
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    AssignmentId = 'assignment-1'
+                    AssignmentScope = $subscription
+                    RoleDefinitionGuid =
+                        '11111111-1111-1111-1111-111111111111'
+                    PrincipalType = 'User'
+                }
+            )
+        }
+        $hierarchy = [pscustomobject]@{
+            AncestorsByScope = @{
+                $root.ToLowerInvariant() = @()
+                $subscription.ToLowerInvariant() = @($root)
+            }
+            UnresolvedAncestorRoots = @()
+        }
+
+        $evidence =
+            Get-RadarBaselineAssignmentEvidenceMap `
+                -BaselineContexts @($context) `
+                -AssignmentInventory $inventory `
+                -Hierarchy $hierarchy
+        $rootKey = Get-RadarBaselineAssignmentEvidenceKey `
+            -BaselineRoleId $context.BaselineRoleId `
+            -BaselineScope $root `
+            -EvaluationScope $root
+        $subscriptionKey =
+            Get-RadarBaselineAssignmentEvidenceKey `
+                -BaselineRoleId $context.BaselineRoleId `
+                -BaselineScope $root `
+                -EvaluationScope $subscription
+
+        $evidence[$rootKey].State |
+            Should -Be 'NoDirectAssignment'
+        $evidence[$subscriptionKey].State |
+            Should -Be 'DirectAssignmentObserved'
+        Get-RadarRelevantBaselineAssignmentCount `
+            -EvidenceByKey $evidence |
+            Should -Be 1
+    }
+
+    It 'keeps conditioned baseline assignments uncertain' {
+        $subscription = '/subscriptions/sub-1'
+        $context = [pscustomobject]@{
+            BaselineRoleId =
+                '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+            BaselineScope = $subscription
+            EvaluationScopes = @(
+                (New-RadarScope -Id $subscription)
+            )
+        }
+        $inventory = [pscustomobject]@{
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    AssignmentId = 'assignment-1'
+                    AssignmentScope = $subscription
+                    RoleDefinitionGuid =
+                        '11111111-1111-1111-1111-111111111111'
+                    PrincipalType = 'User'
+                    Condition =
+                        "@Resource[Microsoft.Authorization/roleAssignments:RoleDefinitionId] StringEqualsIgnoreCase 'allowed-role'"
+                }
+            )
+        }
+        $hierarchy = [pscustomobject]@{
+            IsComplete = $true
+            AncestorsByScope = @{
+                $subscription.ToLowerInvariant() = @()
+            }
+            UnresolvedAncestorRoots = @()
+        }
+
+        $evidence =
+            Get-RadarBaselineAssignmentEvidenceMap `
+                -BaselineContexts @($context) `
+                -AssignmentInventory $inventory `
+                -Hierarchy $hierarchy
+        $key = Get-RadarBaselineAssignmentEvidenceKey `
+            -BaselineRoleId $context.BaselineRoleId `
+            -BaselineScope $subscription `
+            -EvaluationScope $subscription
+
+        $evidence[$key].State |
+            Should -Be 'AssignmentUnknown'
+        $evidence[$key].Warnings |
+            Should -Match 'conditions'
+    }
+
+    It 'uses the scope index when hierarchy is complete' {
+        Mock Test-RadarScopeDescendsFrom {
+            throw 'The complete-hierarchy fast path should not probe pairs.'
+        }
+        $root =
+            '/providers/Microsoft.Management/managementGroups/customer'
+        $subscription = '/subscriptions/sub-1'
+        $context = [pscustomobject]@{
+            BaselineRoleId =
+                '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+            BaselineScope = $root
+            EvaluationScopes = @(
+                (New-RadarScope -Id $root),
+                (New-RadarScope -Id $subscription)
+            )
+        }
+        $inventory = [pscustomobject]@{
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    AssignmentId = 'assignment-1'
+                    AssignmentScope = $root
+                    RoleDefinitionGuid =
+                        '11111111-1111-1111-1111-111111111111'
+                    PrincipalType = 'User'
+                    Condition = ''
+                }
+            )
+        }
+        $hierarchy = [pscustomobject]@{
+            IsComplete = $true
+            AncestorsByScope = @{
+                $root.ToLowerInvariant() = @()
+                $subscription.ToLowerInvariant() = @($root)
+            }
+            UnresolvedAncestorRoots = @()
+        }
+
+        $null = Get-RadarBaselineAssignmentEvidenceMap `
+            -BaselineContexts @($context) `
+            -AssignmentInventory $inventory `
+            -Hierarchy $hierarchy
+
+        Should -Invoke Test-RadarScopeDescendsFrom -Times 0
+    }
+
+    It 'keeps assignments above an unresolved ancestor uncertain' {
+        $customerRoot =
+            '/providers/Microsoft.Management/managementGroups/customer'
+        $unreadableParent =
+            '/providers/Microsoft.Management/managementGroups/parent'
+        $context = [pscustomobject]@{
+            BaselineRoleId =
+                '/providers/Microsoft.Authorization/roleDefinitions/11111111-1111-1111-1111-111111111111'
+            BaselineScope = $customerRoot
+            EvaluationScopes = @(
+                (New-RadarScope -Id $customerRoot)
+            )
+        }
+        $inventory = [pscustomobject]@{
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    AssignmentId = 'assignment-1'
+                    AssignmentScope = $unreadableParent
+                    RoleDefinitionGuid =
+                        '11111111-1111-1111-1111-111111111111'
+                    PrincipalType = 'User'
+                    Condition = ''
+                }
+            )
+        }
+        $hierarchy = [pscustomobject]@{
+            IsComplete = $true
+            AncestorsByScope = @{
+                $customerRoot.ToLowerInvariant() = @()
+            }
+            UnresolvedAncestorRoots = @($customerRoot)
+        }
+
+        $evidence =
+            Get-RadarBaselineAssignmentEvidenceMap `
+                -BaselineContexts @($context) `
+                -AssignmentInventory $inventory `
+                -Hierarchy $hierarchy
+        $key = Get-RadarBaselineAssignmentEvidenceKey `
+            -BaselineRoleId $context.BaselineRoleId `
+            -BaselineScope $customerRoot `
+            -EvaluationScope $customerRoot
+
+        $evidence[$key].State |
+            Should -Be 'AssignmentUnknown'
+        $evidence[$key].Warnings |
+            Should -Match 'could not be placed'
     }
 }
 
@@ -3348,12 +3659,29 @@ Describe 'Control-gap scope map' {
                 )
             }
         }
+        $assignmentEvidence = @{}
+        $assignmentEvidenceKey =
+            Get-RadarBaselineAssignmentEvidenceKey `
+                -BaselineRoleId 'baseline-1' `
+                -BaselineScope (
+                    '/providers/Microsoft.Management/managementGroups/customer'
+                ) `
+                -EvaluationScope '/subscriptions/sub-1'
+        $assignmentEvidence[$assignmentEvidenceKey] =
+            [pscustomobject]@{
+                State = 'DirectAssignmentObserved'
+                EffectiveDirectAssignmentCount = 1
+                PrincipalTypes = @('User')
+                AssignmentScopes = @('/subscriptions/sub-1')
+                Warnings = @()
+            }
 
         $map = @(
             Get-RadarControlGapMap `
                 -Results $results `
                 -ScopeById $scopeById `
-                -Hierarchy $hierarchy
+                -Hierarchy $hierarchy `
+                -BaselineAssignmentEvidence $assignmentEvidence
         )
 
         $map.Count | Should -Be 1
@@ -3370,7 +3698,9 @@ Describe 'Control-gap scope map' {
                 '/providers/Microsoft.Management/managementGroups/customer'
             )
         $map[0].GapStatus | Should -Be 'Gap'
-        $map[0].BaselineAccessStatus | Should -Be 'Obtainable'
+        $map[0].BaselineAccessStatus |
+            Should -Be 'DirectAssignmentObserved'
+        $map[0].EffectiveDirectAssignmentCount | Should -Be 1
         $map[0].ConfirmedGapRoleCount | Should -Be 2
         $map[0].BaselineAssignableRoleCount | Should -Be 1
         $map[0].ExternalAssignmentRoleCount | Should -Be 1
@@ -3398,7 +3728,7 @@ Describe 'Control-gap scope map' {
             IntentSource =
                 'Customer-Platform-Owner NotActions'
             GapStatus = 'Gap'
-            BaselineAccessStatus = 'Obtainable'
+            BaselineAccessStatus = 'BaselineCapable'
             ConfirmedGapRoleCount = 1
             ConfirmedGapRoles = 'Owner [role-1]'
             BaselineAssignableRoleCount = 1
@@ -3420,7 +3750,7 @@ Describe 'Control-gap scope map' {
         $exported = Import-Csv -LiteralPath $path
         $exported.GapStatus | Should -Be 'Gap'
         $exported.BaselineAccessStatus |
-            Should -Be 'Obtainable'
+            Should -Be 'BaselineCapable'
         $exported.EvaluationScope |
             Should -Be '/subscriptions/sub-1'
         @(
@@ -3510,8 +3840,22 @@ Describe 'Control-gap scope map' {
             )
         }
 
+        $evidence = @{}
+        $key = Get-RadarBaselineAssignmentEvidenceKey `
+            -BaselineRoleId 'baseline-1' `
+            -BaselineScope '/subscriptions/sub-1' `
+            -EvaluationScope '/subscriptions/sub-1'
+        $evidence[$key] = [pscustomobject]@{
+            State = 'NoDirectAssignment'
+            EffectiveDirectAssignmentCount = 0
+            PrincipalTypes = @()
+            AssignmentScopes = @()
+            Warnings = @()
+        }
         $map = @(
-            Get-RadarControlGapMap -Results @($result)
+            Get-RadarControlGapMap `
+                -Results @($result) `
+                -BaselineAssignmentEvidence $evidence
         )
 
         $map[0].GapStatus | Should -Be 'Gap'
@@ -3551,13 +3895,27 @@ Describe 'Control-gap scope map' {
             )
         }
 
+        $evidence = @{}
+        $key = Get-RadarBaselineAssignmentEvidenceKey `
+            -BaselineRoleId 'baseline-1' `
+            -BaselineScope '/subscriptions/sub-1' `
+            -EvaluationScope '/subscriptions/sub-1'
+        $evidence[$key] = [pscustomobject]@{
+            State = 'NoDirectAssignment'
+            EffectiveDirectAssignmentCount = 0
+            PrincipalTypes = @()
+            AssignmentScopes = @()
+            Warnings = @()
+        }
         $map = @(
-            Get-RadarControlGapMap -Results @($result)
+            Get-RadarControlGapMap `
+                -Results @($result) `
+                -BaselineAssignmentEvidence $evidence
         )
 
         $map[0].BaselineAssignableRoleCount | Should -Be 1
         $map[0].ExternalAssignmentRoleCount | Should -Be 1
-        $map[0].BaselineAccessStatus | Should -Be 'Obtainable'
+        $map[0].BaselineAccessStatus | Should -Be 'BaselineCapable'
     }
 }
 
@@ -3711,7 +4069,8 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html | Should -Match 'Workload'
         $html | Should -Match 'Dangerous.Provider/write'
         $html | Should -Match 'Owner \[role-1\]'
-        $html | Should -Match 'user-obtainable'
+        $html | Should -Match 'baseline-capable'
+        $html | Should -Match 'remain latent'
         $html | Should -Match 'external-route'
         $html | Should -Match (
             'data-scope-id="/subscriptions/sub-1" ' +
@@ -3742,7 +4101,11 @@ Describe 'ConvertTo-RadarHtmlReport' {
                 BaselineScope = '/subscriptions/sub-1'
                 RestrictedAction = 'Dangerous.Provider/write'
                 GapStatus = 'Gap'
-                BaselineAccessStatus = 'Obtainable'
+                BaselineAccessStatus = 'DirectAssignmentObserved'
+                EffectiveDirectAssignmentCount = 1
+                BaselinePrincipalTypes = 'User'
+                BaselineAssignmentScopes = '/subscriptions/sub-1'
+                AssignmentWarnings = ''
                 BaselineAssignableRoles = 'Owner [role-1]'
                 ExternalAssignmentRoles = 'Owner [role-1]'
                 BlockingPolicies = ''
@@ -3768,6 +4131,10 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html | Should -Match 'baseline-metrics'
         $html | Should -Not -Match 'No matches found'
         $html | Should -Not -Match 'id="filter"'
+        $html | Should -Match '1 direct-assigned'
+        $html |
+            Should -Match 'actions with a direct baseline assignment'
+        $html | Should -Match 'direct baseline assignment scopes'
         $html |
             Should -Match (
                 '<strong>0</strong>external-process gap actions'
@@ -3792,7 +4159,7 @@ Describe 'ConvertTo-RadarHtmlReport' {
                     BaselineScope = $baselineScope
                     RestrictedAction = 'Dangerous.Provider/write'
                     GapStatus = 'Gap'
-                    BaselineAccessStatus = 'Obtainable'
+                    BaselineAccessStatus = 'BaselineCapable'
                     BaselineAssignableRoles = 'Owner [role-1]'
                     ExternalAssignmentRoles = ''
                     BlockingPolicies = ''
