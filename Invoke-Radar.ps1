@@ -2769,11 +2769,21 @@ function ConvertTo-RadarHtmlReport {
   .warning ul { margin: 8px 0 0; padding-left: 20px; }
   .warning li { padding: 2px 0; }
   .model-note {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+    gap: 12px;
     background: rgba(110,168,255,0.08);
     border: 1px solid rgba(110,168,255,0.35);
     border-radius: 12px; padding: 14px 18px; margin-bottom: 22px;
     color: var(--accent); font-size: 13px;
   }
+  .equation {
+    padding: 10px 12px; background: rgba(0,0,0,.12);
+    border: 1px solid rgba(110,168,255,.2); border-radius: 8px;
+  }
+  .equation strong {
+    display: block; margin-bottom: 4px; color: var(--text);
+  }
+  .equation span { color: var(--muted); }
   .map-toolbar {
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     margin: 14px 0 18px; padding: 12px;
@@ -2922,13 +2932,22 @@ function ConvertTo-RadarHtmlReport {
     background: var(--panel); border: 1px solid var(--border);
     border-radius: 8px;
   }
-  .map-metric summary {
-    display: block; cursor: pointer; color: var(--muted);
-    font-size: 12px; line-height: 1.4;
+  .map-metric-trigger {
+    display: block; width: 100%; padding: 0; cursor: pointer;
+    color: var(--muted); background: transparent; border: 0;
+    text-align: left; font: inherit; font-size: 12px; line-height: 1.4;
   }
-  .map-metric summary strong {
+  .map-metric-trigger:hover { color: var(--accent); }
+  .map-metric-trigger:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 4px;
+  }
+  .map-metric-trigger strong {
     display: inline-block; margin-right: 5px;
     color: var(--text); font-size: 15px;
+  }
+  .map-metric-open {
+    float: right; color: var(--accent); font-size: 10px;
+    text-transform: uppercase; letter-spacing: .5px;
   }
   .map-metric.gap { border-color: rgba(255,92,122,.35); }
   .map-metric.current { border-color: rgba(110,168,255,.4); }
@@ -2940,7 +2959,9 @@ function ConvertTo-RadarHtmlReport {
     white-space: normal; overflow-wrap: anywhere;
   }
   .metric-list {
+    columns: 1 !important; column-gap: 0 !important;
     list-style: none; margin: 8px 0 0; padding: 0 8px 0 0;
+    white-space: normal; overflow-wrap: anywhere;
   }
   .metric-list li {
     padding: 7px 0; border-bottom: 1px solid var(--border);
@@ -2950,6 +2971,39 @@ function ConvertTo-RadarHtmlReport {
   .metric-list small {
     display: block; margin-top: 2px; color: var(--muted);
     font-size: 10.5px; font-weight: 400; overflow-wrap: anywhere;
+  }
+  .metric-dialog {
+    width: min(860px, calc(100vw - 32px));
+    max-height: min(82vh, 900px); padding: 0;
+    color: var(--text); background: var(--panel);
+    border: 1px solid var(--border); border-radius: 12px;
+    box-shadow: 0 24px 80px rgba(0,0,0,.55);
+  }
+  .metric-dialog::backdrop { background: rgba(3,7,18,.78); }
+  .metric-dialog-header {
+    position: sticky; top: 0; z-index: 1;
+    display: flex; align-items: center; gap: 16px;
+    padding: 16px 18px; background: var(--panel-2);
+    border-bottom: 1px solid var(--border);
+  }
+  .metric-dialog-title { flex: 1; margin: 0; font-size: 16px; }
+  .metric-dialog-close {
+    cursor: pointer; padding: 6px 10px; border-radius: 8px;
+    color: var(--text); background: transparent;
+    border: 1px solid var(--border); font-size: 18px;
+  }
+  .metric-dialog-search {
+    width: calc(100% - 36px); margin: 16px 18px 4px;
+    padding: 10px 12px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .metric-dialog-body {
+    max-height: calc(82vh - 132px); padding: 6px 18px 20px;
+    overflow: auto;
+  }
+  .metric-dialog-body .metric-list {
+    max-height: none; overflow: visible; padding-right: 0;
   }
 
   .compliance {
@@ -2980,20 +3034,78 @@ function ConvertTo-RadarHtmlReport {
         $documentTitle +
         '</h1>'
     )
-    $scope = if ($IncludeCustomRoles) { 'built-in &amp; custom roles' } else { 'built-in roles' }
-    $scopeNote = if ($IncludeCustomRoles -and $CustomScope) {
-        ' &middot; ' + (ConvertTo-HtmlSafe $CustomScope)
-    } else { '' }
-    [void]$sb.AppendLine(
-        '<div class="sub">Generated ' +
-        $generated +
-        ' &middot; Scope: ' +
-        $scope +
-        $scopeNote +
-        ' &middot; Assignment subject: ' +
-        (ConvertTo-HtmlSafe $PrincipalScenario) +
-        '</div>'
-    )
+    if ($MapOnly) {
+        $mappedScopeCount = @(
+            $controlGapMapArray |
+                ForEach-Object {
+                    Get-RadarPropertyValue `
+                        -InputObject $_ `
+                        -Name 'EvaluationScope'
+                } |
+                Sort-Object -Unique
+        ).Count
+        $mappedScopeLabel = if ($mappedScopeCount -eq 1) {
+            'mapped scope'
+        }
+        else {
+            'mapped scopes'
+        }
+        $sourceRoleCount = @(
+            $controlGapMapArray |
+                ForEach-Object {
+                    Get-RadarPropertyValue `
+                        -InputObject $_ `
+                        -Name 'BaselineRoleId'
+                } |
+                Where-Object {
+                    -not [string]::IsNullOrWhiteSpace($_)
+                } |
+                Sort-Object -Unique
+        ).Count
+        $sourceRoleLabel = if ($sourceRoleCount -eq 1) {
+            'source role'
+        }
+        else {
+            'source roles'
+        }
+        [void]$sb.AppendLine(
+            '<div class="sub">Generated ' +
+            $generated +
+            ' &middot; ' +
+            $mappedScopeCount +
+            ' ' +
+            $mappedScopeLabel +
+            ' &middot; ' +
+            $sourceRoleCount +
+            ' ' +
+            $sourceRoleLabel +
+            '</div>'
+        )
+    }
+    else {
+        $scope = if ($IncludeCustomRoles) {
+            'built-in &amp; custom roles'
+        }
+        else {
+            'built-in roles'
+        }
+        $scopeNote = if ($IncludeCustomRoles -and $CustomScope) {
+            ' &middot; ' + (ConvertTo-HtmlSafe $CustomScope)
+        }
+        else {
+            ''
+        }
+        [void]$sb.AppendLine(
+            '<div class="sub">Generated ' +
+            $generated +
+            ' &middot; Scope: ' +
+            $scope +
+            $scopeNote +
+            ' &middot; Assignment subject: ' +
+            (ConvertTo-HtmlSafe $PrincipalScenario) +
+            '</div>'
+        )
+    }
     [void]$sb.AppendLine('</div></header>')
 
     [void]$sb.AppendLine('<main>')
@@ -3013,16 +3125,14 @@ function ConvertTo-RadarHtmlReport {
     }
     if ($BaselineContextCount -gt 0 -or $controlGapMapArray.Count -gt 0) {
         [void]$sb.AppendLine(
-            '<section class="model-note"><strong>Exposure model:</strong> ' +
-            'net-new gaps require an actual direct source-role holder, no ' +
-            'existing action in visible effective direct or transitive-group ' +
-            'RBAC, a ' +
-            'source-role-reachable assignment path and principal-specific ' +
-            'policy permission. Microsoft Graph supplies enabled state and ' +
-            'transitive groups; unavailable Graph, source groups, conditions ' +
-            'and incomplete evidence remain unknown. PIM source-role schedules ' +
-            'are not inventoried. Secondary baseline-capable results ' +
-            'remain latent.</section>'
+            '<section class="model-note">' +
+            '<div class="equation"><strong>Control gap</strong>' +
+            '<span>= restricted action + granting role &minus; deny-control ' +
+            'coverage</span></div>' +
+            '<div class="equation"><strong>Proven exposure</strong>' +
+            '<span>= restricted action + granting role + actual holder + ' +
+            'self-assignment &minus; existing access &minus; effective ' +
+            'policy block</span></div></section>'
         )
     }
 
@@ -3614,18 +3724,6 @@ function ConvertTo-RadarHtmlReport {
                 } |
                 Sort-Object -Unique
         ).Count
-        $gapRowCount = @(
-            $controlGapMapArray |
-                Where-Object { $_.GapStatus -eq 'Gap' }
-        ).Count
-        $unknownRowCount = @(
-            $controlGapMapArray |
-                Where-Object { $_.GapStatus -eq 'Unknown' }
-        ).Count
-        $coveredRowCount = @(
-            $controlGapMapArray |
-                Where-Object { $_.GapStatus -eq 'Covered' }
-        ).Count
         $actionableScopeCount = @(
             $controlGapMapArray |
                 Where-Object {
@@ -3677,6 +3775,10 @@ function ConvertTo-RadarHtmlReport {
                 Select-Object -ExpandProperty EvaluationScope -Unique
         ).Count
         $defaultMapMode = 'actionable'
+        $metricState = [pscustomobject]@{
+            NextId = 0
+            Payloads = [ordered]@{}
+        }
         $renderMapMetric = {
             param(
                 [object[]]$Values,
@@ -3693,47 +3795,25 @@ function ConvertTo-RadarHtmlReport {
             else {
                 ''
             }
-            $listItems = @(
-                foreach ($item in $items) {
-                    $text = [string]$item
-                    $roleMatch = [regex]::Match(
-                        $text,
-                        '^(?<name>.+?) \[(?<id>[^\]]+)\]$'
-                    )
-                    if ($roleMatch.Success) {
-                        '<li>' +
-                        (
-                            ConvertTo-HtmlSafe `
-                                $roleMatch.Groups['name'].Value
-                        ) +
-                        '<small>' +
-                        (
-                            ConvertTo-HtmlSafe `
-                                $roleMatch.Groups['id'].Value
-                        ) +
-                        '</small></li>'
-                    }
-                    else {
-                        '<li>' +
-                        (ConvertTo-HtmlSafe $text) +
-                        '</li>'
-                    }
-                }
-            )
-            $content =
-                '<ul class="list code metric-list">' +
-                ($listItems -join '') +
-                '</ul>'
+            $metricState.NextId++
+            $metricKey = "metric-$($metricState.NextId)"
+            $metricState.Payloads[$metricKey] = [ordered]@{
+                title = $Label
+                items = @($items | ForEach-Object { [string]$_ })
+            }
             return (
-                '<details class="map-metric' +
+                '<div class="map-metric' +
                 $classAttribute +
-                '"><summary><strong>' +
+                '"><button type="button" class="map-metric-trigger" ' +
+                'aria-haspopup="dialog" data-metric-title="' +
+                (ConvertTo-HtmlSafe $Label) +
+                '" data-metric-key="' +
+                $metricKey +
+                '"><strong>' +
                 $items.Count +
                 '</strong>' +
                 (ConvertTo-HtmlSafe $Label) +
-                '</summary>' +
-                $content +
-                '</details>'
+                '<span class="map-metric-open">Open</span></button></div>'
             )
         }
         $renderScopeCount = {
@@ -3756,21 +3836,20 @@ function ConvertTo-RadarHtmlReport {
 
         [void]$sb.AppendLine(
             '<details class="actions-list" open><summary>' +
-            'MG/subscription control-gap map (' +
+            'Security gap map (' +
             $scopeCountInMap +
-            ' scopes)</summary>'
+            $(if ($scopeCountInMap -eq 1) {
+                ' scope'
+            }
+            else {
+                ' scopes'
+            }) +
+            ')</summary>'
         )
         [void]$sb.AppendLine(
-            '<p class="note">Scope-first view of baseline NotAction intent, ' +
-            'actual source-role holders, their visible direct RBAC and ' +
-            'transitive group RBAC, plus principal-specific assignment policy. Proven user paths are the primary view: an actual holder can gain a net-new restricted action through a role that policy permits. Control coverage is a separate broader view of roles missing from descendant deny controls; it is not exact parent-scope enforcement. ' +
-            'Baseline-capable means the role definition has an unblocked ' +
-            'assignment route if a principal holds it at this scope; it does ' +
-            'not prove a current assignment. External-route gaps require ' +
-            'another principal or assignment process. ' +
-            "$gapRowCount confirmed gap rows, $unknownRowCount unknown rows, " +
-            "$coveredRowCount covered rows. The companion scope-map CSV " +
-            'contains one normalised row per scope, baseline and action.</p>'
+            '<p class="note"><strong>Proven user paths</strong> shows current ' +
+            'principal-to-action exposure; <strong>Control coverage gaps</strong> ' +
+            'shows the broader role/action blast radius.</p>'
         )
         [void]$sb.AppendLine(
             '<div class="map-toolbar">' +
@@ -3809,6 +3888,22 @@ function ConvertTo-RadarHtmlReport {
         )
         [void]$sb.AppendLine(
             '<div id="map-empty" class="map-empty" hidden></div>'
+        )
+        [void]$sb.AppendLine(
+            '<dialog id="metric-dialog" class="metric-dialog" ' +
+            'aria-labelledby="metric-dialog-title">' +
+            '<div class="metric-dialog-header">' +
+            '<h2 id="metric-dialog-title" class="metric-dialog-title"></h2>' +
+            '<button type="button" class="metric-dialog-close" ' +
+            'aria-label="Close details">&times;</button></div>' +
+            '<input id="metric-dialog-search" ' +
+            'class="metric-dialog-search" type="search" ' +
+            'placeholder="Filter this list..." ' +
+            'aria-label="Filter this list" />' +
+            '<div id="metric-dialog-body" class="metric-dialog-body" ' +
+            'tabindex="0" role="region" ' +
+            'aria-label="Metric details"></div>' +
+            '</dialog>'
         )
 
         $rootNodeKey = '__RADAR_ROOT__'
@@ -4307,6 +4402,15 @@ function ConvertTo-RadarHtmlReport {
             & $renderScopeNode $rootChildKey 0
         }
         [void]$sb.AppendLine('</div>')
+        $metricJson = (
+            $metricState.Payloads |
+                ConvertTo-Json -Depth 5 -Compress
+        ).Replace('<', '\u003c')
+        [void]$sb.AppendLine(
+            '<script id="metric-data" type="application/json">' +
+            $metricJson +
+            '</script>'
+        )
         [void]$sb.AppendLine('</details>')
     }
 
@@ -4435,6 +4539,87 @@ function ConvertTo-RadarHtmlReport {
     # Client-side filter.
     [void]$sb.AppendLine(@'
 <script>
+  const metricDialog = document.getElementById('metric-dialog');
+  const metricDialogTitle =
+    document.getElementById('metric-dialog-title');
+  const metricDialogBody =
+    document.getElementById('metric-dialog-body');
+  const metricDialogSearch =
+    document.getElementById('metric-dialog-search');
+  let metricData = {};
+  try {
+    metricData = JSON.parse(
+      document.getElementById('metric-data')?.textContent || '{}'
+    );
+  } catch {
+    metricData = {};
+  }
+  if (metricDialog && metricDialogBody) {
+    document.querySelectorAll('.map-metric-trigger').forEach(trigger => {
+      trigger.addEventListener('click', () => {
+        const payload = metricData[trigger.dataset.metricKey] || {
+          title: trigger.dataset.metricTitle || 'details',
+          items: []
+        };
+        metricDialogBody.replaceChildren();
+        const list = document.createElement('ul');
+        list.className = 'list code metric-list';
+        (payload.items || []).forEach(value => {
+          const item = document.createElement('li');
+          const text = String(value);
+          const roleMatch = text.match(/^(.*?) \[([^\]]+)\]$/);
+          if (roleMatch) {
+            item.append(document.createTextNode(roleMatch[1]));
+            const id = document.createElement('small');
+            id.textContent = roleMatch[2];
+            item.appendChild(id);
+          } else {
+            item.textContent = text;
+          }
+          list.appendChild(item);
+        });
+        metricDialogBody.appendChild(list);
+        if (metricDialogTitle) {
+          const count = (payload.items || []).length;
+          metricDialogTitle.textContent =
+            `${count} ${payload.title || 'details'}`;
+        }
+        if (metricDialogSearch) {
+          metricDialogSearch.value = '';
+        }
+        metricDialog.showModal();
+        metricDialogSearch?.focus();
+      });
+    });
+    document.querySelector('.metric-dialog-close')?.addEventListener(
+      'click',
+      () => metricDialog.close()
+    );
+    metricDialog.addEventListener('click', event => {
+      if (event.target !== metricDialog) return;
+      const bounds = metricDialog.getBoundingClientRect();
+      const outside =
+        event.clientX < bounds.left ||
+        event.clientX > bounds.right ||
+        event.clientY < bounds.top ||
+        event.clientY > bounds.bottom;
+      if (outside) metricDialog.close();
+    });
+    metricDialog.addEventListener('close', () => {
+      metricDialogBody.replaceChildren();
+    });
+    metricDialogSearch?.addEventListener('input', () => {
+      const query = metricDialogSearch.value.toLowerCase().trim();
+      metricDialogBody.querySelectorAll('li').forEach(item => {
+        item.style.display =
+          query === '' ||
+          item.innerText.toLowerCase().includes(query)
+            ? ''
+            : 'none';
+      });
+    });
+  }
+
   const scopeTree = document.querySelector('.scope-tree');
   if (scopeTree) {
     const scopeNodes = Array.from(

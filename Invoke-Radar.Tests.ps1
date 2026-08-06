@@ -6158,16 +6158,19 @@ Describe 'ConvertTo-RadarHtmlReport' {
                 -ControlGapMap $controlGapMap
         }
 
-        $html | Should -Match 'control-gap map'
+        $html | Should -Match 'Security gap map'
         $html | Should -Match 'scope-tree'
         $html | Should -Not -Match 'Flat scope summary table'
         $html | Should -Match 'Workload'
         $html | Should -Match 'Dangerous.Provider/write'
         $html | Should -Match 'Owner'
         $html | Should -Match 'role-1'
-        $html | Should -Match 'baseline-capable'
-        $html | Should -Match 'remain latent'
-        $html | Should -Match 'external-route'
+        $html | Should -Match '<strong>Control gap</strong>'
+        $html | Should -Match '<strong>Proven exposure</strong>'
+        $html |
+            Should -Match '= restricted action \+ granting role'
+        $html | Should -Not -Match 'Exposure model:'
+        $html | Should -Not -Match 'Scope-first view'
         $html | Should -Match (
             'data-scope-id="/subscriptions/sub-1" ' +
             'data-parent-scope="/providers/Microsoft.Management/managementGroups/customer"'
@@ -6244,6 +6247,9 @@ Describe 'ConvertTo-RadarHtmlReport' {
 
         $html |
             Should -Match '<title>RADAR Scope Control-Gap Map</title>'
+        $html | Should -Match '1 mapped scope'
+        $html | Should -Match '1 source role'
+        $html | Should -Match 'Security gap map \(1 scope\)'
         $html | Should -Match 'scope-node'
         $html | Should -Match 'baseline-metrics'
         $html | Should -Not -Match 'No matches found'
@@ -6283,8 +6289,19 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html |
             Should -Match 'actions with a direct baseline assignment'
         $html | Should -Match 'direct baseline assignment scopes'
-        $html | Should -Match '<ul class="list code metric-list">'
-        $html | Should -Match '<small>role-1</small>'
+        $html | Should -Match 'class="map-metric-trigger"'
+        $html | Should -Match 'data-metric-key="metric-'
+        $html | Should -Match 'id="metric-data"'
+        $html | Should -Match 'id="metric-dialog"'
+        $html | Should -Match 'id="metric-dialog-search"'
+        $html | Should -Match 'tabindex="0" role="region"'
+        $html | Should -Match 'metricDialog.showModal'
+        $html | Should -Match 'JSON.parse'
+        $html | Should -Match 'document.createElement\(''ul''\)'
+        $html | Should -Match 'document.createElement\(''small''\)'
+        $html | Should -Not -Match 'class="map-metric-template"'
+        $html |
+            Should -Not -Match '<details class="map-metric'
         $html |
             Should -Not -Match 'external-process gap actions'
     }
@@ -6380,6 +6397,8 @@ Describe 'ConvertTo-RadarHtmlReport' {
         ) | Should -Be 2
         $html | Should -Match '@ /subscriptions/sub-1'
         $html | Should -Match '@ /subscriptions/sub-2'
+        $html | Should -Match '1 source role'
+        $html | Should -Not -Match '2 source roles'
         $html | Should -Match 'No proven user path'
         $html | Should -Not -Match '<strong>0</strong>'
     }
