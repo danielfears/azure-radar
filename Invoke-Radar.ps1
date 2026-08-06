@@ -2774,6 +2774,57 @@ function ConvertTo-RadarHtmlReport {
     border-radius: 12px; padding: 14px 18px; margin-bottom: 22px;
     color: var(--accent); font-size: 13px;
   }
+  .map-toolbar {
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    margin: 14px 0 18px; padding: 12px;
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .map-tabs { display: flex; gap: 6px; flex-wrap: wrap; }
+  .map-tab {
+    cursor: pointer; padding: 8px 12px; border-radius: 8px;
+    border: 1px solid var(--border); color: var(--muted);
+    background: var(--panel-2); font-size: 12px;
+  }
+  .map-tab[aria-selected="true"] {
+    color: var(--text); border-color: var(--accent);
+    box-shadow: 0 0 0 1px rgba(110,168,255,.2);
+  }
+  .map-tab[data-map-mode="actionable"][aria-selected="true"] {
+    color: var(--danger); border-color: var(--danger);
+  }
+  .map-search {
+    flex: 1 1 240px; min-width: 180px; padding: 8px 10px;
+    color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 8px;
+  }
+  .map-scope-type {
+    padding: 8px 10px; color: var(--text);
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+  .map-visible-count { color: var(--muted); font-size: 12px; }
+  .scope-tree[data-mode="actionable"]
+    .map-metric:not(.map-actionable),
+  .scope-tree[data-mode="review"]
+    .map-metric:not(.map-review) { display: none; }
+  .scope-tree[data-mode="actionable"]
+    .baseline-summary:not([data-has-net-new="true"]),
+  .scope-tree[data-mode="review"]
+    .baseline-summary:not([data-has-principal-unknown="true"]) {
+    display: none;
+  }
+  .scope-tree[data-mode="actionable"]
+    .map-status:not(.map-status-actionable),
+  .scope-tree[data-mode="review"]
+    .map-status:not(.map-status-review) { display: none; }
+  .scope-tree[data-mode="all"]
+    .map-status-review-secondary { display: none; }
+  .scope-node .ancestor-context { display: none; }
+  .scope-node.map-ancestor-only .scope-count { display: none; }
+  .scope-node.map-ancestor-only .ancestor-context {
+    display: inline-block;
+  }
   .scope-map-wrap { overflow-x: auto; margin-top: 12px; }
   .scope-map-table td {
     white-space: normal; vertical-align: top; min-width: 110px;
@@ -3330,6 +3381,23 @@ function ConvertTo-RadarHtmlReport {
                         PrincipalUnknownActions = @(
                             $rows |
                                 Where-Object {
+                                    [int](
+                                        Get-RadarPropertyValue `
+                                            -InputObject $_ `
+                                            -Name 'UnknownPrincipalRowCount'
+                                    ) -gt 0 -or
+                                    [int](
+                                        Get-RadarPropertyValue `
+                                            -InputObject $_ `
+                                            -Name 'UnknownPrincipalCount'
+                                    ) -gt 0 -or
+                                    -not [string]::IsNullOrWhiteSpace(
+                                        [string](
+                                            Get-RadarPropertyValue `
+                                                -InputObject $_ `
+                                                -Name 'UnknownPrincipals'
+                                        )
+                                    ) -or
                                     [string](
                                         Get-RadarPropertyValue `
                                             -InputObject $_ `
@@ -3342,6 +3410,16 @@ function ConvertTo-RadarHtmlReport {
                                         -Name 'RestrictedAction'
                                 } |
                                 Sort-Object -Unique
+                        )
+                        PrincipalUnknownPrincipals = @(
+                            & $collectDelimitedValues `
+                                $rows `
+                                'UnknownPrincipals'
+                        )
+                        PrincipalReviewWarnings = @(
+                            & $collectDelimitedValues `
+                                $rows `
+                                'PrincipalGapWarnings'
                         )
                         RemediationGapActions = @(
                             $subtreeGapRows |
@@ -3493,6 +3571,54 @@ function ConvertTo-RadarHtmlReport {
             $controlGapMapArray |
                 Where-Object { $_.GapStatus -eq 'Covered' }
         ).Count
+        $actionableScopeCount = @(
+            $controlGapMapArray |
+                Where-Object {
+                    [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'PrincipalGapStatus'
+                    ) -eq 'NetNewGap'
+                } |
+                Select-Object -ExpandProperty EvaluationScope -Unique
+        ).Count
+        $reviewScopeCount = @(
+            $controlGapMapArray |
+                Where-Object {
+                    [int](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'UnknownPrincipalRowCount'
+                    ) -gt 0 -or
+                    [int](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'UnknownPrincipalCount'
+                    ) -gt 0 -or
+                    -not [string]::IsNullOrWhiteSpace(
+                        [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $_ `
+                                -Name 'UnknownPrincipals'
+                        )
+                    ) -or
+                    [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'PrincipalGapStatus'
+                    ) -eq 'Unknown'
+                } |
+                Select-Object -ExpandProperty EvaluationScope -Unique
+        ).Count
+        $defaultMapMode = if ($actionableScopeCount -gt 0) {
+            'actionable'
+        }
+        elseif ($reviewScopeCount -gt 0) {
+            'review'
+        }
+        else {
+            'all'
+        }
         $renderMapMetric = {
             param(
                 [object[]]$Values,
@@ -3500,20 +3626,19 @@ function ConvertTo-RadarHtmlReport {
                 [string]$ClassName = ''
             )
             $items = @($Values)
+            if ($items.Count -eq 0) {
+                return ''
+            }
             $classAttribute = if ($ClassName) {
                 " $ClassName"
             }
             else {
                 ''
             }
-            $content = if ($items.Count -gt 0) {
+            $content =
                 '<div class="list code">' +
                 (ConvertTo-HtmlSafe ($items -join '; ')) +
                 '</div>'
-            }
-            else {
-                ''
-            }
             return (
                 '<details class="map-metric' +
                 $classAttribute +
@@ -3524,6 +3649,23 @@ function ConvertTo-RadarHtmlReport {
                 '</summary>' +
                 $content +
                 '</details>'
+            )
+        }
+        $renderScopeCount = {
+            param(
+                [int]$Count,
+                [string]$Label,
+                [string]$ClassName
+            )
+            if ($Count -le 0) { return '' }
+            return (
+                '<span class="scope-count ' +
+                (ConvertTo-HtmlSafe $ClassName) +
+                '">' +
+                $Count +
+                ' ' +
+                (ConvertTo-HtmlSafe $Label) +
+                '</span>'
             )
         }
 
@@ -3549,6 +3691,36 @@ function ConvertTo-RadarHtmlReport {
             "$gapRowCount confirmed gap rows, $unknownRowCount unknown rows, " +
             "$coveredRowCount covered rows. The companion scope-map CSV " +
             'contains one normalised row per scope, baseline and action.</p>'
+        )
+        [void]$sb.AppendLine(
+            '<div class="map-toolbar">' +
+            '<div class="map-tabs" role="tablist" ' +
+            'aria-label="Scope-map view">' +
+            '<button type="button" class="map-tab" ' +
+            'data-map-mode="actionable" role="tab">' +
+            'Actionable (' +
+            $actionableScopeCount +
+            ')</button>' +
+            '<button type="button" class="map-tab" ' +
+            'data-map-mode="review" role="tab">' +
+            'Needs review (' +
+            $reviewScopeCount +
+            ')</button>' +
+            '<button type="button" class="map-tab" ' +
+            'data-map-mode="all" role="tab">All diagnostics (' +
+            $scopeCountInMap +
+            ')</button></div>' +
+            '<input id="map-search" class="map-search" type="search" ' +
+            'placeholder="Find a management group or subscription..." ' +
+            'aria-label="Find a scope" />' +
+            '<select id="map-scope-type" class="map-scope-type" ' +
+            'aria-label="Filter scope type">' +
+            '<option value="all">All scope types</option>' +
+            '<option value="ManagementGroup">Management groups</option>' +
+            '<option value="Subscription">Subscriptions</option>' +
+            '</select>' +
+            '<span id="map-visible-count" class="map-visible-count"></span>' +
+            '</div>'
         )
 
         $rootNodeKey = '__RADAR_ROOT__'
@@ -3725,9 +3897,98 @@ function ConvertTo-RadarHtmlReport {
                 ''
             }
             $indent = [math]::Min($Depth * 22, 132)
+            $combinedUnknownCount = @(
+                $nodeAssignmentUnknownActions +
+                $nodeUnknownActions |
+                    Sort-Object -Unique
+            ).Count
+            $actionableStatusBadge = if (
+                $nodeNetNewGapActions.Count -gt 0
+            ) {
+                & $renderScopeCount `
+                    $nodeNetNewGapActions.Count `
+                    'net-new gaps' `
+                    'gap map-status map-status-actionable'
+            }
+            else {
+                ''
+            }
+            $reviewStatusBadge = if (
+                $nodePrincipalUnknownActions.Count -gt 0
+            ) {
+                $reviewStatusClass = if (
+                    $nodeNetNewGapActions.Count -gt 0
+                ) {
+                    'unknown map-status map-status-review ' +
+                    'map-status-review-secondary'
+                }
+                else {
+                    'unknown map-status map-status-review'
+                }
+                & $renderScopeCount `
+                    $nodePrincipalUnknownActions.Count `
+                    'principal unknown' `
+                    $reviewStatusClass
+            }
+            else {
+                ''
+            }
+            $cleanStatusBadge = if (
+                $nodeNetNewGapActions.Count -eq 0 -and
+                $nodePrincipalUnknownActions.Count -eq 0
+            ) {
+                '<span class="scope-count covered map-status ' +
+                'map-status-clean">' +
+                'No actionable gaps</span>'
+            }
+            else {
+                ''
+            }
+            $primaryStatusBadges =
+                $actionableStatusBadge +
+                $reviewStatusBadge +
+                $cleanStatusBadge
+            $secondaryStatusBadges = @(
+                (& $renderScopeCount `
+                    $nodeRemediationGapActions.Count `
+                    'remediation gaps (latent/posture)' `
+                    'gap map-status map-status-diagnostic'),
+                (& $renderScopeCount `
+                    $nodeSubtreeControlledActions.Count `
+                    'subtree-controlled' `
+                    'covered map-status map-status-diagnostic'),
+                (& $renderScopeCount `
+                    $nodeDirectAssignedActions.Count `
+                    'direct-assigned' `
+                    'current map-status map-status-diagnostic'),
+                (& $renderScopeCount `
+                    $nodeBaselineObtainableActions.Count `
+                    'latent-capable' `
+                    'external map-status map-status-diagnostic'),
+                (& $renderScopeCount `
+                    $nodeExternalGapActions.Count `
+                    'external-route' `
+                    'external map-status map-status-diagnostic'),
+                (& $renderScopeCount `
+                    $combinedUnknownCount `
+                    'unknown' `
+                    'unknown map-status map-status-diagnostic'),
+                (& $renderScopeCount `
+                    $nodeCoveredActions.Count `
+                    'covered' `
+                    'covered map-status map-status-diagnostic')
+            ) -join ''
             [void]$sb.AppendLine(
                 '<div class="scope-node" data-depth="' +
                 $Depth +
+                '" data-has-net-new="' +
+                ($nodeNetNewGapActions.Count -gt 0).ToString().
+                    ToLowerInvariant() +
+                '" data-has-principal-unknown="' +
+                ($nodePrincipalUnknownActions.Count -gt 0).ToString().
+                    ToLowerInvariant() +
+                '" data-scope-type="' +
+                (ConvertTo-HtmlSafe $node.Type) +
                 '" style="--scope-indent:' +
                 $indent +
                 'px" data-scope-id="' +
@@ -3743,38 +4004,12 @@ function ConvertTo-RadarHtmlReport {
                 (ConvertTo-HtmlSafe $node.Name) +
                 '</span><span class="scope-type">' +
                 (ConvertTo-HtmlSafe $node.Type) +
-                '</span><span class="scope-count gap">' +
-                $nodeNetNewGapActions.Count +
-                ' net-new gaps</span>' +
-                '<span class="scope-count unknown">' +
-                $nodePrincipalUnknownActions.Count +
-                ' principal unknown</span>' +
-                '<span class="scope-count gap">' +
-                $nodeRemediationGapActions.Count +
-                ' remediation gaps (latent/posture)</span>' +
-                '<span class="scope-count covered">' +
-                $nodeSubtreeControlledActions.Count +
-                ' subtree-controlled</span>' +
-                '<span class="scope-count current">' +
-                $nodeDirectAssignedActions.Count +
-                ' direct-assigned</span>' +
-                '<span class="scope-count external">' +
-                $nodeBaselineObtainableActions.Count +
-                ' latent-capable</span>' +
-                '<span class="scope-count external">' +
-                $nodeExternalGapActions.Count +
-                ' external-route</span>' +
-                '<span class="scope-count unknown">' +
-                (
-                    @(
-                        $nodeAssignmentUnknownActions +
-                        $nodeUnknownActions |
-                            Sort-Object -Unique
-                    ).Count
-                ) +
-                ' unknown</span><span class="scope-count covered">' +
-                $nodeCoveredActions.Count +
-                ' covered</span></summary>'
+                '</span>' +
+                $primaryStatusBadges +
+                $secondaryStatusBadges +
+                '<span class="scope-count current ancestor-context">' +
+                'Ancestor path</span>' +
+                '</summary>'
             )
             [void]$sb.AppendLine(
                 '<div class="scope-node-content"><div class="code">' +
@@ -3813,8 +4048,19 @@ function ConvertTo-RadarHtmlReport {
                             }
                         }
                 )
+                $summaryHasNetNew = (
+                    @($summary.NetNewGapActions).Count -gt 0
+                ).ToString().ToLowerInvariant()
+                $summaryHasPrincipalUnknown = (
+                    @($summary.PrincipalUnknownActions).Count -gt 0
+                ).ToString().ToLowerInvariant()
                 [void]$sb.AppendLine(
-                    '<section class="baseline-summary">' +
+                    '<section class="baseline-summary" ' +
+                    'data-has-net-new="' +
+                    $summaryHasNetNew +
+                    '" data-has-principal-unknown="' +
+                    $summaryHasPrincipalUnknown +
+                    '">' +
                     '<div class="baseline-heading">' +
                     (ConvertTo-HtmlSafe $summary.BaselineRoleName) +
                     $baselineScopeMarkup +
@@ -3822,75 +4068,83 @@ function ConvertTo-RadarHtmlReport {
                     (& $renderMapMetric `
                         $summary.NetNewGapActions `
                         'net-new principal gap actions' `
-                        'gap') +
+                        'gap map-actionable') +
                     (& $renderMapMetric `
                         $summary.NetNewGapRoles `
                         'net-new granting roles' `
-                        'gap') +
+                        'gap map-actionable') +
                     (& $renderMapMetric `
                         $summary.NetNewGapPrincipals `
                         'net-new principals (ID and type)' `
-                        'current') +
+                        'current map-actionable') +
                     (& $renderMapMetric `
                         $summary.PrincipalUnknownActions `
                         'principal correlation unknown' `
-                        'unknown') +
+                        'unknown map-review') +
+                    (& $renderMapMetric `
+                        $summary.PrincipalUnknownPrincipals `
+                        'principals requiring review (ID and type)' `
+                        'unknown map-review') +
+                    (& $renderMapMetric `
+                        $summary.PrincipalReviewWarnings `
+                        'why principal evidence is unknown' `
+                        'unknown map-review') +
                     (& $renderMapMetric `
                         $summary.RemediationGapActions `
                         'latent/subtree posture gap actions' `
-                        'gap') +
+                        'gap map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.RemediationGapRoles `
                         'roles missing from subtree controls' `
-                        'gap') +
+                        'gap map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.SubtreeControlledRoles `
                         'roles represented in subtree controls' `
-                        'covered') +
+                        'covered map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.DirectAssignedActions `
                         'actions with a direct baseline assignment' `
-                        'current') +
+                        'current map-diagnostic') +
                     (& $renderMapMetric `
                         $directAssignmentScopeLabels `
                         'direct baseline assignment scopes' `
-                        'current') +
+                        'current map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.BaselineObtainableActions `
                         'latent actions if baseline is assigned' `
-                        'gap') +
+                        'gap map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.BaselineAssignableRoles `
                         'roles this baseline can assign' `
-                        'gap') +
+                        'gap map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.AssignmentUnknownActions `
                         'assignment exposure unknown' `
-                        'unknown') +
+                        'unknown map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.AssignmentWarnings `
                         'assignment discovery warnings' `
-                        'unknown') +
+                        'unknown map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.ExternalGapActions `
                         'external-process gap actions' `
-                        'external') +
+                        'external map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.ExternalAssignmentRoles `
                         'roles requiring another process' `
-                        'external') +
+                        'external map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.UnknownActions `
                         'unknown actions' `
-                        'unknown') +
+                        'unknown map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.CoveredActions `
                         'covered actions' `
-                        'covered') +
+                        'covered map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.BlockingPolicies `
                         'blocking policies' `
-                        'covered') +
+                        'covered map-diagnostic') +
                     '</div></section>'
                 )
             }
@@ -3914,7 +4168,11 @@ function ConvertTo-RadarHtmlReport {
             }
         }
 
-        [void]$sb.AppendLine('<div class="scope-tree">')
+        [void]$sb.AppendLine(
+            '<div class="scope-tree" data-mode="' +
+            $defaultMapMode +
+            '">'
+        )
         foreach (
             $rootChildKey in @(
                 $childrenByParent[$rootNodeKey] |
@@ -4057,6 +4315,146 @@ function ConvertTo-RadarHtmlReport {
     # Client-side filter.
     [void]$sb.AppendLine(@'
 <script>
+  const scopeTree = document.querySelector('.scope-tree');
+  if (scopeTree) {
+    const scopeNodes = Array.from(
+      scopeTree.querySelectorAll('.scope-node')
+    );
+    const nodeById = new Map(
+      scopeNodes.map(node => [
+        (node.dataset.scopeId || '').toLowerCase(),
+        node
+      ])
+    );
+    const mapTabs = Array.from(
+      document.querySelectorAll('.map-tab')
+    );
+    const mapSearch = document.getElementById('map-search');
+    const mapScopeType = document.getElementById('map-scope-type');
+    const mapVisibleCount =
+      document.getElementById('map-visible-count');
+    let mapMode = scopeTree.dataset.mode || 'all';
+
+    const applyMapFilters = () => {
+      const query = (mapSearch?.value || '').toLowerCase().trim();
+      const scopeType = mapScopeType?.value || 'all';
+      const directMatches = new Set();
+      const searchMatches = new Set();
+      if (query !== '') {
+        scopeNodes.forEach(node => {
+          const summary = node.querySelector('.scope-card > summary');
+          const searchText = (
+            (node.dataset.scopeId || '') +
+            ' ' +
+            (summary?.innerText || '')
+          ).toLowerCase();
+          if (searchText.includes(query)) {
+            searchMatches.add(node);
+          }
+        });
+      }
+      const scopeOrAncestorMatchesSearch = node => {
+        if (query === '') return true;
+        let current = node;
+        const visited = new Set();
+        while (current) {
+          if (searchMatches.has(current)) return true;
+          const parentId = (
+            current.dataset.parentScope || ''
+          ).toLowerCase();
+          if (!parentId || visited.has(parentId)) break;
+          visited.add(parentId);
+          current = nodeById.get(parentId);
+        }
+        return false;
+      };
+      scopeNodes.forEach(node => {
+        const modeMatch =
+          mapMode === 'all' ||
+          (
+            mapMode === 'actionable' &&
+            node.dataset.hasNetNew === 'true'
+          ) ||
+          (
+            mapMode === 'review' &&
+            node.dataset.hasPrincipalUnknown === 'true'
+          );
+        const typeMatch =
+          scopeType === 'all' ||
+          node.dataset.scopeType === scopeType;
+        if (
+          modeMatch &&
+          typeMatch &&
+          scopeOrAncestorMatchesSearch(node)
+        ) {
+          directMatches.add(node);
+        }
+      });
+
+      const visible = new Set(directMatches);
+      if (scopeType === 'all') {
+        directMatches.forEach(node => {
+          let parentId = (
+            node.dataset.parentScope || ''
+          ).toLowerCase();
+          const visited = new Set();
+          while (parentId && !visited.has(parentId)) {
+            visited.add(parentId);
+            const parent = nodeById.get(parentId);
+            if (!parent) break;
+            visible.add(parent);
+            parentId = (
+              parent.dataset.parentScope || ''
+            ).toLowerCase();
+          }
+        });
+      }
+
+      scopeNodes.forEach(node => {
+        node.style.display = visible.has(node) ? '' : 'none';
+        node.classList.toggle(
+          'map-ancestor-only',
+          visible.has(node) && !directMatches.has(node)
+        );
+        const details = node.querySelector('.scope-card');
+        if (
+          details &&
+          (
+            mapMode !== 'all' ||
+            query !== ''
+          )
+        ) {
+          details.open = directMatches.has(node);
+        }
+      });
+      scopeTree.dataset.mode = mapMode;
+      mapTabs.forEach(tab => {
+        tab.setAttribute(
+          'aria-selected',
+          String(tab.dataset.mapMode === mapMode)
+        );
+      });
+      if (mapVisibleCount) {
+        const ancestorCount =
+          visible.size - directMatches.size;
+        mapVisibleCount.textContent =
+          `${directMatches.size} matching scope` +
+          `${directMatches.size === 1 ? '' : 's'}` +
+          `${ancestorCount > 0 ? ` + ${ancestorCount} ancestor${ancestorCount === 1 ? '' : 's'}` : ''}`;
+      }
+    };
+
+    mapTabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        mapMode = tab.dataset.mapMode || 'all';
+        applyMapFilters();
+      });
+    });
+    mapSearch?.addEventListener('input', applyMapFilters);
+    mapScopeType?.addEventListener('change', applyMapFilters);
+    applyMapFilters();
+  }
+
   const input = document.getElementById('filter');
   if (input) {
     input.addEventListener('input', () => {
@@ -8825,6 +9223,9 @@ function Export-RadarControlGapMap {
                     NetNewGapPrincipals,
                     NetNewGapRoleCount,
                     NetNewGapRoles,
+                    UnknownPrincipalCount,
+                    UnknownPrincipalRowCount,
+                    UnknownPrincipals,
                     PrincipalGapWarnings,
                     GapStatus,
                     BaselineAccessStatus,
@@ -8865,7 +9266,7 @@ function Export-RadarControlGapMap {
             Set-Content `
                 -LiteralPath $tempPath `
                 -Encoding UTF8 `
-                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","PrincipalGapStatus","NetNewGapActionCount","NetNewGapPrincipalCount","NetNewGapPrincipals","NetNewGapRoleCount","NetNewGapRoles","PrincipalGapWarnings","GapStatus","BaselineAccessStatus","BaselineAssignmentState","EffectiveDirectAssignmentCount","BaselinePrincipalTypes","BaselineAssignmentScopes","AssignmentWarnings","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownBaselineAssignableRoleCount","UnknownBaselineAssignableRoles","UnknownExternalAssignmentRoleCount","UnknownExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","PolicyControlledRoleCount","PolicyControlledRoles","SubtreeControlStatus","SubtreeGapRoleCount","SubtreeGapRoles","SubtreeControlledRoleCount","SubtreeControlledRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
+                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","PrincipalGapStatus","NetNewGapActionCount","NetNewGapPrincipalCount","NetNewGapPrincipals","NetNewGapRoleCount","NetNewGapRoles","UnknownPrincipalCount","UnknownPrincipalRowCount","UnknownPrincipals","PrincipalGapWarnings","GapStatus","BaselineAccessStatus","BaselineAssignmentState","EffectiveDirectAssignmentCount","BaselinePrincipalTypes","BaselineAssignmentScopes","AssignmentWarnings","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownBaselineAssignableRoleCount","UnknownBaselineAssignableRoles","UnknownExternalAssignmentRoleCount","UnknownExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","PolicyControlledRoleCount","PolicyControlledRoles","SubtreeControlStatus","SubtreeGapRoleCount","SubtreeGapRoles","SubtreeControlledRoleCount","SubtreeControlledRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
         }
         Move-Item `
             -LiteralPath $tempPath `
@@ -11276,6 +11677,27 @@ function Add-RadarPrincipalGapSummary {
                 $netNewRows |
                     ForEach-Object {
                         "$($_.GrantingRoleName) [$($_.GrantingRoleId)]"
+                    } |
+                    Sort-Object -Unique
+            ) -join '; '
+            UnknownPrincipalCount = @(
+                $unknownRows |
+                    ForEach-Object { $_.PrincipalId } |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    } |
+                    Sort-Object -Unique
+            ).Count
+            UnknownPrincipalRowCount = $unknownRows.Count
+            UnknownPrincipals = @(
+                $unknownRows |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$_.PrincipalId
+                        )
+                    } |
+                    ForEach-Object {
+                        "$($_.PrincipalId) [$($_.PrincipalType)]"
                     } |
                     Sort-Object -Unique
             ) -join '; '

@@ -2303,7 +2303,23 @@ Describe 'Principal-gap reporting' {
 
         $summary = Add-RadarPrincipalGapSummary `
             -Rows @($row) `
-            -PrincipalGaps @($principalGap)
+            -PrincipalGaps @(
+                $principalGap,
+                [pscustomobject]@{
+                    PrincipalId = ''
+                    PrincipalType = ''
+                    BaselineRoleId = 'baseline-role'
+                    BaselineScope = '/subscriptions/sub-1'
+                    EvaluationScope = '/subscriptions/sub-1'
+                    RestrictedAction =
+                        'Dangerous.Provider/write'
+                    GrantingRoleName = 'Unknown Operator'
+                    GrantingRoleId = 'unknown-role'
+                    NetNewGapStatus = 'Unknown'
+                    Warnings =
+                        'Principal identity is unreadable.'
+                }
+            )
 
         $summary.PrincipalGapStatus | Should -Be 'NetNewGap'
         $summary.NetNewGapActionCount | Should -Be 1
@@ -2313,6 +2329,10 @@ Describe 'Principal-gap reporting' {
         $summary.NetNewGapRoleCount | Should -Be 1
         $summary.NetNewGapRoles |
             Should -Match 'Dangerous Operator'
+        $summary.UnknownPrincipalCount | Should -Be 0
+        $summary.UnknownPrincipalRowCount | Should -Be 1
+        $summary.PrincipalGapWarnings |
+            Should -Match 'Principal identity is unreadable'
     }
 
     It 'marks a complete no-holder scope as dormant rather than a gap' {
@@ -5418,6 +5438,11 @@ Describe 'ConvertTo-RadarHtmlReport' {
                 NetNewGapRoles = 'Owner [role-1]'
                 NetNewGapPrincipals =
                     'principal-placeholder [User]'
+                UnknownPrincipalCount = 1
+                UnknownPrincipals =
+                    'review-placeholder [ServicePrincipal]'
+                PrincipalGapWarnings =
+                    'One principal requires directory review.'
                 BaselineAssignableRoles = 'Owner [role-1]'
                 ExternalAssignmentRoles = 'Owner [role-1]'
                 SubtreeControlStatus = 'Gap'
@@ -5457,6 +5482,28 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html | Should -Not -Match 'id="filter"'
         $html | Should -Match '1 direct-assigned'
         $html | Should -Match '1 net-new gaps'
+        $html | Should -Match 'Actionable \(1\)'
+        $html | Should -Match 'Needs review \(1\)'
+        $html | Should -Match 'All diagnostics \(1\)'
+        $html | Should -Match 'data-mode="actionable"'
+        $html | Should -Match 'id="map-search"'
+        $html | Should -Match 'id="map-scope-type"'
+        $html | Should -Match 'applyMapFilters'
+        $html | Should -Match 'scopeOrAncestorMatchesSearch'
+        $html | Should -Match 'if \(scopeType === ''all''\)'
+        $html | Should -Match 'map-ancestor-only'
+        $html | Should -Match 'map-status-actionable'
+        $html | Should -Match 'map-status-review-secondary'
+        $html | Should -Match 'review-placeholder \[ServicePrincipal\]'
+        $html |
+            Should -Match 'One principal requires directory review'
+        $html | Should -Not -Match 'scopeType !== ''all'''
+        (
+            [regex]::Matches(
+                $html,
+                '<button type="button" class="map-tab"'
+            ).Count
+        ) | Should -Be 3
         $html |
             Should -Match 'principal-placeholder \[User\]'
         $html | Should -Match '1 remediation gaps'
@@ -5465,9 +5512,51 @@ Describe 'ConvertTo-RadarHtmlReport' {
             Should -Match 'actions with a direct baseline assignment'
         $html | Should -Match 'direct baseline assignment scopes'
         $html |
-            Should -Match (
-                '<strong>0</strong>external-process gap actions'
-            )
+            Should -Not -Match 'external-process gap actions'
+    }
+
+    It 'renders principal identities and reasons in Needs review' {
+        $row = [pscustomobject]@{
+            EvaluationScopeType = 'Subscription'
+            EvaluationScopeName = 'Workload'
+            EvaluationScope = '/subscriptions/sub-1'
+            ParentScopeName = ''
+            ParentScope = ''
+            AncestorScopes = ''
+            BaselineRoleName = 'Customer-Platform-Owner'
+            BaselineRoleId = 'baseline-1'
+            BaselineScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            PrincipalGapStatus = 'Unknown'
+            UnknownPrincipals =
+                'principal-placeholder [ServicePrincipal]'
+            PrincipalGapWarnings =
+                'Directory evidence is incomplete.'
+            GapStatus = 'Unknown'
+            BaselineAccessStatus = 'Unknown'
+            BaselineAssignableRoles = ''
+            ExternalAssignmentRoles = ''
+            BlockingPolicies = ''
+        }
+
+        $html = ConvertTo-RadarHtmlReport `
+            -Results @() `
+            -RestrictedActions @('Dangerous.Provider/write') `
+            -RolesScanned 1 `
+            -IncludeCustomRoles $true `
+            -BaselineContextCount 1 `
+            -ControlGapMap @($row) `
+            -MapOnly
+
+        $html | Should -Match 'Actionable \(0\)'
+        $html | Should -Match 'Needs review \(1\)'
+        $html | Should -Match 'data-mode="review"'
+        $html |
+            Should -Match 'principal-placeholder \[ServicePrincipal\]'
+        $html | Should -Match 'Directory evidence is incomplete'
+        $html | Should -Match 'principals requiring review'
+        $html | Should -Match 'why principal evidence is unknown'
+        $html | Should -Match 'map-status-review'
     }
 
     It 'keeps distinct baseline scopes separate in the map' {
@@ -5512,6 +5601,8 @@ Describe 'ConvertTo-RadarHtmlReport' {
         ) | Should -Be 2
         $html | Should -Match '@ /subscriptions/sub-1'
         $html | Should -Match '@ /subscriptions/sub-2'
+        $html | Should -Match 'No actionable gaps'
+        $html | Should -Not -Match '<strong>0</strong>'
     }
 
     It 'derives the dedicated map path from the requested report path' {

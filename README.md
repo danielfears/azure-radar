@@ -471,6 +471,9 @@ smaller `<name>-scope-map.html` dedicated to the visual hierarchy.
 The HTML outputs include:
 
 - role, policy, exemption, scope, and baseline-context counts;
+- task-focused `Actionable`, `Needs review`, and `All diagnostics` tabs;
+- scope search plus management-group/subscription filtering (type filters show
+  only the selected scope type, without ancestor-card noise);
 - a responsive visual management-group/subscription hierarchy with separate
   primary net-new principal-gap actions plus secondary remediation posture,
   direct-assigned, latent baseline-capable, external-process, exact unknown,
@@ -482,6 +485,11 @@ The HTML outputs include:
 - blocking policy names and assignment scopes;
 - unblocked assignment paths;
 - embedded discovery warnings and searchable findings.
+
+The default view is `Actionable` when proven net-new gaps exist, otherwise
+`Needs review`, then `All diagnostics`. Empty secondary metrics are suppressed.
+The focused views show only relevant baseline sections; the review view includes
+principal IDs/types and the evidence reason needed for triage.
 
 ## Interpretation
 
