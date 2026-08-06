@@ -9951,11 +9951,6 @@ authorizationresources
                 -Assignments $assignmentArray
         Warnings = @(
             @($BaselineAssignmentInventory.Warnings) +
-            @(
-                Get-RadarPropertyValue `
-                    -InputObject $DirectoryEvidence `
-                    -Name 'Warnings'
-            ) +
             $warnings.ToArray() |
                 Sort-Object -Unique
         )
@@ -10314,15 +10309,12 @@ function Get-RadarPrincipalExistingAccess {
                 $PrincipalId.ToLowerInvariant()
             ]
     }
-    $groupIds = if ($null -ne $directoryPrincipalEvidence) {
-        @(
+    $groupIds = @(
+        if ($null -ne $directoryPrincipalEvidence) {
             $directoryPrincipalEvidence.GroupIds |
                 Sort-Object -Unique
-        )
-    }
-    else {
-        @()
-    }
+        }
+    )
     $principalEnabledStatus = if (
         $null -ne $directoryPrincipalEvidence -and
         $directoryPrincipalEvidence.IsComplete
@@ -10923,7 +10915,15 @@ function Get-RadarPrincipalGap {
                     }
                 }
 
-                $existingAccess =
+                $existingAccess = if ($availablePaths.Count -eq 0) {
+                    [pscustomobject]@{
+                        Status = 'NotEvaluated'
+                        PrincipalEnabledStatus = 'NotEvaluated'
+                        GroupIds = @()
+                        Warnings = @()
+                    }
+                }
+                else {
                     Get-RadarPrincipalExistingAccess `
                         -PrincipalId $principalId `
                         -PrincipalType $principalType `
@@ -10941,6 +10941,7 @@ function Get-RadarPrincipalGap {
                         -Hierarchy $Hierarchy `
                         -RoleByKey $roleByKey `
                         -ExistingAccessCache $ExistingAccessCache
+                }
                 $existingAccessStatus = $existingAccess.Status
                 $principalEnabledStatus =
                     $existingAccess.PrincipalEnabledStatus

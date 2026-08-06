@@ -1369,6 +1369,44 @@ Describe 'Get-RadarPrincipalRoleAssignmentInventory' {
         }
     }
 
+    It 'does not attach another principal directory warning to all assignments' {
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @()
+                SkipToken = $null
+            }
+        }
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    PrincipalId =
+                        '33333333-3333-3333-3333-333333333333'
+                    PrincipalType = 'User'
+                }
+            )
+        }
+        $directoryEvidence = [pscustomobject]@{
+            IsComplete = $false
+            GroupIds = @()
+            Warnings = @(
+                'Another directory object returned HTTP 404.'
+            )
+        }
+
+        $inventory =
+            Get-RadarPrincipalRoleAssignmentInventory `
+                -BaselineAssignmentInventory $baselineInventory `
+                -DirectoryEvidence $directoryEvidence
+
+        $inventory.Warnings |
+            Should -Not -Contain (
+                'Another directory object returned HTTP 404.'
+            )
+    }
+
     It 'splits large principal and group filters into bounded queries' {
         Mock Search-AzGraph {
             [pscustomobject]@{
@@ -1593,6 +1631,32 @@ Describe 'Get-RadarPrincipalGap' {
         $gaps[0].AssignmentPolicyStatus |
             Should -Be 'Permitted'
         $gaps[0].NetNewGapStatus | Should -Be 'NetNewGap'
+    }
+
+    It 'keeps a single transitive group as an array under strict mode' {
+        [void]$directoryEvidenceItem.GroupIds.Add(
+            '44444444-4444-4444-4444-444444444444'
+        )
+
+        $gap = & {
+            Set-StrictMode -Version Latest
+            Get-RadarPrincipalGap `
+                -Results @($result) `
+                -BaselineContexts @($context) `
+                -BaselineAssignmentInventory $baselineInventory `
+                -DirectoryEvidence $directoryEvidence `
+                -PrincipalAssignmentInventory $principalInventory `
+                -Roles @(
+                    $baselineRole,
+                    $grantingRole,
+                    $ownerRole
+                ) `
+                -Hierarchy $hierarchy `
+                -PolicyInventory $policyInventory `
+                -DeniedRoleNames $deniedRoles
+        }
+
+        $gap.TransitiveGroupCount | Should -Be 1
     }
 
     It 'caches effective existing-access evidence across candidate roles' {
@@ -2145,6 +2209,9 @@ Describe 'Get-RadarPrincipalGap' {
 
     It 'does not treat an external-only assignment path as actionable' {
         $context.AssignmentPaths = @($externalPath)
+        Mock Get-RadarPrincipalExistingAccess {
+            throw 'Existing access should not be evaluated without a reachable path.'
+        }
 
         $gap = Get-RadarPrincipalGap `
             -Results @($result) `
@@ -2161,6 +2228,7 @@ Describe 'Get-RadarPrincipalGap' {
             Should -Be 'NoBaselineReachablePath'
         $gap.NetNewGapStatus |
             Should -Be 'NoBaselineReachablePath'
+        Should -Invoke Get-RadarPrincipalExistingAccess -Times 0
     }
 }
 
