@@ -43,14 +43,15 @@ flowchart LR
     P --> G
 ```
 
-The primary semantic unit is:
+RADAR keeps two independent semantic units:
 
 ```text
+baseline role × evaluation scope × restricted action × granting role
 principal × baseline role × exact evaluation scope × restricted action × granting role
 ```
 
-The earlier role-capability and subtree-remediation views remain available as
-secondary diagnostics and configuration posture.
+The first preserves the original control-coverage/blast-radius question. The
+second proves current net-new self-escalation. Neither replaces the other.
 
 Baseline roles are never unioned. If production and UAT variants have the same
 `NotActions`, production can be fully protected while UAT retains a latent
@@ -94,20 +95,24 @@ confirm policy boundary scopes before a result can be considered fully covered.
 - Correlates effective direct assignments of baseline roles through one
   filtered Azure Resource Graph query, then reuses an in-memory scope index.
 - Uses bounded Microsoft Graph JSON batches to resolve User/ServicePrincipal
-  enabled state and transitive groups, including paged memberships.
+  enabled state and transitive groups, plus paged transitive User and
+  ServicePrincipal membership of source Groups.
 - Uses bounded tenant-scoped Resource Graph query batches, filtered to holders
   and their transitive group IDs, to inventory visible effective RBAC.
 - Classifies principals that already possess the restricted action as
   `AlreadyHasAction`, not as escalation gaps.
 - Re-evaluates assignment policy at the exact scope for the actual principal ID
   and type, using only assignment paths the source role can create.
-- Treats absent holders as dormant capability and group, conditioned,
-  incomplete, or unsupported evidence as `Unknown`.
-- Produces a normalised principal-gap CSV as the primary actionable output.
+- Treats absent holders as dormant capability, directory object 404s as
+  `PrincipalMissing`, and conditioned, incomplete, or unsupported evidence as
+  `Unknown`.
+- Produces a normalised principal-gap CSV as an exploitability/prioritisation
+  overlay.
 - Produces an MG/subscription-first control-gap map showing restriction intent,
   confirmed gap roles, baseline-assignable roles, externally assigned roles,
   covered roles, blocking policies, and unknown evidence.
-- Retains a legacy-compatible subtree remediation view as secondary posture:
+- Makes the legacy-compatible subtree remediation view the primary control-gap
+  posture:
   roles represented in any descendant deny control versus roles still missing.
 - Emits a detailed CSV and a self-contained HTML dashboard.
 
@@ -134,9 +139,12 @@ Microsoft.Resources/subscriptions/read
 ```
 
 Principal-level `NetNewGap` conclusions also require Microsoft Graph permission
-to read the holder's `accountEnabled` state and transitive group membership
-(normally `Directory.Read.All`). If Graph consent or evidence is unavailable,
-that principal remains `Unknown`.
+to read holder `accountEnabled` state, transitive group membership, and
+transitive User/ServicePrincipal membership of source Groups (normally
+`Directory.Read.All`). If Graph consent or evidence is unavailable, that
+principal remains `Unknown`. A confirmed object-GET 404 is instead complete
+absence evidence and produces the non-actionable `PrincipalMissing` status;
+other Graph failures never imply absence.
 
 `Reader` at the customer root management group is the simplest assignment.
 Tenant Root Group access is not required: RADAR falls back to visible customer
@@ -298,8 +306,8 @@ Principal correlation then performs bounded Microsoft Graph JSON batches for
 enabled state and transitive membership, followed by tenant-scoped Resource
 Graph queries in batches of up to 300 holder/group IDs. Each ARG query is paged,
 merged and deduplicated, then indexed by principal and scope. Use
-`-NoPrincipalCorrelation` to retain only the secondary capability/posture
-analysis. `-NoAssignmentDiscovery` also prevents principal correlation because
+`-NoPrincipalCorrelation` to retain control-coverage and exact-capability
+analysis without the principal overlay. `-NoAssignmentDiscovery` also prevents principal correlation because
 source holders are unavailable.
 
 Effective existing-access evidence is cached by principal ID/type, exact scope,
@@ -343,11 +351,12 @@ For each relevant exact scope, RADAR:
 
 A role is `Full` only when every relevant scope and every available assignment
 path is definitely blocked. This remains a secondary role-definition
-capability conclusion. A primary `NetNewGap` additionally requires an observed,
-unconditioned User or ServicePrincipal source-role assignment effective at the
-exact scope, no effective unconditioned direct assignment already granting the
-action, a source-role-reachable assignment path, and policy permission for the
-actual principal.
+capability conclusion. A principal `NetNewGap` additionally requires an
+observed, unconditioned User or ServicePrincipal source-role assignment,
+directly or through a fully expanded source Group, effective at the exact
+scope; no effective unconditioned direct or transitive-group assignment already
+granting the action; a source-role-reachable assignment path; and policy
+permission for the actual principal.
 
 Policy scope is directional: an assignment at a management group applies
 downwards, but an assignment on a descendant subscription does not protect its
@@ -371,9 +380,13 @@ a fully proven result in unrelated subscription A.
 
 ## Output
 
-The primary actionable file is `<name>-principal-gaps.csv`. It contains:
+The primary control-gap inventory is `<name>-scope-map.csv` and its `Control
+gaps` HTML view. `<name>-principal-gaps.csv` adds a prioritisation overlay
+showing which control gaps have a proven current self-escalation path. It
+contains:
 
 - `PrincipalId`, `PrincipalType`
+- `SourcePrincipalId`, `SourceViaGroup`
 - `BaselineRoleName`, `BaselineRoleId`, `BaselineScope`
 - `SourceAssignmentScopes`, `EvaluationScope`
 - `RestrictedAction`
@@ -381,13 +394,16 @@ The primary actionable file is `<name>-principal-gaps.csv`. It contains:
 - `PrincipalEnabledStatus`, `TransitiveGroupCount`
 - `ExistingAccessStatus`
 - `AssignmentPolicyStatus`
+- `PolicyIntentEvidence`
 - `NetNewGapStatus`
 - `AvailableAssignmentPaths`, `EvidenceModel`, `Warnings`
 
 `NetNewGapStatus=NetNewGap` is the actionable condition. `AlreadyHasAction`,
-`PrincipalDisabled`, `PolicyBlocked`, `NoBaselineReachablePath`, and `Unknown`
-are not counted as active gaps. The export is atomic and contains headers even
-when no source-role holder is observed.
+`PrincipalDisabled`, `PrincipalMissing`, `PolicyBlocked`,
+`NoBaselineReachablePath`, and `Unknown` are not counted as active gaps.
+`PrincipalMissing` means the Graph object GET returned 404; it is not used for
+403, throttling, transport, or other failures. The export is atomic and
+contains headers even when no source-role holder is observed.
 
 The secondary capability match CSV contains one compact row per
 restricted-action match:
@@ -420,7 +436,7 @@ RADAR also writes `<name>-scope-map.csv`, one row per:
 management group or subscription × baseline role × restricted action
 ```
 
-Its secondary `SubtreeControlStatus` reproduces the original remediation
+Its primary `SubtreeControlStatus` reproduces the original remediation
 question at every scope:
 
 | State | Meaning |
@@ -455,7 +471,8 @@ assignment evidence:
 
 Each row now leads with `PrincipalGapStatus`, net-new principal/role counts,
 `NetNewGapPrincipals` (object ID plus type), and net-new granting roles. It also
-lists `SubtreeGapRoles` and
+separately counts unknown and `PrincipalMissing` rows/principals, and lists
+`SubtreeGapRoles` and
 `SubtreeControlledRoles`, plus the count, principal types and scopes of
 effective direct baseline assignments. Exact unknown/covered roles, blocking
 policies, unblocked paths, warnings, and the parent/full ancestor chain remain
@@ -471,13 +488,14 @@ smaller `<name>-scope-map.html` dedicated to the visual hierarchy.
 The HTML outputs include:
 
 - role, policy, exemption, scope, and baseline-context counts;
-- task-focused `Actionable`, `Needs review`, and `All diagnostics` tabs;
+- task-focused `Proven user paths`, `Control coverage gaps`, `Review scopes`, and
+  `All scopes` tabs;
 - scope search plus management-group/subscription filtering (type filters show
   only the selected scope type, without ancestor-card noise);
 - a responsive visual management-group/subscription hierarchy with separate
-  primary net-new principal-gap actions plus secondary remediation posture,
-  direct-assigned, latent baseline-capable, external-process, exact unknown,
-  and covered actions;
+  primary role/action control gaps plus principal exploitability,
+  direct-assigned, latent baseline-capable, external-process, exact unknown and
+  covered evidence;
 - per-baseline potential-action totals;
 - an explicitly labelled estate-wide union;
 - source baseline and scope on every granting-role section;
@@ -486,34 +504,37 @@ The HTML outputs include:
 - unblocked assignment paths;
 - embedded discovery warnings and searchable findings.
 
-The default view is `Actionable` when proven net-new gaps exist, otherwise
-`Needs review`, then `All diagnostics`. Empty secondary metrics are suppressed.
-The focused views show only relevant baseline sections; the review view includes
-principal IDs/types and the evidence reason needed for triage.
+The default `Proven user paths` view answers: principal X holds the source role
+at scope Y; policy Z governs role assignment there; action B is removed by the
+source role; granting role C restores B; X can assign C; and X does not already
+have B. `Control coverage gaps` preserves the original report's broader
+role/action blast radius independently of current holder evidence. Empty
+secondary metrics are suppressed. Focused views show only relevant baseline
+sections; the review view includes principal IDs/types and the evidence reason
+needed for triage.
 
 ## Interpretation
 
-RADAR's primary finding is a **principal-level net-new escalation path**. It
-means an actual User or ServicePrincipal holds the source role effective at the
-exact management group or subscription, does not already possess the action
-through visible effective unconditioned direct RBAC held directly or through a
-transitive group, can use a source-role-reachable direct/PIM request path, and
-effective policy permits assignment of the granting role to that actual
-principal.
+RADAR reports two independent security findings. A **role/action control gap**
+means control intent says an action should be unavailable, but a granting role
+is missing from the relevant deny-control posture. A principal-level
+`NetNewGap` proves a current self-escalation path at an exact scope. The latter
+is not necessarily a strict subset: a role can appear in a descendant control
+while another exact assignment path remains permitted.
 
 `DirectAssignmentObserved` means Azure Resource Graph returned an effective
-direct assignment of the baseline role at or above that scope. It proves the
-RBAC assignment exists, but does not prove that the user/service principal is
-enabled or that a group currently has members.
+direct assignment of the baseline role at or above that scope. A source Group
+is expanded to its current transitive enabled User and ServicePrincipal
+members before principal findings are created. The raw Group remains only as
+non-actionable group-level evidence when expansion is incomplete.
 
 Conditioned baseline assignments remain `AssignmentUnknown`; RADAR does not
 claim their restricted assignment route is usable without evaluating the
 assignment's ABAC expression against each target role and principal.
 
-If no source-role holder is observed and assignment inventory is complete, the
-capability is dormant and the actionable count is zero. `BaselineCapable` and
-the subtree view describe secondary defence-in-depth posture, not active
-principal findings.
+If no source-role holder is observed and assignment inventory is complete, no
+current principal path is proven. The control-gap finding remains relevant
+defence-in-depth posture and must not be discarded.
 
 The scope map makes the inferred control model explicit:
 
@@ -547,12 +568,14 @@ holder.
   because request attributes are unknown.
 - Unsupported policy logic remains `Unknown`.
 - `DataActions` are not currently analysed.
-- User and ServicePrincipal enabled state and transitive groups require
-  Microsoft Graph read consent. Missing, denied or incomplete Graph evidence
-  makes that principal `Unknown`.
-- Source assignments to groups, conditioned source assignments, conditioned existing grants,
-  missing principal IDs/types, incomplete assignment inventory, unavailable
-  role definitions, and unsupported policy evidence remain `Unknown`.
+- User and ServicePrincipal enabled state, transitive groups, and source Group
+  transitive membership require Microsoft Graph read consent. Denied,
+  throttled, transient, or incomplete Graph evidence makes that principal
+  `Unknown`; only an object GET 404 produces `PrincipalMissing`.
+- Incompletely expanded source Groups, conditioned source assignments,
+  conditioned existing grants, missing principal IDs/types, incomplete
+  assignment inventory, unavailable role definitions, and unsupported policy
+  evidence remain `Unknown`.
 - PIM active/eligible source-role schedules are not inventoried.
 - Resource Graph is eventually consistent. Principal correlation therefore
   fails open to `Unknown` rather than creating an active finding when evidence

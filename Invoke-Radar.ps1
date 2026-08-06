@@ -2793,6 +2793,9 @@ function ConvertTo-RadarHtmlReport {
   .map-tab[data-map-mode="actionable"][aria-selected="true"] {
     color: var(--danger); border-color: var(--danger);
   }
+  .map-tab[data-map-mode="blast"][aria-selected="true"] {
+    color: var(--danger); border-color: var(--danger);
+  }
   .map-search {
     flex: 1 1 240px; min-width: 180px; padding: 8px 10px;
     color: var(--text); background: var(--panel-2);
@@ -2804,22 +2807,36 @@ function ConvertTo-RadarHtmlReport {
     border-radius: 8px;
   }
   .map-visible-count { color: var(--muted); font-size: 12px; }
+  .map-empty {
+    margin: 12px 0 18px; padding: 24px; text-align: center;
+    color: var(--muted); background: var(--panel);
+    border: 1px dashed var(--border); border-radius: 10px;
+  }
+  .map-empty[hidden] { display: none; }
   .scope-tree[data-mode="actionable"]
     .map-metric:not(.map-actionable),
+  .scope-tree[data-mode="blast"]
+    .map-metric:not(.map-blast),
   .scope-tree[data-mode="review"]
     .map-metric:not(.map-review) { display: none; }
   .scope-tree[data-mode="actionable"]
     .baseline-summary:not([data-has-net-new="true"]),
+  .scope-tree[data-mode="blast"]
+    .baseline-summary:not([data-has-blast-radius="true"]),
   .scope-tree[data-mode="review"]
     .baseline-summary:not([data-has-principal-unknown="true"]) {
     display: none;
   }
   .scope-tree[data-mode="actionable"]
     .map-status:not(.map-status-actionable),
+  .scope-tree[data-mode="blast"]
+    .map-status:not(.map-status-blast),
   .scope-tree[data-mode="review"]
     .map-status:not(.map-status-review) { display: none; }
   .scope-tree[data-mode="all"]
-    .map-status-review-secondary { display: none; }
+    .map-status-review-secondary,
+  .scope-tree[data-mode="all"]
+    .map-status-blast { display: none; }
   .scope-node .ancestor-context { display: none; }
   .scope-node.map-ancestor-only .scope-count { display: none; }
   .scope-node.map-ancestor-only .ancestor-context {
@@ -2921,6 +2938,18 @@ function ConvertTo-RadarHtmlReport {
   .map-metric .list {
     margin-top: 8px; max-height: 220px; overflow: auto;
     white-space: normal; overflow-wrap: anywhere;
+  }
+  .metric-list {
+    list-style: none; margin: 8px 0 0; padding: 0 8px 0 0;
+  }
+  .metric-list li {
+    padding: 7px 0; border-bottom: 1px solid var(--border);
+    line-height: 1.35; color: var(--text);
+  }
+  .metric-list li:last-child { border-bottom: none; }
+  .metric-list small {
+    display: block; margin-top: 2px; color: var(--muted);
+    font-size: 10.5px; font-weight: 400; overflow-wrap: anywhere;
   }
 
   .compliance {
@@ -3033,7 +3062,7 @@ function ConvertTo-RadarHtmlReport {
         [void]$sb.AppendLine('</svg>')
         [void]$sb.AppendLine('<div class="compliance-info">')
         [void]$sb.AppendLine('  <h2>Secondary role-capability deny coverage</h2>')
-        [void]$sb.AppendLine('  <p>Diagnostic share of baseline/granting-role pairs blocked throughout the relevant baseline subtree. This is candidate/configuration posture, not the primary actionable principal flag.</p>')
+        [void]$sb.AppendLine('  <p>Share of baseline/granting-role pairs represented in the control posture. Proven principal paths are reported separately and do not replace this control-gap evidence.</p>')
         [void]$sb.AppendLine('  <div class="nums">')
         [void]$sb.AppendLine('    <div class="num"><b>' + $rolesAffected + '</b>baseline/role pairs</div>')
         [void]$sb.AppendLine('    <div class="num ok"><b>' + $rolesAlreadyDenied + '</b>fully denied</div>')
@@ -3126,7 +3155,7 @@ function ConvertTo-RadarHtmlReport {
 
     if (@($BaselineSummaries).Count -gt 0) {
         [void]$sb.AppendLine('<details class="actions-list"><summary>Secondary candidate actions by baseline context (' + @($BaselineSummaries).Count + ')</summary>')
-        [void]$sb.AppendLine('<p class="note">Each baseline role and exact AssignableScope is evaluated independently. This is latent role-definition capability and configuration posture, not the primary actionable flag. Actual holders, existing access and principal-specific policy are correlated in the net-new principal-gap results.</p>')
+        [void]$sb.AppendLine('<p class="note">Each baseline role and exact AssignableScope is evaluated independently for control coverage. Actual holders, existing access and principal-specific policy are correlated separately in the proven user-path results.</p>')
         [void]$sb.AppendLine('<ul>')
         foreach (
             $baselineSummary in @(
@@ -3373,6 +3402,27 @@ function ConvertTo-RadarHtmlReport {
                                 $rows `
                                 'NetNewGapRoles'
                         )
+                        NetNewGapPolicies = @(
+                            & $collectDelimitedValues `
+                                $rows `
+                                'NetNewGapPolicies'
+                        )
+                        NetNewGapPaths = @(
+                            $rows |
+                                ForEach-Object {
+                                    [string](
+                                        Get-RadarPropertyValue `
+                                            -InputObject $_ `
+                                            -Name 'NetNewGapPaths'
+                                    ) -split ' \|\| '
+                                } |
+                                Where-Object {
+                                    -not [string]::IsNullOrWhiteSpace(
+                                        $_
+                                    )
+                                } |
+                                Sort-Object -Unique
+                        )
                         NetNewGapPrincipals = @(
                             & $collectDelimitedValues `
                                 $rows `
@@ -3443,6 +3493,11 @@ function ConvertTo-RadarHtmlReport {
                                         -Name 'RestrictedAction'
                                 } |
                                 Sort-Object -Unique
+                        )
+                        GapSubtreeControlledRoles = @(
+                            & $collectDelimitedValues `
+                                $subtreeGapRows `
+                                'SubtreeControlledRoles'
                         )
                         SubtreeControlledRoles = @(
                             & $collectDelimitedValues `
@@ -3610,15 +3665,18 @@ function ConvertTo-RadarHtmlReport {
                 } |
                 Select-Object -ExpandProperty EvaluationScope -Unique
         ).Count
-        $defaultMapMode = if ($actionableScopeCount -gt 0) {
-            'actionable'
-        }
-        elseif ($reviewScopeCount -gt 0) {
-            'review'
-        }
-        else {
-            'all'
-        }
+        $blastRadiusScopeCount = @(
+            $controlGapMapArray |
+                Where-Object {
+                    [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $_ `
+                            -Name 'SubtreeControlStatus'
+                    ) -eq 'Gap'
+                } |
+                Select-Object -ExpandProperty EvaluationScope -Unique
+        ).Count
+        $defaultMapMode = 'actionable'
         $renderMapMetric = {
             param(
                 [object[]]$Values,
@@ -3635,10 +3693,37 @@ function ConvertTo-RadarHtmlReport {
             else {
                 ''
             }
+            $listItems = @(
+                foreach ($item in $items) {
+                    $text = [string]$item
+                    $roleMatch = [regex]::Match(
+                        $text,
+                        '^(?<name>.+?) \[(?<id>[^\]]+)\]$'
+                    )
+                    if ($roleMatch.Success) {
+                        '<li>' +
+                        (
+                            ConvertTo-HtmlSafe `
+                                $roleMatch.Groups['name'].Value
+                        ) +
+                        '<small>' +
+                        (
+                            ConvertTo-HtmlSafe `
+                                $roleMatch.Groups['id'].Value
+                        ) +
+                        '</small></li>'
+                    }
+                    else {
+                        '<li>' +
+                        (ConvertTo-HtmlSafe $text) +
+                        '</li>'
+                    }
+                }
+            )
             $content =
-                '<div class="list code">' +
-                (ConvertTo-HtmlSafe ($items -join '; ')) +
-                '</div>'
+                '<ul class="list code metric-list">' +
+                ($listItems -join '') +
+                '</ul>'
             return (
                 '<details class="map-metric' +
                 $classAttribute +
@@ -3678,12 +3763,7 @@ function ConvertTo-RadarHtmlReport {
         [void]$sb.AppendLine(
             '<p class="note">Scope-first view of baseline NotAction intent, ' +
             'actual source-role holders, their visible direct RBAC and ' +
-            'transitive group RBAC, plus principal-specific assignment policy. Net-new principal gaps ' +
-            'are the primary actionable metric. Remediation gaps reproduce ' +
-            'the secondary legacy subtree-control view: a ' +
-            'role is represented when any policy in this scope or a ' +
-            'descendant blocks one of its assignment paths. This is ' +
-            'configuration posture, not exact parent-scope enforcement. ' +
+            'transitive group RBAC, plus principal-specific assignment policy. Proven user paths are the primary view: an actual holder can gain a net-new restricted action through a role that policy permits. Control coverage is a separate broader view of roles missing from descendant deny controls; it is not exact parent-scope enforcement. ' +
             'Baseline-capable means the role definition has an unblocked ' +
             'assignment route if a principal holds it at this scope; it does ' +
             'not prove a current assignment. External-route gaps require ' +
@@ -3698,16 +3778,21 @@ function ConvertTo-RadarHtmlReport {
             'aria-label="Scope-map view">' +
             '<button type="button" class="map-tab" ' +
             'data-map-mode="actionable" role="tab">' +
-            'Actionable (' +
+            'Proven user paths (' +
             $actionableScopeCount +
             ')</button>' +
             '<button type="button" class="map-tab" ' +
+            'data-map-mode="blast" role="tab">' +
+            'Control coverage gaps (' +
+            $blastRadiusScopeCount +
+            ')</button>' +
+            '<button type="button" class="map-tab" ' +
             'data-map-mode="review" role="tab">' +
-            'Needs review (' +
+            'Review scopes (' +
             $reviewScopeCount +
             ')</button>' +
             '<button type="button" class="map-tab" ' +
-            'data-map-mode="all" role="tab">All diagnostics (' +
+            'data-map-mode="all" role="tab">All scopes (' +
             $scopeCountInMap +
             ')</button></div>' +
             '<input id="map-search" class="map-search" type="search" ' +
@@ -3721,6 +3806,9 @@ function ConvertTo-RadarHtmlReport {
             '</select>' +
             '<span id="map-visible-count" class="map-visible-count"></span>' +
             '</div>'
+        )
+        [void]$sb.AppendLine(
+            '<div id="map-empty" class="map-empty" hidden></div>'
         )
 
         $rootNodeKey = '__RADAR_ROOT__'
@@ -3933,13 +4021,24 @@ function ConvertTo-RadarHtmlReport {
             else {
                 ''
             }
+            $blastRadiusStatusBadge = if (
+                $nodeRemediationGapActions.Count -gt 0
+            ) {
+                & $renderScopeCount `
+                    $nodeRemediationGapActions.Count `
+                    'control-gap actions' `
+                    'gap map-status map-status-blast'
+            }
+            else {
+                ''
+            }
             $cleanStatusBadge = if (
                 $nodeNetNewGapActions.Count -eq 0 -and
                 $nodePrincipalUnknownActions.Count -eq 0
             ) {
                 '<span class="scope-count covered map-status ' +
                 'map-status-clean">' +
-                'No actionable gaps</span>'
+                'No proven user path</span>'
             }
             else {
                 ''
@@ -3947,6 +4046,7 @@ function ConvertTo-RadarHtmlReport {
             $primaryStatusBadges =
                 $actionableStatusBadge +
                 $reviewStatusBadge +
+                $blastRadiusStatusBadge +
                 $cleanStatusBadge
             $secondaryStatusBadges = @(
                 (& $renderScopeCount `
@@ -3986,6 +4086,9 @@ function ConvertTo-RadarHtmlReport {
                     ToLowerInvariant() +
                 '" data-has-principal-unknown="' +
                 ($nodePrincipalUnknownActions.Count -gt 0).ToString().
+                    ToLowerInvariant() +
+                '" data-has-blast-radius="' +
+                ($nodeRemediationGapActions.Count -gt 0).ToString().
                     ToLowerInvariant() +
                 '" data-scope-type="' +
                 (ConvertTo-HtmlSafe $node.Type) +
@@ -4054,12 +4157,17 @@ function ConvertTo-RadarHtmlReport {
                 $summaryHasPrincipalUnknown = (
                     @($summary.PrincipalUnknownActions).Count -gt 0
                 ).ToString().ToLowerInvariant()
+                $summaryHasBlastRadius = (
+                    @($summary.RemediationGapActions).Count -gt 0
+                ).ToString().ToLowerInvariant()
                 [void]$sb.AppendLine(
                     '<section class="baseline-summary" ' +
                     'data-has-net-new="' +
                     $summaryHasNetNew +
                     '" data-has-principal-unknown="' +
                     $summaryHasPrincipalUnknown +
+                    '" data-has-blast-radius="' +
+                    $summaryHasBlastRadius +
                     '">' +
                     '<div class="baseline-heading">' +
                     (ConvertTo-HtmlSafe $summary.BaselineRoleName) +
@@ -4070,13 +4178,21 @@ function ConvertTo-RadarHtmlReport {
                         'net-new principal gap actions' `
                         'gap map-actionable') +
                     (& $renderMapMetric `
+                        $summary.NetNewGapPaths `
+                        'proven principal -> action -> role -> policy paths' `
+                        'gap map-actionable') +
+                    (& $renderMapMetric `
                         $summary.NetNewGapRoles `
                         'net-new granting roles' `
-                        'gap map-actionable') +
+                        'gap map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.NetNewGapPrincipals `
                         'net-new principals (ID and type)' `
-                        'current map-actionable') +
+                        'current map-diagnostic') +
+                    (& $renderMapMetric `
+                        $summary.NetNewGapPolicies `
+                        'policy intent evaluated at this scope' `
+                        'current map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.PrincipalUnknownActions `
                         'principal correlation unknown' `
@@ -4091,15 +4207,19 @@ function ConvertTo-RadarHtmlReport {
                         'unknown map-review') +
                     (& $renderMapMetric `
                         $summary.RemediationGapActions `
-                        'latent/subtree posture gap actions' `
-                        'gap map-diagnostic') +
+                        'control-gap actions' `
+                        'gap map-blast map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.RemediationGapRoles `
-                        'roles missing from subtree controls' `
-                        'gap map-diagnostic') +
+                        'granting roles missing from deny controls' `
+                        'gap map-blast map-diagnostic') +
+                    (& $renderMapMetric `
+                        $summary.GapSubtreeControlledRoles `
+                        'control-gap roles represented elsewhere in subtree controls' `
+                        'covered map-blast') +
                     (& $renderMapMetric `
                         $summary.SubtreeControlledRoles `
-                        'roles represented in subtree controls' `
+                        'all roles represented in subtree controls' `
                         'covered map-diagnostic') +
                     (& $renderMapMetric `
                         $summary.DirectAssignedActions `
@@ -4333,6 +4453,7 @@ function ConvertTo-RadarHtmlReport {
     const mapScopeType = document.getElementById('map-scope-type');
     const mapVisibleCount =
       document.getElementById('map-visible-count');
+    const mapEmpty = document.getElementById('map-empty');
     let mapMode = scopeTree.dataset.mode || 'all';
 
     const applyMapFilters = () => {
@@ -4374,6 +4495,10 @@ function ConvertTo-RadarHtmlReport {
           (
             mapMode === 'actionable' &&
             node.dataset.hasNetNew === 'true'
+          ) ||
+          (
+            mapMode === 'blast' &&
+            node.dataset.hasBlastRadius === 'true'
           ) ||
           (
             mapMode === 'review' &&
@@ -4441,6 +4566,19 @@ function ConvertTo-RadarHtmlReport {
           `${directMatches.size} matching scope` +
           `${directMatches.size === 1 ? '' : 's'}` +
           `${ancestorCount > 0 ? ` + ${ancestorCount} ancestor${ancestorCount === 1 ? '' : 's'}` : ''}`;
+      }
+      if (mapEmpty) {
+        mapEmpty.hidden = directMatches.size > 0;
+        if (!mapEmpty.hidden) {
+          mapEmpty.textContent =
+            mapMode === 'actionable'
+              ? 'No proven user self-escalation paths match these filters.'
+              : mapMode === 'review'
+                ? 'No scopes requiring principal-evidence review match these filters.'
+                : mapMode === 'blast'
+                  ? 'No control-coverage gaps match these filters.'
+                  : 'No scopes match these filters.';
+        }
       }
     };
 
@@ -7786,6 +7924,7 @@ function Get-RadarRoleDenyCoverage {
             DeniedScopeCount = @($RoleScopes).Count
             ScopeCount = @($RoleScopes).Count
             BlockingPolicies = @('Denied-roles CSV supplement')
+            EvaluatedPolicies = @('Denied-roles CSV supplement')
             DeniedScopes = @($RoleScopes)
             UnblockedScopes = @()
             UnblockedAssignmentPaths = @()
@@ -7796,6 +7935,9 @@ function Get-RadarRoleDenyCoverage {
                         Scope = $roleScope
                         GapStatus = 'Covered'
                         BlockingPolicies = @(
+                            'Denied-roles CSV supplement'
+                        )
+                        EvaluatedPolicies = @(
                             'Denied-roles CSV supplement'
                         )
                         BlockedAssignmentPaths = @(
@@ -7821,6 +7963,7 @@ function Get-RadarRoleDenyCoverage {
             DeniedScopeCount = 0
             ScopeCount = @($RoleScopes).Count
             BlockingPolicies = @()
+            EvaluatedPolicies = @()
             DeniedScopes = @()
             UnblockedScopes = @($RoleScopes)
             UnblockedAssignmentPaths = @(
@@ -7837,6 +7980,7 @@ function Get-RadarRoleDenyCoverage {
                         Scope = $roleScope
                         GapStatus = 'NotEvaluated'
                         BlockingPolicies = @()
+                        EvaluatedPolicies = @()
                         BlockedAssignmentPaths = @()
                         UnblockedAssignmentPaths = @(
                             $AssignmentPaths |
@@ -7904,6 +8048,10 @@ function Get-RadarRoleDenyCoverage {
         New-Object System.Collections.Generic.HashSet[string] (
             [StringComparer]::OrdinalIgnoreCase
         )
+    $evaluatedPolicies =
+        New-Object System.Collections.Generic.HashSet[string] (
+            [StringComparer]::OrdinalIgnoreCase
+        )
     $deniedScopes = New-Object System.Collections.Generic.List[string]
     $unblockedScopes = New-Object System.Collections.Generic.List[string]
     $unblockedAssignmentPaths =
@@ -7919,6 +8067,10 @@ function Get-RadarRoleDenyCoverage {
     foreach ($roleScope in @($RoleScopes | Sort-Object -Unique)) {
         $scopeUnknown = $false
         $scopeBlockingPolicies =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        $scopeEvaluatedPolicies =
             New-Object System.Collections.Generic.HashSet[string] (
                 [StringComparer]::OrdinalIgnoreCase
             )
@@ -7978,15 +8130,6 @@ function Get-RadarRoleDenyCoverage {
                 ) {
                     continue
                 }
-                if ($rule.UnsupportedReason) {
-                    $pathUnknown = $true
-                    $reason =
-                        "$($rule.AssignmentName): $($rule.UnsupportedReason)"
-                    [void]$unknownReasons.Add($reason)
-                    [void]$scopeUnknownReasons.Add($reason)
-                    continue
-                }
-
                 $applicability = Get-RadarPolicyScopeApplicability `
                     -Rule $rule `
                     -Scope $roleScope `
@@ -7994,8 +8137,28 @@ function Get-RadarRoleDenyCoverage {
                 if ($applicability.State -eq 'Excluded') { continue }
                 if ($applicability.State -eq 'Unknown') {
                     $pathUnknown = $true
+                    $policyEvidence =
+                        "$($rule.AssignmentName) [$($rule.AssignmentScope)] via $($assignmentPath.Name): Scope applicability unknown"
+                    [void]$evaluatedPolicies.Add($policyEvidence)
+                    [void]$scopeEvaluatedPolicies.Add(
+                        $policyEvidence
+                    )
                     $reason =
                         "$($rule.AssignmentName): $($applicability.Reason)"
+                    [void]$unknownReasons.Add($reason)
+                    [void]$scopeUnknownReasons.Add($reason)
+                    continue
+                }
+                if ($rule.UnsupportedReason) {
+                    $pathUnknown = $true
+                    $policyEvidence =
+                        "$($rule.AssignmentName) [$($rule.AssignmentScope)] via $($assignmentPath.Name): Evaluation unknown"
+                    [void]$evaluatedPolicies.Add($policyEvidence)
+                    [void]$scopeEvaluatedPolicies.Add(
+                        $policyEvidence
+                    )
+                    $reason =
+                        "$($rule.AssignmentName): $($rule.UnsupportedReason)"
                     [void]$unknownReasons.Add($reason)
                     [void]$scopeUnknownReasons.Add($reason)
                     continue
@@ -8095,13 +8258,33 @@ function Get-RadarRoleDenyCoverage {
                         "$($rule.AssignmentName) [$($rule.AssignmentScope)] via $($assignmentPath.Name)"
                     [void]$blockingPolicies.Add($policyEvidence)
                     [void]$scopeBlockingPolicies.Add($policyEvidence)
+                    [void]$evaluatedPolicies.Add(
+                        "${policyEvidence}: Blocked"
+                    )
+                    [void]$scopeEvaluatedPolicies.Add(
+                        "${policyEvidence}: Blocked"
+                    )
                 }
                 elseif ($evaluation.State -eq 'Unknown') {
                     $pathUnknown = $true
+                    $policyEvidence =
+                        "$($rule.AssignmentName) [$($rule.AssignmentScope)] via $($assignmentPath.Name): Evaluation unknown"
+                    [void]$evaluatedPolicies.Add($policyEvidence)
+                    [void]$scopeEvaluatedPolicies.Add(
+                        $policyEvidence
+                    )
                     $reason =
                         "$($rule.AssignmentName) via $($assignmentPath.Name): $($evaluation.Reason)"
                     [void]$unknownReasons.Add($reason)
                     [void]$scopeUnknownReasons.Add($reason)
+                }
+                else {
+                    $policyEvidence =
+                        "$($rule.AssignmentName) [$($rule.AssignmentScope)] via $($assignmentPath.Name): Permitted"
+                    [void]$evaluatedPolicies.Add($policyEvidence)
+                    [void]$scopeEvaluatedPolicies.Add(
+                        $policyEvidence
+                    )
                 }
             }
 
@@ -8201,6 +8384,10 @@ function Get-RadarRoleDenyCoverage {
                 $scopeBlockingPolicies |
                     Sort-Object
             )
+            EvaluatedPolicies = @(
+                $scopeEvaluatedPolicies |
+                    Sort-Object
+            )
             BlockedAssignmentPaths = @(
                 $scopeBlockedPaths |
                     Sort-Object -Unique
@@ -8271,6 +8458,7 @@ function Get-RadarRoleDenyCoverage {
         DeniedScopeCount = $blockedScopeCount
         ScopeCount = $scopeCount
         BlockingPolicies = @($blockingPolicies | Sort-Object)
+        EvaluatedPolicies = @($evaluatedPolicies | Sort-Object)
         DeniedScopes = @($deniedScopes | Sort-Object -Unique)
         UnblockedScopes = @($unblockedScopes | Sort-Object -Unique)
         UnblockedAssignmentPaths = @(
@@ -9223,9 +9411,14 @@ function Export-RadarControlGapMap {
                     NetNewGapPrincipals,
                     NetNewGapRoleCount,
                     NetNewGapRoles,
+                    NetNewGapPolicies,
+                    NetNewGapPaths,
                     UnknownPrincipalCount,
                     UnknownPrincipalRowCount,
                     UnknownPrincipals,
+                    MissingPrincipalCount,
+                    MissingPrincipalRowCount,
+                    MissingPrincipals,
                     PrincipalGapWarnings,
                     GapStatus,
                     BaselineAccessStatus,
@@ -9266,7 +9459,7 @@ function Export-RadarControlGapMap {
             Set-Content `
                 -LiteralPath $tempPath `
                 -Encoding UTF8 `
-                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","PrincipalGapStatus","NetNewGapActionCount","NetNewGapPrincipalCount","NetNewGapPrincipals","NetNewGapRoleCount","NetNewGapRoles","UnknownPrincipalCount","UnknownPrincipalRowCount","UnknownPrincipals","PrincipalGapWarnings","GapStatus","BaselineAccessStatus","BaselineAssignmentState","EffectiveDirectAssignmentCount","BaselinePrincipalTypes","BaselineAssignmentScopes","AssignmentWarnings","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownBaselineAssignableRoleCount","UnknownBaselineAssignableRoles","UnknownExternalAssignmentRoleCount","UnknownExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","PolicyControlledRoleCount","PolicyControlledRoles","SubtreeControlStatus","SubtreeGapRoleCount","SubtreeGapRoles","SubtreeControlledRoleCount","SubtreeControlledRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
+                -Value '"EvaluationScopeType","EvaluationScopeName","EvaluationScope","ParentScopeName","ParentScope","AncestorScopes","BaselineRoleName","BaselineRoleId","BaselineScope","RestrictedAction","IntentSource","PrincipalGapStatus","NetNewGapActionCount","NetNewGapPrincipalCount","NetNewGapPrincipals","NetNewGapRoleCount","NetNewGapRoles","NetNewGapPolicies","NetNewGapPaths","UnknownPrincipalCount","UnknownPrincipalRowCount","UnknownPrincipals","MissingPrincipalCount","MissingPrincipalRowCount","MissingPrincipals","PrincipalGapWarnings","GapStatus","BaselineAccessStatus","BaselineAssignmentState","EffectiveDirectAssignmentCount","BaselinePrincipalTypes","BaselineAssignmentScopes","AssignmentWarnings","ConfirmedGapRoleCount","ConfirmedGapRoles","BaselineAssignableRoleCount","BaselineAssignableRoles","ExternalAssignmentRoleCount","ExternalAssignmentRoles","UnknownBaselineAssignableRoleCount","UnknownBaselineAssignableRoles","UnknownExternalAssignmentRoleCount","UnknownExternalAssignmentRoles","UnknownRoleCount","UnknownRoles","CoveredRoleCount","CoveredRoles","PolicyControlledRoleCount","PolicyControlledRoles","SubtreeControlStatus","SubtreeGapRoleCount","SubtreeGapRoles","SubtreeControlledRoleCount","SubtreeControlledRoles","BlockingPolicies","UnblockedAssignmentPaths","CoverageWarnings"'
         }
         Move-Item `
             -LiteralPath $tempPath `
@@ -9790,13 +9983,46 @@ function Get-RadarPrincipalDirectoryEvidence {
             Source = 'Disabled'
         }
     }
+    $newPrincipalEvidence = {
+        param(
+            [string]$PrincipalId,
+            [string]$PrincipalType
+        )
+
+        return [pscustomobject]@{
+            PrincipalId = $PrincipalId
+            PrincipalType = $PrincipalType
+            DirectoryObjectState = 'Unknown'
+            AccountEnabled = $null
+            GroupIds =
+                New-Object System.Collections.Generic.HashSet[string] (
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+            SourceGroupIds =
+                New-Object System.Collections.Generic.HashSet[string] (
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+            MemberIds =
+                New-Object System.Collections.Generic.HashSet[string] (
+                    [StringComparer]::OrdinalIgnoreCase
+                )
+            ObjectEvidenceComplete = $false
+            MembershipEvidenceComplete = $false
+            UserMemberEvidenceComplete = $false
+            ServicePrincipalMemberEvidenceComplete = $false
+            IsComplete = $false
+            Warnings =
+                New-Object System.Collections.Generic.List[string]
+        }
+    }
     foreach (
         $assignment in @(
             $BaselineAssignmentInventory.Assignments |
                 Where-Object {
                     [string]$_.PrincipalType -in @(
                         'User',
-                        'ServicePrincipal'
+                        'ServicePrincipal',
+                        'Group'
                     ) -and
                     -not [string]::IsNullOrWhiteSpace(
                         [string]$_.PrincipalId
@@ -9807,20 +10033,9 @@ function Get-RadarPrincipalDirectoryEvidence {
         $principalId = [string]$assignment.PrincipalId
         $key = $principalId.ToLowerInvariant()
         if ($evidenceByPrincipal.ContainsKey($key)) { continue }
-        $evidenceByPrincipal[$key] = [pscustomobject]@{
-            PrincipalId = $principalId
-            PrincipalType = [string]$assignment.PrincipalType
-            AccountEnabled = $null
-            GroupIds =
-                New-Object System.Collections.Generic.HashSet[string] (
-                    [StringComparer]::OrdinalIgnoreCase
-                )
-            ObjectEvidenceComplete = $false
-            MembershipEvidenceComplete = $false
-            IsComplete = $false
-            Warnings =
-                New-Object System.Collections.Generic.List[string]
-        }
+        $evidenceByPrincipal[$key] = & $newPrincipalEvidence `
+            -PrincipalId $principalId `
+            -PrincipalType ([string]$assignment.PrincipalType)
     }
     if ($evidenceByPrincipal.Count -eq 0) {
         return [pscustomobject]@{
@@ -9867,13 +10082,64 @@ function Get-RadarPrincipalDirectoryEvidence {
     }
 
     $pending = New-Object System.Collections.Generic.Queue[object]
+    $queuedRequestKeys =
+        New-Object System.Collections.Generic.HashSet[string] (
+            [StringComparer]::OrdinalIgnoreCase
+        )
+    $enqueueRequest = {
+        param(
+            [string]$PrincipalKey,
+            [string]$Kind,
+            [string]$Url
+        )
+
+        $requestKey = @(
+            $PrincipalKey,
+            $Kind,
+            $Url
+        ) -join [char]31
+        if ($queuedRequestKeys.Add($requestKey)) {
+            $pending.Enqueue([pscustomobject]@{
+                PrincipalKey = $PrincipalKey
+                Kind = $Kind
+                Url = $Url
+            })
+        }
+    }
     $requestSequence = 0
     foreach ($evidence in $evidenceByPrincipal.Values) {
-        $entitySet = if ($evidence.PrincipalType -eq 'User') {
-            'users'
+        if ($evidence.PrincipalType -eq 'Group') {
+            foreach (
+                $request in @(
+                    [pscustomobject]@{
+                        Kind = 'Object'
+                        Url = "/groups/$($evidence.PrincipalId)?`$select=id"
+                    },
+                    [pscustomobject]@{
+                        Kind = 'GroupUsers'
+                        Url = "/groups/$($evidence.PrincipalId)/transitiveMembers/microsoft.graph.user?`$select=id,accountEnabled&`$count=true&`$top=999"
+                    },
+                    [pscustomobject]@{
+                        Kind = 'GroupServicePrincipals'
+                        Url = "/groups/$($evidence.PrincipalId)/transitiveMembers/microsoft.graph.servicePrincipal?`$select=id,accountEnabled&`$count=true&`$top=999"
+                    }
+                )
+            ) {
+                & $enqueueRequest `
+                    -PrincipalKey $evidence.PrincipalId.ToLowerInvariant() `
+                    -Kind $request.Kind `
+                    -Url $request.Url
+            }
+            continue
+        }
+
+        $entitySet = if (
+            $evidence.PrincipalType -eq 'ServicePrincipal'
+        ) {
+            'servicePrincipals'
         }
         else {
-            'servicePrincipals'
+            'users'
         }
         foreach (
             $request in @(
@@ -9887,13 +10153,10 @@ function Get-RadarPrincipalDirectoryEvidence {
                 }
             )
         ) {
-            $requestSequence++
-            $pending.Enqueue([pscustomobject]@{
-                Id = [string]$requestSequence
-                PrincipalKey = $evidence.PrincipalId.ToLowerInvariant()
-                Kind = $request.Kind
-                Url = $request.Url
-            })
+            & $enqueueRequest `
+                -PrincipalKey $evidence.PrincipalId.ToLowerInvariant() `
+                -Kind $request.Kind `
+                -Url $request.Url
         }
     }
 
@@ -9914,7 +10177,13 @@ function Get-RadarPrincipalDirectoryEvidence {
                 method = 'GET'
                 url = $request.Url
             }
-            if ($request.Kind -eq 'Groups') {
+            if (
+                $request.Kind -in @(
+                    'Groups',
+                    'GroupUsers',
+                    'GroupServicePrincipals'
+                )
+            ) {
                 $batchRequest.headers = @{
                     ConsistencyLevel = 'eventual'
                 }
@@ -9951,7 +10220,22 @@ function Get-RadarPrincipalDirectoryEvidence {
             }
             continue
         }
-        foreach ($response in @($batchResponse.responses)) {
+        $orderedResponses = @(
+            @($batchResponse.responses) |
+                Sort-Object {
+                    $responseId = [string]$_.id
+                    if (
+                        $requestById.ContainsKey($responseId) -and
+                        $requestById[$responseId].Kind -eq 'Object'
+                    ) {
+                        0
+                    }
+                    else {
+                        1
+                    }
+                }
+        )
+        foreach ($response in $orderedResponses) {
             $responseId = [string]$response.id
             if (-not $requestById.ContainsKey($responseId)) {
                 continue
@@ -9959,14 +10243,41 @@ function Get-RadarPrincipalDirectoryEvidence {
             $request = $requestById[$responseId]
             $evidence =
                 $evidenceByPrincipal[$request.PrincipalKey]
-            if ([int]$response.status -lt 200 -or [int]$response.status -ge 300) {
+            if (
+                $evidence.DirectoryObjectState -eq 'Missing' -and
+                $request.Kind -ne 'Object'
+            ) {
+                continue
+            }
+            $statusCode = [int]$response.status
+            if ($statusCode -lt 200 -or $statusCode -ge 300) {
+                if (
+                    $request.Kind -eq 'Object' -and
+                    $statusCode -eq 404
+                ) {
+                    $evidence.DirectoryObjectState = 'Missing'
+                    $evidence.ObjectEvidenceComplete = $true
+                    $evidence.MembershipEvidenceComplete = $true
+                    $evidence.UserMemberEvidenceComplete = $true
+                    $evidence.ServicePrincipalMemberEvidenceComplete =
+                        $true
+                    [void]$evidence.Warnings.Add(
+                        'Microsoft Graph directory object was not found (HTTP 404).'
+                    )
+                    continue
+                }
                 $warning =
-                    "Microsoft Graph $($request.Kind.ToLowerInvariant()) evidence returned HTTP $($response.status)."
+                    "Microsoft Graph $($request.Kind.ToLowerInvariant()) evidence returned HTTP $statusCode."
                 [void]$warnings.Add($warning)
                 [void]$evidence.Warnings.Add($warning)
                 continue
             }
             if ($request.Kind -eq 'Object') {
+                $evidence.DirectoryObjectState = 'Present'
+                if ($evidence.PrincipalType -eq 'Group') {
+                    $evidence.ObjectEvidenceComplete = $true
+                    continue
+                }
                 $enabled = Get-RadarPropertyValue `
                     -InputObject $response.body `
                     -Name 'accountEnabled'
@@ -9978,6 +10289,125 @@ function Get-RadarPrincipalDirectoryEvidence {
                 else {
                     $evidence.AccountEnabled = [bool]$enabled
                     $evidence.ObjectEvidenceComplete = $true
+                }
+                continue
+            }
+            if (
+                $request.Kind -in @(
+                    'GroupUsers',
+                    'GroupServicePrincipals'
+                )
+            ) {
+                $memberType = if (
+                    $request.Kind -eq 'GroupUsers'
+                ) {
+                    'User'
+                }
+                else {
+                    'ServicePrincipal'
+                }
+                foreach (
+                    $member in @(
+                        Get-RadarPropertyValue `
+                            -InputObject $response.body `
+                            -Name 'value'
+                    )
+                ) {
+                    $memberId = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject $member `
+                            -Name 'id'
+                    )
+                    if ([string]::IsNullOrWhiteSpace($memberId)) {
+                        [void]$evidence.Warnings.Add(
+                            'Microsoft Graph returned a group member without an object ID.'
+                        )
+                        continue
+                    }
+                    $memberKey = $memberId.ToLowerInvariant()
+                    if (-not $evidenceByPrincipal.ContainsKey($memberKey)) {
+                        $evidenceByPrincipal[$memberKey] =
+                            & $newPrincipalEvidence `
+                                -PrincipalId $memberId `
+                                -PrincipalType $memberType
+                    }
+                    $memberEvidence =
+                        $evidenceByPrincipal[$memberKey]
+                    if (
+                        $memberEvidence.PrincipalType -ne $memberType
+                    ) {
+                        [void]$memberEvidence.Warnings.Add(
+                            'Microsoft Graph returned conflicting directory object types.'
+                        )
+                    }
+                    [void]$evidence.MemberIds.Add($memberId)
+                    [void]$memberEvidence.SourceGroupIds.Add(
+                        $evidence.PrincipalId
+                    )
+                    $enabled = Get-RadarPropertyValue `
+                        -InputObject $member `
+                        -Name 'accountEnabled'
+                    if (
+                        $memberEvidence.DirectoryObjectState -eq
+                            'Missing'
+                    ) {
+                        continue
+                    }
+                    elseif ($null -ne $enabled) {
+                        $memberEvidence.DirectoryObjectState =
+                            'Present'
+                        $memberEvidence.AccountEnabled =
+                            [bool]$enabled
+                        $memberEvidence.ObjectEvidenceComplete =
+                            $true
+                    }
+                    else {
+                        [void]$memberEvidence.Warnings.Add(
+                            'Microsoft Graph did not return accountEnabled for a group member.'
+                        )
+                    }
+                    $entitySet = if (
+                        $memberType -eq 'User'
+                    ) {
+                        'users'
+                    }
+                    else {
+                        'servicePrincipals'
+                    }
+                    if ($null -eq $enabled) {
+                        & $enqueueRequest `
+                            -PrincipalKey $memberKey `
+                            -Kind 'Object' `
+                            -Url "/$entitySet/$($memberId)?`$select=id,accountEnabled"
+                    }
+                    & $enqueueRequest `
+                        -PrincipalKey $memberKey `
+                        -Kind 'Groups' `
+                        -Url "/$entitySet/$memberId/transitiveMemberOf/microsoft.graph.group?`$select=id&`$count=true&`$top=999"
+                }
+                $nextLink = [string](
+                    Get-RadarPropertyValue `
+                        -InputObject $response.body `
+                        -Name '@odata.nextLink'
+                )
+                if ([string]::IsNullOrWhiteSpace($nextLink)) {
+                    if ($request.Kind -eq 'GroupUsers') {
+                        $evidence.UserMemberEvidenceComplete = $true
+                    }
+                    else {
+                        $evidence.
+                            ServicePrincipalMemberEvidenceComplete =
+                            $true
+                    }
+                }
+                else {
+                    $relativeUrl = $nextLink -replace
+                        '^https://graph\.microsoft\.com/v1\.0',
+                        ''
+                    & $enqueueRequest `
+                        -PrincipalKey $request.PrincipalKey `
+                        -Kind $request.Kind `
+                        -Url $relativeUrl
                 }
                 continue
             }
@@ -10009,11 +10439,10 @@ function Get-RadarPrincipalDirectoryEvidence {
                 $relativeUrl = $nextLink -replace
                     '^https://graph\.microsoft\.com/v1\.0',
                     ''
-                $pending.Enqueue([pscustomobject]@{
-                    PrincipalKey = $request.PrincipalKey
-                    Kind = 'Groups'
-                    Url = $relativeUrl
-                })
+                & $enqueueRequest `
+                    -PrincipalKey $request.PrincipalKey `
+                    -Kind 'Groups' `
+                    -Url $relativeUrl
             }
         }
     }
@@ -10023,13 +10452,27 @@ function Get-RadarPrincipalDirectoryEvidence {
             [StringComparer]::OrdinalIgnoreCase
         )
     foreach ($evidence in $evidenceByPrincipal.Values) {
-        $evidence.IsComplete = (
-            $evidence.ObjectEvidenceComplete -and
-            $evidence.MembershipEvidenceComplete
-        )
+        $evidence.IsComplete = if (
+            $evidence.DirectoryObjectState -eq 'Missing'
+        ) {
+            $true
+        }
+        elseif ($evidence.PrincipalType -eq 'Group') {
+            (
+                $evidence.ObjectEvidenceComplete -and
+                $evidence.UserMemberEvidenceComplete -and
+                $evidence.ServicePrincipalMemberEvidenceComplete
+            )
+        }
+        else {
+            (
+                $evidence.ObjectEvidenceComplete -and
+                $evidence.MembershipEvidenceComplete
+            )
+        }
         if (-not $evidence.IsComplete) {
             [void]$evidence.Warnings.Add(
-                'Directory enabled-state or transitive-group evidence is incomplete.'
+                'Directory object, enabled-state, membership or group-expansion evidence is incomplete.'
             )
         }
         foreach ($groupId in $evidence.GroupIds) {
@@ -10086,6 +10529,21 @@ function Get-RadarPrincipalRoleAssignmentInventory {
                             -InputObject $_ `
                             -Name 'PrincipalId'
                     )
+                }
+        ) +
+        @(
+            Get-RadarPropertyValue `
+                -InputObject $DirectoryEvidence `
+                -Name 'EvidenceByPrincipal' |
+                ForEach-Object {
+                    @($_.Values) |
+                        ForEach-Object {
+                            [string](
+                                Get-RadarPropertyValue `
+                                    -InputObject $_ `
+                                    -Name 'PrincipalId'
+                            )
+                        }
                 }
         ) +
         @(
@@ -10716,7 +11174,24 @@ function Get-RadarPrincipalExistingAccess {
                 Sort-Object -Unique
         }
     )
+    $directoryObjectState = if (
+        $null -ne $directoryPrincipalEvidence
+    ) {
+        [string](
+            Get-RadarPropertyValue `
+                -InputObject $directoryPrincipalEvidence `
+                -Name 'DirectoryObjectState'
+        )
+    }
+    else {
+        'Unknown'
+    }
     $principalEnabledStatus = if (
+        $directoryObjectState -eq 'Missing'
+    ) {
+        'Missing'
+    }
+    elseif (
         $null -ne $directoryPrincipalEvidence -and
         $directoryPrincipalEvidence.IsComplete
     ) {
@@ -10734,6 +11209,7 @@ function Get-RadarPrincipalExistingAccess {
         "source:$($HolderEvidence.IsComplete)",
         "conditioned:$($Holder.SourceAssignmentConditioned)",
         "directory:$($null -ne $directoryPrincipalEvidence -and $directoryPrincipalEvidence.IsComplete)",
+        "directoryObject:$directoryObjectState",
         "enabled:$principalEnabledStatus",
         "groupCount:$($groupIds.Count)",
         "assignmentsEvaluated:$($PrincipalAssignmentInventory.IsEvaluated)",
@@ -10775,11 +11251,16 @@ function Get-RadarPrincipalExistingAccess {
         ) {
             $fixedStatus = 'Unknown'
         }
-        elseif ($PrincipalType -eq 'Group') {
-            $fixedStatus = 'Unknown'
-            [void]$warnings.Add(
-                'Source assignments to Group principals remain Unknown because current members are not expanded.'
-            )
+        elseif (        $directoryObjectState -eq 'Missing'
+        ) {
+        $fixedStatus = 'PrincipalMissing'
+        }
+        elseif (
+        $PrincipalType -eq 'Group') {
+        $fixedStatus = 'Unknown'
+        [void]$warnings.Add(
+            'Source Group membership expansion is incomplete, so the group-level holder remains non-actionable.'
+        )
         }
         elseif (
             $PrincipalType -notin @(
@@ -11010,7 +11491,8 @@ function Get-RadarPrincipalGap {
     Correlates actual source-role holders with their effective direct RBAC,
     baseline-reachable assignment paths and principal-specific policy outcome.
     Microsoft Graph supplies enabled state and transitive group membership for
-    User and ServicePrincipal holders. PIM source-role schedules remain outside
+    User and ServicePrincipal holders and expands source Groups to transitive
+    User and ServicePrincipal members. PIM source-role schedules remain outside
     this evidence model.
     #>
     param(
@@ -11138,49 +11620,219 @@ function Get-RadarPrincipalGap {
                 foreach (
                     $sourceAssignment in $effectiveSourceAssignments
                 ) {
-                    $principalId = [string]$sourceAssignment.PrincipalId
-                    $principalKey = if (
-                        [string]::IsNullOrWhiteSpace($principalId)
-                    ) {
-                        "missing:$($sourceAssignment.AssignmentId)"
-                    }
-                    else {
-                        $principalId.ToLowerInvariant()
-                    }
-                    if (-not $holdersByKey.ContainsKey($principalKey)) {
-                        $holdersByKey[$principalKey] = [pscustomobject]@{
-                            PrincipalId = $principalId
-                            PrincipalTypes =
-                                New-Object System.Collections.Generic.HashSet[string] (
-                                    [StringComparer]::OrdinalIgnoreCase
-                                )
-                            SourceAssignmentScopes =
-                                New-Object System.Collections.Generic.HashSet[string] (
-                                    [StringComparer]::OrdinalIgnoreCase
-                                )
-                            HasUnconditionedSourceAssignment = $false
-                            HasConditionedSourceAssignment = $false
-                            Warnings =
-                                New-Object System.Collections.Generic.List[string]
-                        }
-                    }
-                    $holder = $holdersByKey[$principalKey]
-                    $principalType = [string]$sourceAssignment.PrincipalType
-                    if (-not [string]::IsNullOrWhiteSpace($principalType)) {
-                        [void]$holder.PrincipalTypes.Add($principalType)
-                    }
-                    [void]$holder.SourceAssignmentScopes.Add(
-                        [string]$sourceAssignment.AssignmentScope
-                    )
+                    $sourcePrincipalId =
+                        [string]$sourceAssignment.PrincipalId
+                    $sourcePrincipalType =
+                        [string]$sourceAssignment.PrincipalType
+                    $effectiveSubjects =
+                        New-Object System.Collections.Generic.List[object]
                     if (
-                        [string]::IsNullOrWhiteSpace(
-                            [string]$sourceAssignment.Condition
+                        $sourcePrincipalType -eq 'Group' -and
+                        -not [string]::IsNullOrWhiteSpace(
+                            $sourcePrincipalId
                         )
                     ) {
-                        $holder.HasUnconditionedSourceAssignment = $true
+                        $groupEvidence = $null
+                        $directoryEvidenceByPrincipal =
+                            Get-RadarPropertyValue `
+                                -InputObject $DirectoryEvidence `
+                                -Name 'EvidenceByPrincipal'
+                        $sourcePrincipalKey =
+                            $sourcePrincipalId.ToLowerInvariant()
+                        if (
+                            $null -ne $directoryEvidenceByPrincipal -and
+                            $directoryEvidenceByPrincipal.ContainsKey(
+                                $sourcePrincipalKey
+                            )
+                        ) {
+                            $groupEvidence =
+                                $directoryEvidenceByPrincipal[
+                                    $sourcePrincipalKey
+                                ]
+                        }
+                        $groupState = if ($null -ne $groupEvidence) {
+                            [string](
+                                Get-RadarPropertyValue `
+                                    -InputObject $groupEvidence `
+                                    -Name 'DirectoryObjectState'
+                            )
+                        }
+                        else {
+                            'Unknown'
+                        }
+                        if (
+                            $null -ne $groupEvidence -and
+                            [string]$groupEvidence.PrincipalType -eq
+                                'Group' -and
+                            $groupState -eq 'Present'
+                        ) {
+                            foreach (
+                                $memberId in @(
+                                    $groupEvidence.MemberIds |
+                                        Sort-Object -Unique
+                                )
+                            ) {
+                                $memberKey =
+                                    ([string]$memberId).
+                                        ToLowerInvariant()
+                                $memberEvidence = if (
+                                    $directoryEvidenceByPrincipal.
+                                        ContainsKey($memberKey)
+                                ) {
+                                    $directoryEvidenceByPrincipal[
+                                        $memberKey
+                                    ]
+                                }
+                                else {
+                                    $null
+                                }
+                                [void]$effectiveSubjects.Add(
+                                    [pscustomobject]@{
+                                        PrincipalId =
+                                            [string]$memberId
+                                        PrincipalType = [string](
+                                            Get-RadarPropertyValue `
+                                                -InputObject (
+                                                    $memberEvidence
+                                                ) `
+                                                -Name 'PrincipalType'
+                                        )
+                                        SourcePrincipalId =
+                                            $sourcePrincipalId
+                                        SourceViaGroup = $true
+                                        Warnings = @()
+                                    }
+                                )
+                            }
+                            if (-not [bool]$groupEvidence.IsComplete) {
+                                [void]$effectiveSubjects.Add(
+                                    [pscustomobject]@{
+                                        PrincipalId =
+                                            $sourcePrincipalId
+                                        PrincipalType = 'Group'
+                                        SourcePrincipalId =
+                                            $sourcePrincipalId
+                                        SourceViaGroup = $false
+                                        Warnings = @(
+                                            'Source Group membership expansion is incomplete.'
+                                        )
+                                    }
+                                )
+                            }
+                        }
+                        else {
+                            [void]$effectiveSubjects.Add(
+                                [pscustomobject]@{
+                                    PrincipalId = $sourcePrincipalId
+                                    PrincipalType = 'Group'
+                                    SourcePrincipalId =
+                                        $sourcePrincipalId
+                                    SourceViaGroup = $false
+                                    Warnings = @(
+                                        if ($groupState -eq 'Missing') {
+                                            'The source Group directory object is missing.'
+                                        }
+                                        else {
+                                            'Source Group membership expansion is incomplete.'
+                                        }
+                                    )
+                                }
+                            )
+                        }
                     }
                     else {
-                        $holder.HasConditionedSourceAssignment = $true
+                        [void]$effectiveSubjects.Add(
+                            [pscustomobject]@{
+                                PrincipalId = $sourcePrincipalId
+                                PrincipalType = $sourcePrincipalType
+                                SourcePrincipalId =
+                                    $sourcePrincipalId
+                                SourceViaGroup = $false
+                                Warnings = @()
+                            }
+                        )
+                    }
+
+                    foreach ($subject in $effectiveSubjects) {
+                        $principalId = [string]$subject.PrincipalId
+                        $principalKey = if (
+                            [string]::IsNullOrWhiteSpace($principalId)
+                        ) {
+                            "missing:$($sourceAssignment.AssignmentId)"
+                        }
+                        else {
+                            $principalId.ToLowerInvariant()
+                        }
+                        if (
+                            -not $holdersByKey.ContainsKey(
+                                $principalKey
+                            )
+                        ) {
+                            $holdersByKey[$principalKey] =
+                                [pscustomobject]@{
+                                    PrincipalId = $principalId
+                                    PrincipalTypes =
+                                        New-Object System.Collections.Generic.HashSet[string] (
+                                            [StringComparer]::OrdinalIgnoreCase
+                                        )
+                                    SourcePrincipalIds =
+                                        New-Object System.Collections.Generic.HashSet[string] (
+                                            [StringComparer]::OrdinalIgnoreCase
+                                        )
+                                    SourceViaGroup = $false
+                                    SourceAssignmentScopes =
+                                        New-Object System.Collections.Generic.HashSet[string] (
+                                            [StringComparer]::OrdinalIgnoreCase
+                                        )
+                                    HasUnconditionedSourceAssignment =
+                                        $false
+                                    HasConditionedSourceAssignment =
+                                        $false
+                                    Warnings =
+                                        New-Object System.Collections.Generic.List[string]
+                                }
+                        }
+                        $holder = $holdersByKey[$principalKey]
+                        $principalType = [string]$subject.PrincipalType
+                        if (
+                            -not [string]::IsNullOrWhiteSpace(
+                                $principalType
+                            )
+                        ) {
+                            [void]$holder.PrincipalTypes.Add(
+                                $principalType
+                            )
+                        }
+                        if (
+                            -not [string]::IsNullOrWhiteSpace(
+                                [string]$subject.SourcePrincipalId
+                            )
+                        ) {
+                            [void]$holder.SourcePrincipalIds.Add(
+                                [string]$subject.SourcePrincipalId
+                            )
+                        }
+                        if ([bool]$subject.SourceViaGroup) {
+                            $holder.SourceViaGroup = $true
+                        }
+                        [void]$holder.SourceAssignmentScopes.Add(
+                            [string]$sourceAssignment.AssignmentScope
+                        )
+                        foreach ($warning in @($subject.Warnings)) {
+                            [void]$holder.Warnings.Add($warning)
+                        }
+                        if (
+                            [string]::IsNullOrWhiteSpace(
+                                [string]$sourceAssignment.Condition
+                            )
+                        ) {
+                            $holder.HasUnconditionedSourceAssignment =
+                                $true
+                        }
+                        else {
+                            $holder.HasConditionedSourceAssignment =
+                                $true
+                        }
                     }
                 }
                 $holders = @(
@@ -11221,6 +11873,12 @@ function Get-RadarPrincipalGap {
                             [pscustomobject]@{
                                 PrincipalId = $holder.PrincipalId
                                 PrincipalType = $principalType
+                                SourcePrincipalId = @(
+                                    $holder.SourcePrincipalIds |
+                                        Sort-Object
+                                ) -join '; '
+                                SourceViaGroup =
+                                    [bool]$holder.SourceViaGroup
                                 SourceAssignmentScopes = @(
                                     $holder.SourceAssignmentScopes |
                                         Sort-Object
@@ -11229,7 +11887,16 @@ function Get-RadarPrincipalGap {
                                     -not $holder.HasUnconditionedSourceAssignment -and
                                     $holder.HasConditionedSourceAssignment
                                 )
-                                Warnings = $holderWarnings
+                                Warnings = @(
+                                    @($holder.Warnings) +
+                                    $holderWarnings |
+                                        Where-Object {
+                                            -not [string]::IsNullOrWhiteSpace(
+                                                $_
+                                            )
+                                        } |
+                                        Sort-Object -Unique
+                                )
                             }
                         }
                 )
@@ -11261,6 +11928,8 @@ function Get-RadarPrincipalGap {
                     [pscustomobject]@{
                         PrincipalId = ''
                         PrincipalType = ''
+                        SourcePrincipalId = ''
+                        SourceViaGroup = $false
                         SourceAssignmentScopes = @()
                         SourceAssignmentConditioned = $false
                         Warnings = @(
@@ -11316,12 +11985,46 @@ function Get-RadarPrincipalGap {
                     }
                 }
 
+                $holderDirectoryState = 'Unknown'
+                $directoryEvidenceByPrincipal =
+                    Get-RadarPropertyValue `
+                        -InputObject $DirectoryEvidence `
+                        -Name 'EvidenceByPrincipal'
+                if (
+                    -not [string]::IsNullOrWhiteSpace(
+                        $principalId
+                    ) -and
+                    $null -ne $directoryEvidenceByPrincipal -and
+                    $directoryEvidenceByPrincipal.ContainsKey(
+                        $principalId.ToLowerInvariant()
+                    )
+                ) {
+                    $holderDirectoryState = [string](
+                        Get-RadarPropertyValue `
+                            -InputObject (
+                                $directoryEvidenceByPrincipal[
+                                    $principalId.ToLowerInvariant()
+                                ]
+                            ) `
+                            -Name 'DirectoryObjectState'
+                    )
+                }
                 $existingAccess = if ($availablePaths.Count -eq 0) {
-                    [pscustomobject]@{
-                        Status = 'NotEvaluated'
-                        PrincipalEnabledStatus = 'NotEvaluated'
-                        GroupIds = @()
-                        Warnings = @()
+                    if ($holderDirectoryState -eq 'Missing') {
+                        [pscustomobject]@{
+                            Status = 'PrincipalMissing'
+                            PrincipalEnabledStatus = 'Missing'
+                            GroupIds = @()
+                            Warnings = @()
+                        }
+                    }
+                    else {
+                        [pscustomobject]@{
+                            Status = 'NotEvaluated'
+                            PrincipalEnabledStatus = 'NotEvaluated'
+                            GroupIds = @()
+                            Warnings = @()
+                        }
                     }
                 }
                 else {
@@ -11354,13 +12057,26 @@ function Get-RadarPrincipalGap {
                 }
 
                 $assignmentPolicyStatus = 'Unknown'
+                $policyIntentEvidence = @()
                 $policyWarnings = @()
-                if ($existingAccessStatus -eq 'PrincipalDisabled') {
+                if ($existingAccessStatus -eq 'PrincipalMissing') {
                     $assignmentPolicyStatus = 'NotApplicable'
+                    $policyIntentEvidence = @(
+                        'Not applicable: principal directory object is missing.'
+                    )
+                }
+                elseif ($existingAccessStatus -eq 'PrincipalDisabled') {
+                    $assignmentPolicyStatus = 'NotApplicable'
+                    $policyIntentEvidence = @(
+                        'Not applicable: principal is disabled.'
+                    )
                 }
                 elseif ($availablePaths.Count -eq 0) {
                     $assignmentPolicyStatus =
                         'NoBaselineReachablePath'
+                    $policyIntentEvidence = @(
+                        'Not applicable: no source-reachable assignment path.'
+                    )
                 }
                 elseif (
                     $null -eq $grantingRole -or
@@ -11374,6 +12090,9 @@ function Get-RadarPrincipalGap {
                     -not $holderEvidence.IsComplete
                 ) {
                     $assignmentPolicyStatus = 'Unknown'
+                    $policyIntentEvidence = @(
+                        'Candidate-specific policy evidence is unavailable.'
+                    )
                     if ($null -eq $grantingRole) {
                         [void]$warnings.Add(
                             'The granting role definition is unavailable.'
@@ -11438,6 +12157,44 @@ function Get-RadarPrincipalGap {
                             } |
                             Sort-Object -Unique
                     )
+                    $policyIntentEvidence = @(
+                        if ($principalScopeEvaluation) {
+                            @(
+                                Get-RadarPropertyValue `
+                                    -InputObject (
+                                        $principalScopeEvaluation
+                                    ) `
+                                    -Name 'EvaluatedPolicies'
+                            )
+                        }
+                    )
+                    if ($policyIntentEvidence.Count -eq 0) {
+                        $policyIntentEvidence = @(
+                            if (
+                                -not [bool](
+                                    Get-RadarPropertyValue `
+                                        -InputObject $PolicyInventory `
+                                        -Name 'IsEvaluated'
+                                )
+                            ) {
+                                'Role-assignment policy was not evaluated for this principal, role and path.'
+                            }
+                            elseif (
+                                $scopePolicyUnknownReasons.Count -gt 0
+                            ) {
+                                'Role-assignment policy evidence is incomplete for this principal, role and path.'
+                            }
+                            else {
+                                'No applicable role-assignment deny policy was evaluated for this principal, role and path.'
+                            }
+                        )
+                    }
+                    elseif (
+                        $scopePolicyUnknownReasons.Count -gt 0
+                    ) {
+                        $policyIntentEvidence +=
+                            'Role-assignment policy evidence is incomplete for this principal, role and path.'
+                    }
                     if (
                         $principalScopeEvaluation -and
                         $principalScopeEvaluation.GapStatus -eq 'Gap' -and
@@ -11472,6 +12229,11 @@ function Get-RadarPrincipalGap {
                     $existingAccessStatus -eq 'AlreadyHasAction'
                 ) {
                     'AlreadyHasAction'
+                }
+                elseif (
+                    $existingAccessStatus -eq 'PrincipalMissing'
+                ) {
+                    'PrincipalMissing'
                 }
                 elseif (
                     $existingAccessStatus -eq 'PrincipalDisabled'
@@ -11509,6 +12271,10 @@ function Get-RadarPrincipalGap {
                 [void]$rows.Add([pscustomobject]@{
                     PrincipalId = $principalId
                     PrincipalType = $principalType
+                    SourcePrincipalId =
+                        [string]$holder.SourcePrincipalId
+                    SourceViaGroup =
+                        [bool]$holder.SourceViaGroup
                     BaselineRoleName = $result.BaselineRoleName
                     BaselineRoleId = $result.BaselineRoleId
                     BaselineScope = $result.BaselineScope
@@ -11526,6 +12292,8 @@ function Get-RadarPrincipalGap {
                     ExistingAccessStatus = $existingAccessStatus
                     AssignmentPolicyStatus =
                         $assignmentPolicyStatus
+                    PolicyIntentEvidence =
+                        $policyIntentEvidence -join '; '
                     NetNewGapStatus = $netNewGapStatus
                     AvailableAssignmentPaths = @(
                         $availablePaths |
@@ -11535,7 +12303,7 @@ function Get-RadarPrincipalGap {
                             Sort-Object -Unique
                     ) -join '; '
                     EvidenceModel =
-                        'Microsoft Graph enabled state and transitive groups plus visible effective direct RBAC'
+                        'Microsoft Graph enabled state, source Group expansion and transitive groups plus visible effective direct RBAC'
                     Warnings = @(
                         $warnings |
                             Where-Object {
@@ -11623,11 +12391,23 @@ function Add-RadarPrincipalGapSummary {
                     $_.NetNewGapStatus -eq 'Unknown'
                 }
         )
+        $missingRows = @(
+            $principalRows |
+                Where-Object {
+                    $_.NetNewGapStatus -eq 'PrincipalMissing'
+                }
+        )
         $principalStatus = if ($netNewRows.Count -gt 0) {
             'NetNewGap'
         }
         elseif ($unknownRows.Count -gt 0) {
             'Unknown'
+        }
+        elseif (
+            $principalRows.Count -gt 0 -and
+            $missingRows.Count -eq $principalRows.Count
+        ) {
+            'PrincipalMissing'
         }
         elseif ($principalRows.Count -eq 0) {
             if ($row.BaselineAssignmentState -eq 'NoDirectAssignment') {
@@ -11680,6 +12460,45 @@ function Add-RadarPrincipalGapSummary {
                     } |
                     Sort-Object -Unique
             ) -join '; '
+            NetNewGapPolicies = @(
+                $netNewRows |
+                    ForEach-Object {
+                        [string](
+                            Get-RadarPropertyValue `
+                                -InputObject $_ `
+                                -Name 'PolicyIntentEvidence'
+                        ) -split '; '
+                    } |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    } |
+                    Sort-Object -Unique
+            ) -join '; '
+            NetNewGapPaths = @(
+                $netNewRows |
+                    ForEach-Object {
+                        $policy = if (
+                            [string]::IsNullOrWhiteSpace(
+                                [string](
+                                    Get-RadarPropertyValue `
+                                        -InputObject $_ `
+                                        -Name 'PolicyIntentEvidence'
+                                )
+                            )
+                        ) {
+                            'Policy evidence unavailable'
+                        }
+                        else {
+                            [string](
+                                Get-RadarPropertyValue `
+                                    -InputObject $_ `
+                                    -Name 'PolicyIntentEvidence'
+                            )
+                        }
+                        "$($_.PrincipalId) [$($_.PrincipalType)] -> $($_.RestrictedAction) via $($_.GrantingRoleName) [$($_.GrantingRoleId)] | Policy: $policy"
+                    } |
+                    Sort-Object -Unique
+            ) -join ' || '
             UnknownPrincipalCount = @(
                 $unknownRows |
                     ForEach-Object { $_.PrincipalId } |
@@ -11691,6 +12510,27 @@ function Add-RadarPrincipalGapSummary {
             UnknownPrincipalRowCount = $unknownRows.Count
             UnknownPrincipals = @(
                 $unknownRows |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace(
+                            [string]$_.PrincipalId
+                        )
+                    } |
+                    ForEach-Object {
+                        "$($_.PrincipalId) [$($_.PrincipalType)]"
+                    } |
+                    Sort-Object -Unique
+            ) -join '; '
+            MissingPrincipalCount = @(
+                $missingRows |
+                    ForEach-Object { $_.PrincipalId } |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace($_)
+                    } |
+                    Sort-Object -Unique
+            ).Count
+            MissingPrincipalRowCount = $missingRows.Count
+            MissingPrincipals = @(
+                $missingRows |
                     Where-Object {
                         -not [string]::IsNullOrWhiteSpace(
                             [string]$_.PrincipalId
@@ -11746,6 +12586,8 @@ function Export-RadarPrincipalGap {
                 Select-Object `
                     PrincipalId,
                     PrincipalType,
+                    SourcePrincipalId,
+                    SourceViaGroup,
                     BaselineRoleName,
                     BaselineRoleId,
                     BaselineScope,
@@ -11758,6 +12600,7 @@ function Export-RadarPrincipalGap {
                     TransitiveGroupCount,
                     ExistingAccessStatus,
                     AssignmentPolicyStatus,
+                    PolicyIntentEvidence,
                     NetNewGapStatus,
                     AvailableAssignmentPaths,
                     EvidenceModel,
@@ -11770,7 +12613,7 @@ function Export-RadarPrincipalGap {
             Set-Content `
                 -LiteralPath $tempPath `
                 -Encoding UTF8 `
-                -Value '"PrincipalId","PrincipalType","BaselineRoleName","BaselineRoleId","BaselineScope","SourceAssignmentScopes","EvaluationScope","RestrictedAction","GrantingRoleName","GrantingRoleId","PrincipalEnabledStatus","TransitiveGroupCount","ExistingAccessStatus","AssignmentPolicyStatus","NetNewGapStatus","AvailableAssignmentPaths","EvidenceModel","Warnings"'
+                -Value '"PrincipalId","PrincipalType","SourcePrincipalId","SourceViaGroup","BaselineRoleName","BaselineRoleId","BaselineScope","SourceAssignmentScopes","EvaluationScope","RestrictedAction","GrantingRoleName","GrantingRoleId","PrincipalEnabledStatus","TransitiveGroupCount","ExistingAccessStatus","AssignmentPolicyStatus","PolicyIntentEvidence","NetNewGapStatus","AvailableAssignmentPaths","EvidenceModel","Warnings"'
         }
         Move-Item `
             -LiteralPath $tempPath `

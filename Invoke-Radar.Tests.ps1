@@ -1279,12 +1279,212 @@ Describe 'Get-RadarPrincipalDirectoryEvidence' {
             -BaselineAssignmentInventory $baselineInventory
 
         $evidence.IsComplete | Should -BeFalse
+        $evidence.EvidenceByPrincipal[
+            $principalId
+        ].DirectoryObjectState | Should -Be 'Unknown'
         ($evidence.Warnings -join ' ') | Should -Not -Match $principalId
         (
             $evidence.EvidenceByPrincipal[
                 $principalId
             ].Warnings -join ' '
         ) | Should -Match 'HTTP 403'
+    }
+
+    It 'treats only an object GET 404 as complete missing evidence' {
+        Mock Get-AzAccessToken {
+            [pscustomobject]@{ Token = 'test-token' }
+        }
+        Mock Invoke-RestMethod {
+            $payload = $Body | ConvertFrom-Json
+            [pscustomobject]@{
+                responses = @(
+                    foreach (
+                        $request in @($payload.requests) |
+                            Sort-Object {
+                                if (
+                                    $_.url -match
+                                        'transitiveMemberOf'
+                                ) {
+                                    0
+                                }
+                                else {
+                                    1
+                                }
+                            }
+                    ) {
+                        [pscustomobject]@{
+                            id = $request.id
+                            status = 404
+                            body = [pscustomobject]@{}
+                        }
+                    }
+                )
+            }
+        }
+        $principalId =
+            '33333333-3333-3333-3333-333333333333'
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    PrincipalId = $principalId
+                    PrincipalType = 'ServicePrincipal'
+                }
+            )
+        }
+
+        $evidence = Get-RadarPrincipalDirectoryEvidence `
+            -BaselineAssignmentInventory $baselineInventory
+        $item = $evidence.EvidenceByPrincipal[
+            $principalId
+        ]
+
+        $evidence.IsComplete | Should -BeTrue
+        $item.DirectoryObjectState | Should -Be 'Missing'
+        $item.ObjectEvidenceComplete | Should -BeTrue
+        $item.MembershipEvidenceComplete | Should -BeTrue
+        $item.IsComplete | Should -BeTrue
+        ($item.Warnings -join ' ') |
+            Should -Not -Match 'membership evidence returned'
+    }
+
+    It 'expands paged source Group users and service principals in batches' {
+        Mock Get-AzAccessToken {
+            [pscustomobject]@{ Token = 'test-token' }
+        }
+        $script:groupDirectoryBatchSizes = @()
+        $groupId =
+            '44444444-4444-4444-4444-444444444444'
+        $enabledUserId =
+            '55555555-5555-5555-5555-555555555555'
+        $disabledUserId =
+            '66666666-6666-6666-6666-666666666666'
+        $missingUserId =
+            '99999999-9999-9999-9999-999999999999'
+        $servicePrincipalId =
+            '77777777-7777-7777-7777-777777777777'
+        $existingGroupId =
+            '88888888-8888-8888-8888-888888888888'
+        Mock Invoke-RestMethod {
+            $payload = $Body | ConvertFrom-Json
+            $script:groupDirectoryBatchSizes +=
+                @($payload.requests).Count
+            $responses = @(
+                foreach ($request in @($payload.requests)) {
+                    $body = [ordered]@{}
+                    $status = 200
+                    if (
+                        $request.url -match
+                            "^/groups/$groupId\?"
+                    ) {
+                        $body.id = $groupId
+                    }
+                    elseif (
+                        $request.url -match
+                            'transitiveMembers/microsoft\.graph\.user'
+                    ) {
+                        if ($request.url -match 'page=2') {
+                            $body.value = @(
+                                [pscustomobject]@{
+                                    id = $disabledUserId
+                                    accountEnabled = $false
+                                },
+                                [pscustomobject]@{
+                                    id = $missingUserId
+                                }
+                            )
+                        }
+                        else {
+                            $body.value = @(
+                                [pscustomobject]@{
+                                    id = $enabledUserId
+                                    accountEnabled = $true
+                                }
+                            )
+                            $body['@odata.nextLink'] =
+                                "https://graph.microsoft.com/v1.0/groups/$groupId/transitiveMembers/microsoft.graph.user?page=2"
+                        }
+                    }
+                    elseif (
+                        $request.url -match
+                            'transitiveMembers/microsoft\.graph\.servicePrincipal'
+                    ) {
+                        $body.value = @(
+                            [pscustomobject]@{
+                                id = $servicePrincipalId
+                                accountEnabled = $true
+                            }
+                        )
+                    }
+                    elseif (
+                        $request.url -match
+                            "^/users/$missingUserId\?"
+                    ) {
+                        $status = 404
+                    }
+                    elseif (
+                        $request.url -match 'transitiveMemberOf'
+                    ) {
+                        $memberId = (
+                            $request.url -split '/'
+                        )[2]
+                        $body.value = @(
+                            [pscustomobject]@{ id = $groupId }
+                        )
+                        if ($memberId -eq $enabledUserId) {
+                            $body.value +=
+                                [pscustomobject]@{
+                                    id = $existingGroupId
+                                }
+                        }
+                    }
+                    [pscustomobject]@{
+                        id = $request.id
+                        status = $status
+                        body = [pscustomobject]$body
+                    }
+                }
+            )
+            [pscustomobject]@{ responses = $responses }
+        }
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    PrincipalId = $groupId
+                    PrincipalType = 'Group'
+                }
+            )
+        }
+
+        $evidence = Get-RadarPrincipalDirectoryEvidence `
+            -BaselineAssignmentInventory $baselineInventory
+
+        $evidence.IsComplete | Should -BeTrue
+        $evidence.EvidenceByPrincipal[$groupId].
+            MemberIds.Count | Should -Be 4
+        $evidence.EvidenceByPrincipal[$enabledUserId].
+            AccountEnabled | Should -BeTrue
+        $evidence.EvidenceByPrincipal[$disabledUserId].
+            AccountEnabled | Should -BeFalse
+        $evidence.EvidenceByPrincipal[$servicePrincipalId].
+            PrincipalType | Should -Be 'ServicePrincipal'
+        $evidence.EvidenceByPrincipal[$missingUserId].
+            DirectoryObjectState | Should -Be 'Missing'
+        $evidence.EvidenceByPrincipal[$missingUserId].
+            IsComplete | Should -BeTrue
+        @(
+            $evidence.EvidenceByPrincipal[$enabledUserId].
+                GroupIds
+        ) | Should -Contain $existingGroupId
+        ($script:groupDirectoryBatchSizes |
+            Measure-Object -Maximum).Maximum |
+            Should -BeLessOrEqual 20
+        Should -Invoke Invoke-RestMethod -Times 3
     }
 
     It 'fails closed to incomplete evidence when Graph is unavailable' {
@@ -1405,6 +1605,53 @@ Describe 'Get-RadarPrincipalRoleAssignmentInventory' {
             Should -Not -Contain (
                 'Another directory object returned HTTP 404.'
             )
+    }
+
+    It 'queries expanded source Group members and their transitive groups' {
+        Mock Search-AzGraph {
+            [pscustomobject]@{
+                Data = @()
+                SkipToken = $null
+            }
+        }
+        $groupId =
+            '44444444-4444-4444-4444-444444444444'
+        $memberId =
+            '55555555-5555-5555-5555-555555555555'
+        $memberGroupId =
+            '66666666-6666-6666-6666-666666666666'
+        $baselineInventory = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            Warnings = @()
+            Assignments = @(
+                [pscustomobject]@{
+                    PrincipalId = $groupId
+                    PrincipalType = 'Group'
+                }
+            )
+        }
+        $directoryEvidence = [pscustomobject]@{
+            EvidenceByPrincipal = @{
+                $groupId = [pscustomobject]@{
+                    PrincipalId = $groupId
+                }
+                $memberId = [pscustomobject]@{
+                    PrincipalId = $memberId
+                }
+            }
+            GroupIds = @($memberGroupId)
+        }
+
+        $null = Get-RadarPrincipalRoleAssignmentInventory `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence
+
+        Should -Invoke Search-AzGraph -Times 1 -ParameterFilter {
+            $Query -match $groupId -and
+            $Query -match $memberId -and
+            $Query -match $memberGroupId
+        }
     }
 
     It 'splits large principal and group filters into bounded queries' {
@@ -1583,6 +1830,7 @@ Describe 'Get-RadarPrincipalGap' {
         $directoryEvidenceItem = [pscustomobject]@{
             PrincipalId = $principalId
             PrincipalType = 'User'
+            DirectoryObjectState = 'Present'
             AccountEnabled = $true
             GroupIds =
                 New-Object System.Collections.Generic.HashSet[string] (
@@ -1630,7 +1878,154 @@ Describe 'Get-RadarPrincipalGap' {
             Should -Be 'NoExistingAction'
         $gaps[0].AssignmentPolicyStatus |
             Should -Be 'Permitted'
+        $gaps[0].PolicyIntentEvidence |
+            Should -Match 'No applicable role-assignment deny policy'
         $gaps[0].NetNewGapStatus | Should -Be 'NetNewGap'
+    }
+
+    It 'distinguishes policy discovery not evaluated from confirmed absence' {
+        $notEvaluatedPolicy = [pscustomobject]@{
+            IsEvaluated = $false
+            IsComplete = $false
+            RulesByScope = @{}
+            ExemptionsByScope = @{}
+            UncertainScopes = @()
+            Warnings = @()
+        }
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @(
+                $baselineRole,
+                $grantingRole,
+                $ownerRole
+            ) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $notEvaluatedPolicy `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.PolicyIntentEvidence |
+            Should -Match 'was not evaluated'
+        $gap.NetNewGapStatus | Should -Be 'Unknown'
+    }
+
+    It 'excludes an exempt policy from exact-scope intent evidence' {
+        $rule = [pscustomobject]@{
+            AssignmentId =
+                '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/deny'
+            AssignmentName = 'Deny restricted roles'
+            AssignmentScope = '/subscriptions/sub-1'
+            NotScopes = @()
+            DefinitionName = 'Deny restricted roles'
+            ReferenceId = $null
+            PolicyRule = @{
+                if = @{
+                    field =
+                        'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                    in = @($grantingRoleId)
+                }
+                then = @{ effect = 'deny' }
+            }
+            Parameters = @{}
+            ScopeSensitive = $false
+            UnsupportedReason = $null
+        }
+        $exemptPolicy = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            RulesByScope = @{
+                $subscription = @($rule)
+            }
+            ExemptionsByScope = @{
+                $subscription = @(
+                    [pscustomobject]@{
+                        PolicyAssignmentId = $rule.AssignmentId
+                        PolicyDefinitionReferenceId = @()
+                    }
+                )
+            }
+            UncertainScopes = @()
+            Warnings = @()
+        }
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @(
+                $baselineRole,
+                $grantingRole,
+                $ownerRole
+            ) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $exemptPolicy `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.PolicyIntentEvidence |
+            Should -Match 'No applicable role-assignment deny policy'
+        $gap.NetNewGapStatus | Should -Be 'NetNewGap'
+    }
+
+    It 'shows policy that blocks protected roles but permits the granting role' {
+        $rule = [pscustomobject]@{
+            AssignmentId =
+                '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/deny'
+            AssignmentName = 'Deny protected roles'
+            AssignmentScope = '/subscriptions/sub-1'
+            NotScopes = @()
+            DefinitionName = 'Deny protected roles'
+            ReferenceId = $null
+            PolicyRule = @{
+                if = @{
+                    field =
+                        'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                    in = @($ownerRoleId)
+                }
+                then = @{ effect = 'deny' }
+            }
+            Parameters = @{}
+            ScopeSensitive = $false
+            UnsupportedReason = $null
+        }
+        $roleDenyPolicy = [pscustomobject]@{
+            IsEvaluated = $true
+            IsComplete = $true
+            RulesByScope = @{
+                $subscription = @($rule)
+            }
+            ExemptionsByScope = @{
+                $subscription = @()
+            }
+            UncertainScopes = @()
+            Warnings = @()
+        }
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @(
+                $baselineRole,
+                $grantingRole,
+                $ownerRole
+            ) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $roleDenyPolicy `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.AssignmentPolicyStatus | Should -Be 'Permitted'
+        $gap.PolicyIntentEvidence |
+            Should -Match 'Deny protected roles'
+        $gap.PolicyIntentEvidence | Should -Match 'Permitted'
+        $gap.NetNewGapStatus | Should -Be 'NetNewGap'
     }
 
     It 'keeps a single transitive group as an array under strict mode' {
@@ -1785,6 +2180,300 @@ Describe 'Get-RadarPrincipalGap' {
         $gap.TransitiveGroupCount | Should -Be 1
         $gap.NetNewGapStatus |
             Should -Be 'AlreadyHasAction'
+    }
+
+    It 'expands source Groups without duplicate actionable findings' {
+        $sourceGroupId =
+            '44444444-4444-4444-4444-444444444444'
+        $disabledMemberId =
+            '55555555-5555-5555-5555-555555555555'
+        $missingMemberId =
+            '66666666-6666-6666-6666-666666666666'
+        $sourceAssignment.PrincipalId = $sourceGroupId
+        $sourceAssignment.PrincipalType = 'Group'
+        $directMemberAssignment = [pscustomobject]@{
+            AssignmentId = 'direct-member-source-assignment'
+            AssignmentScope = $subscription
+            RoleDefinitionGuid =
+                '11111111-1111-1111-1111-111111111111'
+            PrincipalId = $principalId
+            PrincipalType = 'User'
+            Condition = ''
+        }
+        $baselineInventory.Assignments = @(
+            $sourceAssignment,
+            $directMemberAssignment
+        )
+        $sourceGroupMembers =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        [void]$sourceGroupMembers.Add($principalId)
+        [void]$sourceGroupMembers.Add($disabledMemberId)
+        [void]$sourceGroupMembers.Add($missingMemberId)
+        $enabledMemberGroups =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        [void]$enabledMemberGroups.Add($sourceGroupId)
+        $disabledMemberGroups =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        [void]$disabledMemberGroups.Add($sourceGroupId)
+        $directoryEvidence.EvidenceByPrincipal = @{
+            $sourceGroupId = [pscustomobject]@{
+                PrincipalId = $sourceGroupId
+                PrincipalType = 'Group'
+                DirectoryObjectState = 'Present'
+                MemberIds = $sourceGroupMembers
+                IsComplete = $true
+                Warnings = @()
+            }
+            $principalId = [pscustomobject]@{
+                PrincipalId = $principalId
+                PrincipalType = 'User'
+                DirectoryObjectState = 'Present'
+                AccountEnabled = $true
+                GroupIds = $enabledMemberGroups
+                IsComplete = $true
+                Warnings = @()
+            }
+            $disabledMemberId = [pscustomobject]@{
+                PrincipalId = $disabledMemberId
+                PrincipalType = 'User'
+                DirectoryObjectState = 'Present'
+                AccountEnabled = $false
+                GroupIds = $disabledMemberGroups
+                IsComplete = $true
+                Warnings = @()
+            }
+            $missingMemberId = [pscustomobject]@{
+                PrincipalId = $missingMemberId
+                PrincipalType = 'User'
+                DirectoryObjectState = 'Missing'
+                AccountEnabled = $null
+                GroupIds =
+                    New-Object System.Collections.Generic.HashSet[string] (
+                        [StringComparer]::OrdinalIgnoreCase
+                    )
+                IsComplete = $true
+                Warnings = @(
+                    'Microsoft Graph directory object was not found (HTTP 404).'
+                )
+            }
+        }
+        $directoryEvidence.GroupIds = @($sourceGroupId)
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            $directMemberAssignment
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gaps = @(
+            Get-RadarPrincipalGap `
+                -Results @($result) `
+                -BaselineContexts @($context) `
+                -BaselineAssignmentInventory $baselineInventory `
+                -DirectoryEvidence $directoryEvidence `
+                -PrincipalAssignmentInventory $principalInventory `
+                -Roles @($baselineRole, $grantingRole) `
+                -Hierarchy $hierarchy `
+                -PolicyInventory $policyInventory `
+                -DeniedRoleNames $deniedRoles
+        )
+
+        $gaps.Count | Should -Be 3
+        @($gaps | Where-Object {
+            $_.PrincipalId -eq $sourceGroupId
+        }).Count | Should -Be 0
+        $enabledGap = @($gaps | Where-Object {
+            $_.PrincipalId -eq $principalId
+        })
+        $enabledGap.Count | Should -Be 1
+        $enabledGap.SourceViaGroup | Should -BeTrue
+        $enabledGap.SourcePrincipalId |
+            Should -Match $sourceGroupId
+        $enabledGap.SourcePrincipalId |
+            Should -Match $principalId
+        $enabledGap.NetNewGapStatus |
+            Should -Be 'NetNewGap'
+        @($gaps | Where-Object {
+            $_.PrincipalId -eq $disabledMemberId
+        }).NetNewGapStatus | Should -Be 'PrincipalDisabled'
+        @($gaps | Where-Object {
+            $_.PrincipalId -eq $missingMemberId
+        }).NetNewGapStatus | Should -Be 'PrincipalMissing'
+    }
+
+    It 'uses group-derived existing RBAC for an expanded source member' {
+        $sourceGroupId =
+            '44444444-4444-4444-4444-444444444444'
+        $existingGroupId =
+            '55555555-5555-5555-5555-555555555555'
+        $sourceAssignment.PrincipalId = $sourceGroupId
+        $sourceAssignment.PrincipalType = 'Group'
+        $sourceGroupMembers =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        [void]$sourceGroupMembers.Add($principalId)
+        $memberGroups =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        [void]$memberGroups.Add($sourceGroupId)
+        [void]$memberGroups.Add($existingGroupId)
+        $directoryEvidence.EvidenceByPrincipal = @{
+            $sourceGroupId = [pscustomobject]@{
+                PrincipalId = $sourceGroupId
+                PrincipalType = 'Group'
+                DirectoryObjectState = 'Present'
+                MemberIds = $sourceGroupMembers
+                IsComplete = $true
+                Warnings = @()
+            }
+            $principalId = [pscustomobject]@{
+                PrincipalId = $principalId
+                PrincipalType = 'User'
+                DirectoryObjectState = 'Present'
+                AccountEnabled = $true
+                GroupIds = $memberGroups
+                IsComplete = $true
+                Warnings = @()
+            }
+        }
+        $groupOwnerAssignment = [pscustomobject]@{
+            AssignmentId = 'group-owner-assignment'
+            AssignmentScope = $subscription
+            RoleDefinitionGuid =
+                'bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb'
+            PrincipalId = $existingGroupId
+            PrincipalType = 'Group'
+            Condition = ''
+        }
+        $principalInventory.Assignments = @(
+            $sourceAssignment,
+            $groupOwnerAssignment
+        )
+        $principalInventory.AssignmentsByPrincipalAndScope =
+            New-RadarPrincipalScopeAssignmentIndex `
+                -Assignments $principalInventory.Assignments
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole, $ownerRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $gap.PrincipalId | Should -Be $principalId
+        $gap.SourceViaGroup | Should -BeTrue
+        $gap.ExistingAccessStatus |
+            Should -Be 'AlreadyHasAction'
+        $gap.NetNewGapStatus |
+            Should -Be 'AlreadyHasAction'
+    }
+
+    It 'keeps group-level evidence alongside resolved members when expansion is incomplete' {
+        $sourceGroupId =
+            '44444444-4444-4444-4444-444444444444'
+        $sourceAssignment.PrincipalId = $sourceGroupId
+        $sourceAssignment.PrincipalType = 'Group'
+        $partialMembers =
+            New-Object System.Collections.Generic.HashSet[string] (
+                [StringComparer]::OrdinalIgnoreCase
+            )
+        [void]$partialMembers.Add($principalId)
+        $directoryEvidence.EvidenceByPrincipal = @{
+            $sourceGroupId = [pscustomobject]@{
+                PrincipalId = $sourceGroupId
+                PrincipalType = 'Group'
+                DirectoryObjectState = 'Present'
+                MemberIds = $partialMembers
+                IsComplete = $false
+                Warnings = @(
+                    'Microsoft Graph group member evidence returned HTTP 403.'
+                )
+            }
+            $principalId = $directoryEvidenceItem
+        }
+
+        $gap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        @($gap).Count | Should -Be 2
+        $memberGap = @($gap | Where-Object {
+            $_.PrincipalId -eq $principalId
+        })
+        $memberGap.SourceViaGroup | Should -BeTrue
+        $memberGap.NetNewGapStatus | Should -Be 'NetNewGap'
+        $groupGap = @($gap | Where-Object {
+            $_.PrincipalId -eq $sourceGroupId
+        })
+        $groupGap.PrincipalType | Should -Be 'Group'
+        $groupGap.SourceViaGroup | Should -BeFalse
+        $groupGap.NetNewGapStatus | Should -Be 'Unknown'
+        $groupGap.Warnings |
+            Should -Match 'membership expansion is incomplete'
+    }
+
+    It 'classifies object absence separately from Graph permission failure' {
+        $directoryEvidenceItem.DirectoryObjectState = 'Missing'
+        $directoryEvidenceItem.AccountEnabled = $null
+        $directoryEvidenceItem.IsComplete = $true
+        $missingGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $missingGap.ExistingAccessStatus |
+            Should -Be 'PrincipalMissing'
+        $missingGap.AssignmentPolicyStatus |
+            Should -Be 'NotApplicable'
+        $missingGap.NetNewGapStatus |
+            Should -Be 'PrincipalMissing'
+
+        $directoryEvidenceItem.DirectoryObjectState = 'Unknown'
+        $directoryEvidenceItem.IsComplete = $false
+        $directoryEvidenceItem.Warnings = @(
+            'Microsoft Graph object evidence returned HTTP 403.'
+        )
+        $forbiddenGap = Get-RadarPrincipalGap `
+            -Results @($result) `
+            -BaselineContexts @($context) `
+            -BaselineAssignmentInventory $baselineInventory `
+            -DirectoryEvidence $directoryEvidence `
+            -PrincipalAssignmentInventory $principalInventory `
+            -Roles @($baselineRole, $grantingRole) `
+            -Hierarchy $hierarchy `
+            -PolicyInventory $policyInventory `
+            -DeniedRoleNames $deniedRoles
+
+        $forbiddenGap.ExistingAccessStatus |
+            Should -Be 'Unknown'
+        $forbiddenGap.NetNewGapStatus |
+            Should -Be 'Unknown'
     }
 
     It 'keeps disabled and incomplete directory principals non-actionable' {
@@ -2182,12 +2871,36 @@ Describe 'Get-RadarPrincipalGap' {
             -DeniedRoleNames $deniedRoles
 
         $gap.AssignmentPolicyStatus | Should -Be 'Blocked'
+        $gap.PolicyIntentEvidence |
+            Should -Match 'Denied-roles CSV supplement'
         $gap.NetNewGapStatus | Should -Be 'PolicyBlocked'
     }
 
     It 'keeps exact-scope policy discovery uncertainty non-actionable' {
         $policyInventory.UncertainScopes = @(
             $subscription.ToLowerInvariant()
+        )
+        $policyInventory.RulesByScope[$subscription] = @(
+            [pscustomobject]@{
+                AssignmentId =
+                    '/subscriptions/sub-1/providers/Microsoft.Authorization/policyAssignments/deny'
+                AssignmentName = 'Deny protected roles'
+                AssignmentScope = $subscription
+                NotScopes = @()
+                DefinitionName = 'Deny protected roles'
+                ReferenceId = $null
+                PolicyRule = @{
+                    if = @{
+                        field =
+                            'Microsoft.Authorization/roleAssignments/roleDefinitionId'
+                        in = @($ownerRoleId)
+                    }
+                    then = @{ effect = 'deny' }
+                }
+                Parameters = @{}
+                ScopeSensitive = $false
+                UnsupportedReason = $null
+            }
         )
 
         $gap = Get-RadarPrincipalGap `
@@ -2202,6 +2915,9 @@ Describe 'Get-RadarPrincipalGap' {
             -DeniedRoleNames $deniedRoles
 
         $gap.AssignmentPolicyStatus | Should -Be 'Unknown'
+        $gap.PolicyIntentEvidence | Should -Match 'Permitted'
+        $gap.PolicyIntentEvidence |
+            Should -Match 'evidence is incomplete'
         $gap.NetNewGapStatus | Should -Be 'Unknown'
         $gap.Warnings |
             Should -Match 'discovery was incomplete'
@@ -2273,6 +2989,10 @@ Describe 'Principal-gap reporting' {
         Test-Path -LiteralPath $path | Should -BeTrue
         (Get-Content -LiteralPath $path -Raw) |
             Should -Match '"NetNewGapStatus"'
+        (Get-Content -LiteralPath $path -Raw) |
+            Should -Match '"PolicyIntentEvidence"'
+        (Get-Content -LiteralPath $path -Raw) |
+            Should -Match '"SourceViaGroup"'
         @(
             Get-ChildItem `
                 -LiteralPath $TestDrive `
@@ -2298,6 +3018,8 @@ Describe 'Principal-gap reporting' {
             GrantingRoleName = 'Dangerous Operator'
             GrantingRoleId = 'granting-role'
             NetNewGapStatus = 'NetNewGap'
+            PolicyIntentEvidence =
+                'Deny restricted roles [/subscriptions/sub-1]'
             Warnings = ''
         }
 
@@ -2329,6 +3051,16 @@ Describe 'Principal-gap reporting' {
         $summary.NetNewGapRoleCount | Should -Be 1
         $summary.NetNewGapRoles |
             Should -Match 'Dangerous Operator'
+        $summary.NetNewGapPolicies |
+            Should -Match 'Deny restricted roles'
+        $summary.NetNewGapPaths |
+            Should -Match 'principal-placeholder'
+        $summary.NetNewGapPaths |
+            Should -Match 'Dangerous.Provider/write'
+        $summary.NetNewGapPaths |
+            Should -Match 'Dangerous Operator'
+        $summary.NetNewGapPaths |
+            Should -Match 'Deny restricted roles'
         $summary.UnknownPrincipalCount | Should -Be 0
         $summary.UnknownPrincipalRowCount | Should -Be 1
         $summary.PrincipalGapWarnings |
@@ -2352,6 +3084,41 @@ Describe 'Principal-gap reporting' {
             Should -Be 'NoObservedHolder'
         $summary.NetNewGapActionCount | Should -Be 0
         $summary.NetNewGapPrincipalCount | Should -Be 0
+    }
+
+    It 'aggregates missing principals without treating them as unknown' {
+        $row = [pscustomobject]@{
+            BaselineRoleId = 'baseline-role'
+            BaselineScope = '/subscriptions/sub-1'
+            EvaluationScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            BaselineAssignmentState = 'DirectAssignmentObserved'
+        }
+        $principalGap = [pscustomobject]@{
+            PrincipalId = 'missing-principal'
+            PrincipalType = 'ServicePrincipal'
+            BaselineRoleId = 'baseline-role'
+            BaselineScope = '/subscriptions/sub-1'
+            EvaluationScope = '/subscriptions/sub-1'
+            RestrictedAction = 'Dangerous.Provider/write'
+            GrantingRoleName = 'Dangerous Operator'
+            GrantingRoleId = 'granting-role'
+            NetNewGapStatus = 'PrincipalMissing'
+            Warnings = 'Directory object was not found.'
+        }
+
+        $summary = Add-RadarPrincipalGapSummary `
+            -Rows @($row) `
+            -PrincipalGaps @($principalGap)
+
+        $summary.PrincipalGapStatus |
+            Should -Be 'PrincipalMissing'
+        $summary.UnknownPrincipalCount | Should -Be 0
+        $summary.UnknownPrincipalRowCount | Should -Be 0
+        $summary.MissingPrincipalCount | Should -Be 1
+        $summary.MissingPrincipalRowCount | Should -Be 1
+        $summary.MissingPrincipals |
+            Should -Be 'missing-principal [ServicePrincipal]'
     }
 }
 
@@ -5396,7 +6163,8 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html | Should -Not -Match 'Flat scope summary table'
         $html | Should -Match 'Workload'
         $html | Should -Match 'Dangerous.Provider/write'
-        $html | Should -Match 'Owner \[role-1\]'
+        $html | Should -Match 'Owner'
+        $html | Should -Match 'role-1'
         $html | Should -Match 'baseline-capable'
         $html | Should -Match 'remain latent'
         $html | Should -Match 'external-route'
@@ -5482,9 +6250,10 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html | Should -Not -Match 'id="filter"'
         $html | Should -Match '1 direct-assigned'
         $html | Should -Match '1 net-new gaps'
-        $html | Should -Match 'Actionable \(1\)'
-        $html | Should -Match 'Needs review \(1\)'
-        $html | Should -Match 'All diagnostics \(1\)'
+        $html | Should -Match 'Control coverage gaps \(1\)'
+        $html | Should -Match 'Proven user paths \(1\)'
+        $html | Should -Match 'Review scopes \(1\)'
+        $html | Should -Match 'All scopes \(1\)'
         $html | Should -Match 'data-mode="actionable"'
         $html | Should -Match 'id="map-search"'
         $html | Should -Match 'id="map-scope-type"'
@@ -5494,7 +6263,8 @@ Describe 'ConvertTo-RadarHtmlReport' {
         $html | Should -Match 'map-ancestor-only'
         $html | Should -Match 'map-status-actionable'
         $html | Should -Match 'map-status-review-secondary'
-        $html | Should -Match 'review-placeholder \[ServicePrincipal\]'
+        $html | Should -Match 'review-placeholder'
+        $html | Should -Match 'ServicePrincipal'
         $html |
             Should -Match 'One principal requires directory review'
         $html | Should -Not -Match 'scopeType !== ''all'''
@@ -5503,14 +6273,18 @@ Describe 'ConvertTo-RadarHtmlReport' {
                 $html,
                 '<button type="button" class="map-tab"'
             ).Count
-        ) | Should -Be 3
+        ) | Should -Be 4
         $html |
-            Should -Match 'principal-placeholder \[User\]'
+            Should -Match 'principal-placeholder'
+        $html | Should -Match 'User'
         $html | Should -Match '1 remediation gaps'
-        $html | Should -Match 'roles missing from subtree controls'
+        $html |
+            Should -Match 'granting roles missing from deny controls'
         $html |
             Should -Match 'actions with a direct baseline assignment'
         $html | Should -Match 'direct baseline assignment scopes'
+        $html | Should -Match '<ul class="list code metric-list">'
+        $html | Should -Match '<small>role-1</small>'
         $html |
             Should -Not -Match 'external-process gap actions'
     }
@@ -5548,11 +6322,16 @@ Describe 'ConvertTo-RadarHtmlReport' {
             -ControlGapMap @($row) `
             -MapOnly
 
-        $html | Should -Match 'Actionable \(0\)'
-        $html | Should -Match 'Needs review \(1\)'
-        $html | Should -Match 'data-mode="review"'
+        $html | Should -Match 'Control coverage gaps \(0\)'
+        $html | Should -Match 'Proven user paths \(0\)'
+        $html | Should -Match 'Review scopes \(1\)'
+        $html | Should -Match 'data-mode="actionable"'
+        $html | Should -Match 'id="map-empty"'
         $html |
-            Should -Match 'principal-placeholder \[ServicePrincipal\]'
+            Should -Match 'No proven user self-escalation paths'
+        $html |
+            Should -Match 'principal-placeholder'
+        $html | Should -Match 'ServicePrincipal'
         $html | Should -Match 'Directory evidence is incomplete'
         $html | Should -Match 'principals requiring review'
         $html | Should -Match 'why principal evidence is unknown'
@@ -5601,7 +6380,7 @@ Describe 'ConvertTo-RadarHtmlReport' {
         ) | Should -Be 2
         $html | Should -Match '@ /subscriptions/sub-1'
         $html | Should -Match '@ /subscriptions/sub-2'
-        $html | Should -Match 'No actionable gaps'
+        $html | Should -Match 'No proven user path'
         $html | Should -Not -Match '<strong>0</strong>'
     }
 
